@@ -1,0 +1,51 @@
+# === Environment ===
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+
+# === Secrets (defensive — never commit credentials of any kind) ===
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# === Storage (auto-generated) ===
+storage/
+*.db
+*.sqlite
+*.sqlite3
+*.joblib
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === OS ===
+.DS_Store
+Thumbs.db
+nul
+
+# === Scratch / local experiments ===
+scratch_*.py
+.pytest_cache/
+
+# === Deploy ===
+.scrooge.pid
+.frontend_version
+.requirements.txt.bak
+
+# === Local notes ===
+extra/

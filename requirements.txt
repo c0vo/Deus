@@ -1,0 +1,53 @@
+# === LLM ===
+google-genai>=0.1.1
+openai
+
+# === Embeddings ===
+# Using Gemini embeddings (google-generativeai)
+numpy
+sqlite-vec
+
+# === Telegram Bot ===
+python-telegram-bot>=21.0
+
+# === Web Framework ===
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+
+# === HTTP Client (async) ===
+httpx>=0.27.0
+
+# === Web Search ===
+tavily-python>=0.5.0
+
+# === News Feeds ===
+feedparser>=6.0.0
+
+# === HTML Parsing (for Nitter scraping) ===
+beautifulsoup4>=4.12.0
+
+# === Scheduling ===
+APScheduler>=3.10.0
+
+# === Configuration ===
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+python-dotenv>=1.0.0
+
+# === Logging ===
+structlog>=24.1.0
+
+# === News APIs ===
+finnhub-python>=2.4.0
+
+# === ML Prediction ===
+scikit-learn
+joblib
+yfinance
+pandas
+langgraph
+
+# === Testing ===
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+tzdata>=2024.1

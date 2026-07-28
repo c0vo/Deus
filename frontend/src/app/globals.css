@@ -1,0 +1,525 @@
+@import "tailwindcss";
+
+/* ============================================================================
+   DEUS — design tokens
+
+   Two rules govern this palette:
+
+   1. Surfaces get LIGHTER as they come forward. ground < card < raised.
+   2. One accent. `signal` carries chrome and state. Green and red are
+      semantic — they mean price/sentiment direction and nothing else.
+
+   Decorative hues (violet, amber, teal, orange, pale-blue) are retained as
+   token names for compatibility but now resolve to neutrals or to signal, so
+   legacy usages collapse into the restrained palette automatically.
+   ============================================================================ */
+
+:root {
+  /* ── Surface ladder ── */
+  --background: #0b0d10;      /* page ground */
+  --panel: #12151a;           /* card — rises toward the light */
+  --surface: #191d24;         /* raised: nested, hover, input */
+  --surface-hover: #1f242c;
+  --input-bg: #191d24;
+  --border: #232932;          /* hairline */
+  --border-soft: #1b2027;     /* divider inside a card */
+
+  /* ── Text ── */
+  --foreground: #e4e8ef;      /* primary */
+  --muted: #8a93a3;           /* secondary */
+  --muted-alt: #5c6474;       /* tertiary / labels */
+
+  /* ── Accent: chrome + state ONLY ── */
+  --signal: #6ea8ff;
+  --signal-soft: #16233a;
+  --on-signal: #0b0d10;
+
+  /* ── Semantic: direction ONLY ── */
+  --green: #3fd68c;
+  --red: #f2645a;
+  --warn: #e8b04b;
+  --green-soft: #102a1f;
+  --red-soft: #2c1614;
+  --warn-soft: #2a2115;
+
+  /* ── Legacy aliases — collapsed onto the restrained palette ──
+     These names are still referenced across the app. Rather than touch
+     every call site, they resolve here so decorative colour disappears. */
+  --violet: var(--signal);
+  --amber: var(--warn);
+  --blue: var(--signal);
+  --orange: var(--foreground); /* was decorative on plain values, not a warning */
+  --teal: var(--signal);
+  --pale-blue: var(--muted);
+  --accent: var(--signal);
+  --brand-blue: var(--signal);
+  --error: var(--red);
+  --success: var(--green);
+  --danger: var(--red);
+
+  /* ── Material ── */
+  --glow: rgba(110, 168, 255, 0.055);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --radius: 4px;
+}
+
+/* ===== Light theme ===== */
+:root.light {
+  --background: #f4f6f9;
+  --panel: #ffffff;
+  --surface: #edf0f5;
+  --surface-hover: #e6eaf1;
+  --input-bg: #ffffff;
+  --border: #dce1e9;
+  --border-soft: #e7ebf1;
+
+  --foreground: #131721;
+  --muted: #59616f;
+  --muted-alt: #8892a0;
+
+  --signal: #2563c9;
+  --signal-soft: #e4edfc;
+  --on-signal: #ffffff;
+
+  --green: #0f9a62;
+  --red: #d14338;
+  --warn: #b0761a;
+  --green-soft: #e3f5ec;
+  --red-soft: #fbe8e6;
+  --warn-soft: #faf0de;
+
+  --glow: transparent;
+  --shadow: 0 1px 2px rgba(19, 23, 33, 0.06), 0 4px 12px rgba(19, 23, 33, 0.04);
+}
+
+@theme {
+  --color-bg-main: var(--background);
+  --color-bg-card: var(--panel);
+  --color-bg-surface: var(--surface);
+  --color-bg-surface-hover: var(--surface-hover);
+  --color-bg-input: var(--input-bg);
+  --color-border-dim: var(--border);
+  --color-border-soft: var(--border-soft);
+
+  --color-terminal-text: var(--foreground);
+  --color-terminal-muted: var(--muted);
+  --color-terminal-muted-alt: var(--muted-alt);
+
+  --color-terminal-signal: var(--signal);
+  --color-terminal-signal-soft: var(--signal-soft);
+  --color-terminal-on-signal: var(--on-signal);
+
+  --color-terminal-green: var(--green);
+  --color-terminal-red: var(--red);
+  --color-terminal-yellow: var(--warn);
+  --color-terminal-green-soft: var(--green-soft);
+  --color-terminal-red-soft: var(--red-soft);
+  --color-terminal-yellow-soft: var(--warn-soft);
+
+  /* legacy names — resolve to the collapsed values above */
+  --color-terminal-violet: var(--violet);
+  --color-terminal-amber: var(--amber);
+  --color-terminal-blue: var(--blue);
+  --color-terminal-orange: var(--orange);
+  --color-terminal-teal: var(--teal);
+  --color-terminal-pale-blue: var(--pale-blue);
+  --color-terminal-accent: var(--accent);
+  --color-terminal-brand-blue: var(--brand-blue);
+  --color-terminal-error: var(--error);
+  --color-terminal-success: var(--success);
+  --color-terminal-danger: var(--danger);
+
+  --font-sans: var(--font-plex-sans), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: var(--font-plex-mono), ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* type scale — six steps, nothing off-scale */
+  --text-micro: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-md: 15px;
+  --text-lg: 18px;
+  --text-xl: 24px;
+
+  --radius-sm: 3px;
+  --radius-DEFAULT: 4px;
+}
+
+body {
+  background:
+    radial-gradient(120% 60% at 50% -10%, var(--glow), transparent 60%),
+    var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0;
+  padding: 0;
+}
+
+:focus-visible {
+  outline: 2px solid var(--signal);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ============================================================================
+   Numerals are data. Mono is scoped to them and nothing else.
+   ============================================================================ */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+  letter-spacing: -0.01em;
+}
+
+/* ============================================================================
+   Primitives — repeated patterns, so every page agrees
+   ============================================================================ */
+.card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.card-body {
+  padding: 14px;
+}
+
+.label {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted-alt);
+}
+
+/* status pill — state encoded as form, not only as text */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.pill-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: currentColor;
+  flex: none;
+}
+.pill-ok { color: var(--green); background: var(--green-soft); border-color: transparent; }
+.pill-bad { color: var(--red); background: var(--red-soft); border-color: transparent; }
+.pill-warn { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
+.pill-signal { color: var(--signal); background: var(--signal-soft); border-color: transparent; }
+
+/* inline tag — lighter than a pill, for inline metadata */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 6px;
+  border-radius: 2px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.tag-up { background: var(--green-soft); color: var(--green); }
+.tag-down { background: var(--red-soft); color: var(--red); }
+.tag-warn { background: var(--warn-soft); color: var(--warn); }
+
+/* segmented control */
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface);
+  border-radius: var(--radius);
+}
+.seg > button {
+  padding: 3px 9px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--muted-alt);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.seg > button:hover { color: var(--foreground); }
+.seg > button[aria-selected="true"] {
+  background: var(--panel);
+  color: var(--foreground);
+  box-shadow: var(--shadow);
+}
+
+/* quiet button */
+.btn-ghost {
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.btn-ghost:hover { background: var(--surface); color: var(--foreground); }
+.btn-ghost:disabled { opacity: 0.5; cursor: default; }
+
+/* primary action */
+.btn-signal {
+  padding: 5px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: var(--signal);
+  color: var(--on-signal);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.btn-signal:hover { opacity: 0.88; }
+.btn-signal:disabled { opacity: 0.45; cursor: default; }
+
+/* ============================================================================
+   Scrollbars — hairline, not chrome
+   ============================================================================ */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background-color: var(--border);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background-color: var(--muted-alt); }
+
+/* ============================================================================
+   Motion
+   ============================================================================ */
+/* The ticker tape drives its own transform from rAF rather than a keyframe,
+   so the reduced-motion rule below cannot silently freeze it. */
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+@keyframes slideUpFade {
+  0% { opacity: 0; transform: translateY(16px) scale(0.96); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes ping {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }
+  70% { box-shadow: 0 0 0 5px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: currentColor;
+  animation: ping 2.4s ease-out infinite;
+  flex: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ============================================================================
+   Markdown-rendered content (FormattedText.tsx)
+   Body prose is sans. Mono appears only inside code.
+   ============================================================================ */
+.formatted-text {
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.formatted-text h1,
+.formatted-text h2,
+.formatted-text h3,
+.formatted-text h4,
+.formatted-text h5,
+.formatted-text h6 {
+  margin: 1.5em 0 0.5em;
+  color: var(--foreground);
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+
+.formatted-text h1 { font-size: 20px; }
+.formatted-text h2 { font-size: 17px; }
+.formatted-text h3 { font-size: 15px; }
+.formatted-text h4,
+.formatted-text h5,
+.formatted-text h6 {
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.formatted-text h1:first-child,
+.formatted-text h2:first-child,
+.formatted-text h3:first-child,
+.formatted-text h4:first-child,
+.formatted-text h5:first-child,
+.formatted-text h6:first-child,
+.formatted-text p:first-child {
+  margin-top: 0;
+}
+
+.formatted-text p {
+  margin: 0.85em 0;
+  color: var(--foreground);
+  text-wrap: pretty;
+}
+
+.formatted-text ul,
+.formatted-text ol {
+  margin: 0.7em 0 0.9em;
+  padding-left: 1.35em;
+}
+
+.formatted-text ul { list-style-type: disc; }
+.formatted-text ol { list-style-type: decimal; }
+
+.formatted-text li {
+  margin: 0.35em 0;
+  color: var(--foreground);
+}
+
+.formatted-text li::marker { color: var(--muted-alt); }
+
+.formatted-text strong {
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.formatted-text em {
+  font-style: italic;
+  color: var(--muted);
+}
+
+.formatted-text a {
+  color: var(--signal);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.formatted-text a:hover { opacity: 0.8; }
+
+.formatted-text code {
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+  background: var(--surface);
+  color: var(--foreground);
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+}
+
+.formatted-text pre {
+  margin: 0.9em 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface);
+  overflow-x: auto;
+}
+.formatted-text pre code {
+  padding: 0;
+  background: none;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.formatted-text blockquote {
+  margin: 0.9em 0;
+  padding: 2px 0 2px 14px;
+  border-left: 2px solid var(--border);
+  color: var(--muted);
+}
+
+.formatted-text hr {
+  margin: 1.4em 0;
+  border: none;
+  border-top: 1px solid var(--border-soft);
+}
+
+.formatted-text table {
+  width: 100%;
+  margin: 0.9em 0;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.formatted-text th,
+.formatted-text td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  text-align: left;
+}
+.formatted-text th {
+  color: var(--muted-alt);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}

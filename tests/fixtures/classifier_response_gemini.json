@@ -1,0 +1,9 @@
+{
+  "event_type": "macro",
+  "sentiment_score": 0.35,
+  "urgency": "high",
+  "suggested_direction": "bullish",
+  "affected_sectors": ["Financials", "Real Estate", "Technology"],
+  "affected_tickers": ["SPY", "QQQ", "XLF"],
+  "classification_summary": "Fed raised rates as expected but signaled a potential pause, which markets interpreted dovishly."
+}

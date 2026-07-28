@@ -1,0 +1,9 @@
+{
+  "event_type": "earnings",
+  "sentiment_score": 0.55,
+  "urgency": "high",
+  "suggested_direction": "bullish",
+  "affected_sectors": ["Technology", "Consumer Electronics"],
+  "affected_tickers": ["AAPL"],
+  "classification_summary": "Apple beat Q3 estimates on both revenue and EPS. The $90B buyback and dividend increase signal strong management confidence."
+}
