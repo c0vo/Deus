@@ -1,6 +1,6 @@
 # Deus
 
-Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Hacker News, Nitter, Finnhub and Alpha Vantage; classifies and ranks it with DeepSeek and Gemini; trains per-ticker gradient boosting models to predict price direction; and serves everything through a Next.js dashboard and a Telegram bot.
+Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Hacker News, Nitter, Finnhub, Twitter (In-Progress) and Alpha Vantage; classifies and ranks it with DeepSeek and Gemini; trains per-ticker gradient boosting models to predict price direction; and serves everything through a Next.js dashboard and a Telegram bot.
 
 <p align="center">
   <img src="screenshots/dashboard.png" alt="Deus dashboard" width="100%">
@@ -15,10 +15,10 @@ Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Ha
 - **News ingestion** — 6 source types fetched concurrently, deduplicated by URL and by embedding cosine similarity
 - **Dual-LLM pipeline** — DeepSeek classifies event type, sentiment, urgency and tickers; Gemini scores importance 0–10 and pushes high-impact stories to Telegram
 - **ML prediction** — per-ticker `GradientBoostingClassifier` with Platt scaling, 23 features (sentiment, technicals, market regime), 5-fold walk-forward CV
-- **Multi-agent debate** — Bull and Bear researchers argue over two LangGraph rounds, synthesized into a Buy/Sell/Hold call by a trader agent
-- **RAG analyst chat** — vector search over classified news with shallow/complex routing and token-by-token streaming
+- **Multi-agent debate** — Bull and Bear researchers argue over two rounds, synthesized into a Buy/Sell/Hold call by a trader agent
+- **RAG analyst chat** — vector search over classified news with shallow/complex routing, with supplemental information pulled in real-time from the internet.
 - **Market intelligence** — sector rotation, IPO tracking, earnings calendar, macro themes, trend scenarios, ≥5% price-swing alerts
-- **Runs on a phone** — the static frontend export is served by FastAPI, so a Termux install needs no Node process at runtime
+- **Runs on a phone** — Originally built to run on Termux. Had a spare phone lying around :)
 
 ## Architecture
 
@@ -107,7 +107,7 @@ npm run dev                    # :3000, proxies /api/* to :8000
 npm run build:static           # or: export to frontend/out/, served by FastAPI on :8000
 ```
 
-Deus binds to `0.0.0.0` with no authentication and open CORS, which is intended for a trusted LAN or tailnet. Set `API_HOST=127.0.0.1` or put it behind an authenticating reverse proxy before exposing it anywhere else — several endpoints spend money on LLM calls per request.
+Deus binds to `0.0.0.0` with no authentication and open CORS, which is intended for a trusted LAN or tailnet. Set `API_HOST=127.0.0.1` or put it behind an authenticating reverse proxy before exposing it anywhere else.
 
 ## Configuration
 
