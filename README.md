@@ -7,11 +7,6 @@ Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Ha
 </p>
 
 <p align="center">
-  <a href="screenshots/debate.mp4"><img src="screenshots/debate.gif" alt="Bull vs Bear debate" width="100%"></a>
-  <br><em>Bull vs Bear researchers debating a ticker, streamed over SSE</em>
-</p>
-
-<p align="center">
   <img src="screenshots/markets.png" alt="Markets" width="49%">
   <img src="screenshots/trending.png" alt="Trending" width="49%">
 </p>
