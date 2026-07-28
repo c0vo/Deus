@@ -7,11 +7,6 @@ Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Ha
 </p>
 
 <p align="center">
-  <img src="screenshots/markets.png" alt="Markets" width="49%">
-  <img src="screenshots/trending.png" alt="Trending" width="49%">
-</p>
-
-<p align="center">
   <img src="screenshots/globe.png" alt="News-origin globe" width="100%">
 </p>
 
