@@ -19,8 +19,7 @@ Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Ha
 - **Multi-agent debate** — Bull and Bear researchers argue over two rounds, synthesized into a Buy/Sell/Hold call by a trader agent
 - **RAG analyst chat** — vector search over classified news with shallow/complex routing, with supplemental information pulled in real-time from the internet.
 - **Market intelligence** — sector rotation, IPO tracking, earnings calendar, macro themes, trend scenarios, ≥5% price-swing alerts
-- **Structured LLM output** — response schemas constrain decoding at the API, so a malformed JSON blob can't leak into the UI
-- **Runs on a phone** — Originally built to run on Termux. Had a spare Galaxy S20 lying around:)
+- **Runs on a phone** — Originally built to run on Termux. Had a spare Galaxy S20 lying around :)
 
 ## Architecture
 
