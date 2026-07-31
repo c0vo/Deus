@@ -1,6 +1,6 @@
 # Deus
 
-Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Hacker News, Nitter, Finnhub, Twitter (In-Progress) and Alpha Vantage; classifies and ranks it with DeepSeek and Gemini; trains per-ticker gradient boosting models to predict price direction; and serves everything through a Next.js dashboard and a Telegram bot.
+Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Hacker News, Nitter, Finnhub, WallStreetJournal, Twitter (In-Progress) and Alpha Vantage; classifies and ranks it with DeepSeek and Gemini; trains per-ticker gradient boosting models to predict price direction; and serves everything through a Next.js dashboard and a Telegram bot. Built to track US + Korean markets.
 
 <p align="center">
   <img src="screenshots/dashboard.png" alt="Deus dashboard" width="100%">
@@ -20,7 +20,7 @@ Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Ha
 - **RAG analyst chat** — vector search over classified news with shallow/complex routing, with supplemental information pulled in real-time from the internet.
 - **Market intelligence** — sector rotation, IPO tracking, earnings calendar, macro themes, trend scenarios, ≥5% price-swing alerts
 - **Structured LLM output** — response schemas constrain decoding at the API, so a malformed JSON blob can't leak into the UI
-- **Runs on a phone** — Originally built to run on Termux. Had a spare phone lying around :)
+- **Runs on a phone** — Originally built to run on Termux. Had a spare Galaxy S20 lying around:)
 
 ## Architecture
 
@@ -83,14 +83,6 @@ Work is split across two providers to keep cost down on the high-volume path:
 | Embeddings (3072-dim) | `gemini-embedding-001` |
 
 Background jobs run on APScheduler: the ETL cycle every 15 minutes, market scanning every 10, sector analysis every 15, an insider scan at 07:00 and Korean investor flows at 18:00 KST, daily predictions and resolution, and weekly model retraining.
-
-### Smart money
-
-Positioning gets treated as a real input rather than a sidebar widget — `data/tickers.py` routes each ticker to the right source, so the US/KR split lives in one place.
-
-SEC EDGAR gives **Form 4** (an insider traded, disclosed within 2 business days) and **SC 13D/13G** (someone crossed 5% ownership, within 10 days). Both are free, need no key, and are far timelier than a quarterly 13F. The client is `httpx` + `xml.etree` rather than a filing SDK, because `pyarrow` and `lxml` are miserable to build on the phone.
-
-Korea has no equivalent, so Deus reads the daily 기관 (institutional) and 외국인 (foreign) net-trading figures from Naver Finance — one of the few places that question has a genuinely daily answer.
 
 ## Quick start
 
