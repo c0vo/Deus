@@ -89,7 +89,6 @@ class DeusBot:
                 BotCommand("briefing", "Get an immediate daily market briefing"),
                 BotCommand("trending", "See the most discussed tickers"),
                 BotCommand("markets", "View live market performance & charts"),
-                BotCommand("chart", "Generate a price/sentiment chart"),
                 BotCommand("predict", "ML prediction (e.g. /predict AAPL)"),
                 BotCommand("accuracy", "View prediction accuracy"),
                 BotCommand("track", "Add to watchlist"),

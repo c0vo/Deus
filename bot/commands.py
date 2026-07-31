@@ -62,7 +62,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• /briefing - Get an immediate daily market briefing (e.g. <code>/briefing</code>)\n"
         "• /trending [HOURS] - See the most discussed tickers (e.g. <code>/trending 24</code>)\n"
         "• /markets - View live market performance and charts for tracked tickers (e.g. <code>/markets</code>)\n"
-        "• /chart &lt;TICKER&gt; - Generate a price/sentiment chart (e.g. <code>/chart AAPL</code>)\n"
         "• /predict &lt;TICKER&gt; [HORIZON] - ML prediction (e.g. <code>/predict NVDA 3d</code>)\n"
         "• /accuracy [TICKER] - View prediction accuracy (e.g. <code>/accuracy AAPL</code>)\n"
         "• /track &lt;TICKER&gt; - Add to watchlist (e.g. <code>/track MSFT</code>)\n"
@@ -329,8 +328,7 @@ async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         emoji = "📈" if diff >= 0 else "📉"
                         sign = "+" if diff >= 0 else ""
                         
-                        import datetime as dt_module
-                        today = dt_module.date.today().isoformat()
+                        today = datetime.date.today().isoformat()
                         
                         from pipeline.predictor import StockPredictor
                         predictor = StockPredictor(db)
@@ -474,68 +472,6 @@ async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except Exception as e:
         log.error("telegram.briefing_failed", error=str(e))
         await update.message.reply_text("❌ Failed to generate briefing.")
-
-async def chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /chart command."""
-    if not await auth_middleware(update, context):
-        return
-        
-    if not context.args:
-        await update.message.reply_text("Usage: /chart <TICKER>")
-        return
-        
-    ticker = context.args[0].upper()
-    await update.message.reply_text(f"📊 Generating chart for {ticker}...")
-    
-    try:
-        from bot.visualizations import get_price_chart
-        
-        # Fetch 30 day history
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-        params = {"range": "1mo", "interval": "1d"}
-        headers = {"User-Agent": "Mozilla/5.0"}
-        
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, params=params, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            
-        chart_data = data["chart"]["result"][0]
-        closes = chart_data["indicators"]["quote"][0]["close"]
-        timestamps = chart_data["timestamp"]
-        
-        # Clean data
-        valid_closes = []
-        valid_dates = []
-        for i, c in enumerate(closes):
-            if c is not None:
-                valid_closes.append(round(c, 2))
-                dt = datetime.datetime.fromtimestamp(timestamps[i])
-                valid_dates.append(dt.strftime("%m-%d"))
-                
-        if not valid_closes:
-            await update.message.reply_text("❌ Could not fetch data for chart.")
-            return
-            
-        # Generate chart in memory
-        chart_buffer = await get_price_chart(ticker, valid_closes, valid_dates)
-        
-        caption = f"📉 1 Month Price History: {ticker}"
-        db = get_db(context)
-        import datetime as dt_module
-        today = dt_module.date.today().isoformat()
-        prediction = db.get_existing_prediction(ticker, horizon_days=1, date=today)
-        if prediction:
-            direction = prediction.get("predicted_direction", "UNKNOWN")
-            conf = int(prediction.get("confidence", 0.0) * 100)
-            emoji = "📈" if direction == "UP" else "📉"
-            caption += f"\n\n{emoji} Prediction: {direction} ({conf}% confident)"
-        
-        await update.message.reply_photo(photo=chart_buffer, caption=caption)
-        
-    except Exception as e:
-        log.error("telegram.chart_failed", error=str(e))
-        await update.message.reply_text("❌ Failed to generate chart.")
 
 async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle natural language queries using the LangGraph orchestrator."""
