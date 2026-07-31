@@ -39,7 +39,7 @@ export default function RootLayout({
       <head>
         <script
           dangerouslySetInnerHTML={{
-            __html: `(function(){try{var t=localStorage.getItem('deus-theme');if(t==='light')document.documentElement.classList.add('light')}catch(e){}})();`,
+            __html: `(function(){var d=document.documentElement;try{var t=localStorage.getItem('deus-theme');if(t==='light')d.classList.add('light');var m=localStorage.getItem('deus-motion');d.setAttribute('data-motion',m==='off'?'off':'on')}catch(e){d.setAttribute('data-motion','on')}})();`,
           }}
         />
       </head>

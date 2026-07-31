@@ -1,5 +1,5 @@
 """
-Project Scrooge V2 — Telegram Bot Setup
+Deus — Telegram Bot Setup
 
 Initializes the python-telegram-bot Application, registers handlers,
 and manages the bot lifecycle.
@@ -24,7 +24,7 @@ from data.database import Database
 
 log = get_logger(__name__)
 
-class ScroogeBot:
+class DeusBot:
     """Manages the Telegram Bot application and alerts."""
     
     def __init__(self, db: Database):

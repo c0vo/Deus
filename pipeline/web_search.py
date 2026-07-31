@@ -1,5 +1,5 @@
 """
-Project Scrooge V2 — Web Search Provider
+Deus — Web Search Provider
 
 Abstracts web search behind a common interface so the debate agents can
 enrich their news context with real-time search results (e.g. Tavily).
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -21,6 +22,7 @@ from typing import Optional
 from config.llm import get_deepseek_client, is_deepseek_configured
 from config.logging_config import get_logger
 from config.settings import settings
+from config.usage import track_llm
 
 log = get_logger(__name__)
 
@@ -181,7 +183,7 @@ def _fallback_format(results: list[WebSearchResult]) -> str:
     return "\n\n".join(lines)
 
 
-async def summarize_search_results(ticker: str, results: list[WebSearchResult]) -> str:
+async def summarize_search_results(ticker: str, results: list[WebSearchResult], db=None) -> str:
     """Distill raw search results into concise DeepSeek-generated summaries.
 
     Uses the same non-thinking DeepSeek model as the news classifier for
@@ -214,13 +216,19 @@ async def summarize_search_results(ticker: str, results: list[WebSearchResult]) 
     )
 
     try:
-        response = await client.chat.completions.create(
-            model=settings.deepseek_model_classifier,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-            extra_body={"thinking": {"type": "disabled"}},
-        )
+        # `db` is optional so the existing module-level callers keep working;
+        # when supplied, this call stops being invisible in llm_usage_log. It
+        # fires on every agent debate and every web-search-backed chat turn.
+        with track_llm(db, settings.deepseek_model_classifier, "web_search_summary") if db else nullcontext() as u:
+            response = await client.chat.completions.create(
+                model=settings.deepseek_model_classifier,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.0,
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+            if u is not None:
+                u.response = response
         text = response.choices[0].message.content.strip()
         summaries = json.loads(text)
 

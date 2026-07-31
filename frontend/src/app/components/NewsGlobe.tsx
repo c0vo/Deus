@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import { geoOrthographic, geoPath, geoGraticule10, geoCentroid } from "d3-geo";
 import { feature } from "topojson-client";
 import worldAtlas from "world-atlas/countries-110m.json";
+import { useReducedMotion } from "../hooks/useReducedMotion";
 
 export interface GeoCountry {
   country: string;
@@ -48,35 +49,52 @@ const world = feature(
 const GRATICULE = geoGraticule10();
 const SPHERE = { type: "Sphere" } as any;
 
+/** Atlas geometry and its centroids never change — resolve each exactly once. */
+const FEATURE_BY_ID = new Map<number, Feature>(
+  world.features.map((f) => [Number(f.id), f])
+);
+const CENTROID_CACHE = new Map<string, [number, number] | null>();
+
+/** Pixels the halo extends past the rim; the sphere is inset to make room. */
+const HALO_WIDTH = 12;
+
 function readTheme() {
   const s = getComputedStyle(document.documentElement);
   const v = (name: string) => s.getPropertyValue(name).trim();
   return {
     ocean: v("--panel"),
-    land: v("--surface"),
+    // One rung further up the surface ladder than the ocean. `--surface` sits
+    // only ~7/255 off `--panel` in dark mode, which read as a blank disc.
+    land: v("--surface-hover"),
     line: v("--border"),
     signal: v("--signal"),
     up: v("--green"),
     down: v("--red"),
     muted: v("--muted-alt"),
     text: v("--foreground"),
+    // `transparent` in light mode — the design system's own signal for
+    // "no ambient glow here".
+    glow: v("--glow"),
   };
+}
+
+type Theme = ReturnType<typeof readTheme>;
+
+function parseHex(h: string): [number, number, number] {
+  let s = h.replace("#", "");
+  if (s.length === 3) s = s.split("").map((c) => c + c).join("");
+  return [
+    parseInt(s.slice(0, 2), 16),
+    parseInt(s.slice(2, 4), 16),
+    parseInt(s.slice(4, 6), 16),
+  ];
 }
 
 /** Mix two hex colours; t=0 returns a, t=1 returns b. */
 function mix(a: string, b: string, t: number): string {
-  const parse = (h: string) => {
-    let s = h.replace("#", "");
-    if (s.length === 3) s = s.split("").map((c) => c + c).join("");
-    return [
-      parseInt(s.slice(0, 2), 16),
-      parseInt(s.slice(2, 4), 16),
-      parseInt(s.slice(4, 6), 16),
-    ];
-  };
   try {
-    const [r1, g1, b1] = parse(a);
-    const [r2, g2, b2] = parse(b);
+    const [r1, g1, b1] = parseHex(a);
+    const [r2, g2, b2] = parseHex(b);
     const c = (x: number, y: number) => Math.round(x + (y - x) * t);
     return `rgb(${c(r1, r2)},${c(g1, g2)},${c(b1, b2)})`;
   } catch {
@@ -84,17 +102,85 @@ function mix(a: string, b: string, t: number): string {
   }
 }
 
-export default function NewsGlobe({ countries, spinSpeed = 6 }: NewsGlobeProps) {
+function rgbaFromHex(hex: string, alpha: number): string {
+  try {
+    const [r, g, b] = parseHex(hex);
+    return `rgba(${r},${g},${b},${alpha})`;
+  } catch {
+    return `rgba(0,0,0,${alpha})`;
+  }
+}
+
+function centroidOf(c: GeoCountry): [number, number] | null {
+  const cached = CENTROID_CACHE.get(c.country);
+  if (cached !== undefined) return cached;
+
+  let result: [number, number] | null = null;
+  if (FALLBACK_CENTROIDS[c.country]) {
+    result = FALLBACK_CENTROIDS[c.country];
+  } else {
+    const f = FEATURE_BY_ID.get(ALPHA2_TO_NUMERIC[c.country]);
+    result = f ? (geoCentroid(f as any) as [number, number]) : null;
+  }
+  CENTROID_CACHE.set(c.country, result);
+  return result;
+}
+
+interface GlobeData {
+  map: Map<number, GeoCountry>;
+  markers: { c: GeoCountry; coords: [number, number] }[];
+  maxCount: number;
+}
+
+export default function NewsGlobe({ countries, spinSpeed = 12 }: NewsGlobeProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const rotationRef = useRef<[number, number]>([-20, -15]);
   const draggingRef = useRef<{ x: number; y: number } | null>(null);
   const [size, setSize] = useState(420);
-  const [themeTick, setThemeTick] = useState(0);
+
+  const reduceMotion = useReducedMotion();
+
+  // The render loop reads everything below through refs so that a 60-second
+  // data poll, a theme flip or a motion toggle cannot tear down and restart
+  // the animation — which used to reset the pulse phase and recompute every
+  // marker centroid on each poll.
+  const dataRef = useRef<GlobeData>({ map: new Map(), markers: [], maxCount: 1 });
+  const themeRef = useRef<Theme | null>(null);
+  const spinRef = useRef(spinSpeed);
+  const reduceRef = useRef(reduceMotion);
+
+  useEffect(() => {
+    const map = new Map<number, GeoCountry>();
+    for (const c of countries) {
+      const numeric = ALPHA2_TO_NUMERIC[c.country];
+      if (numeric !== undefined) map.set(numeric, c);
+    }
+    const markers = countries
+      .map((c) => ({ c, coords: centroidOf(c) }))
+      .filter((m): m is { c: GeoCountry; coords: [number, number] } => !!m.coords);
+
+    dataRef.current = {
+      map,
+      markers,
+      maxCount: Math.max(1, ...countries.map((c) => c.count)),
+    };
+  }, [countries]);
+
+  useEffect(() => {
+    spinRef.current = spinSpeed;
+  }, [spinSpeed]);
+
+  useEffect(() => {
+    reduceRef.current = reduceMotion;
+  }, [reduceMotion]);
 
   // Redraw when the theme class flips; the canvas has no CSS to cascade into.
   useEffect(() => {
-    const observer = new MutationObserver(() => setThemeTick((t) => t + 1));
+    themeRef.current = readTheme();
+    const observer = new MutationObserver(() => {
+      themeRef.current = readTheme();
+    });
     observer.observe(document.documentElement, {
       attributes: true,
       attributeFilter: ["class"],
@@ -112,16 +198,21 @@ export default function NewsGlobe({ countries, spinSpeed = 6 }: NewsGlobeProps) 
     return () => observer.disconnect();
   }, []);
 
-  const byCode = useCallback(() => {
-    const map = new Map<number, GeoCountry>();
-    const extras: GeoCountry[] = [];
-    for (const c of countries) {
-      const numeric = ALPHA2_TO_NUMERIC[c.country];
-      if (numeric !== undefined) map.set(numeric, c);
-      if (FALLBACK_CENTROIDS[c.country]) extras.push(c);
-    }
-    return { map, extras };
-  }, [countries]);
+  // A pointerup lost to an alt-tab or an OS gesture used to leave draggingRef
+  // set, which stops the auto-spin permanently.
+  useEffect(() => {
+    const release = () => {
+      draggingRef.current = null;
+    };
+    window.addEventListener("pointerup", release);
+    window.addEventListener("pointercancel", release);
+    window.addEventListener("blur", release);
+    return () => {
+      window.removeEventListener("pointerup", release);
+      window.removeEventListener("pointercancel", release);
+      window.removeEventListener("blur", release);
+    };
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -136,51 +227,55 @@ export default function NewsGlobe({ countries, spinSpeed = 6 }: NewsGlobeProps) 
     canvas.style.height = `${size}px`;
     ctx.scale(dpr, dpr);
 
-    const theme = readTheme();
-    const { map, extras } = byCode();
-    const maxCount = Math.max(1, ...countries.map((c) => c.count));
+    if (!themeRef.current) themeRef.current = readTheme();
 
+    // Inset by the halo width so the atmosphere has somewhere to go.
+    const pad = HALO_WIDTH + 2;
     const projection = geoOrthographic()
-      .fitExtent(
-        [[6, 6], [size - 6, size - 6]],
-        SPHERE
-      )
+      .fitExtent([[pad, pad], [size - pad, size - pad]], SPHERE)
       .rotate(rotationRef.current);
     const path = geoPath(projection, ctx as any);
-
-    const reduceMotion = window.matchMedia(
-      "(prefers-reduced-motion: reduce)"
-    ).matches;
 
     let raf = 0;
     let last = performance.now();
     let elapsed = 0;
-
-    const centroidOf = (c: GeoCountry): [number, number] | null => {
-      if (FALLBACK_CENTROIDS[c.country]) return FALLBACK_CENTROIDS[c.country];
-      const numeric = ALPHA2_TO_NUMERIC[c.country];
-      const f = world.features.find((x) => Number(x.id) === numeric);
-      return f ? (geoCentroid(f as any) as [number, number]) : null;
-    };
-
-    const markers = countries
-      .map((c) => ({ c, coords: centroidOf(c) }))
-      .filter((m): m is { c: GeoCountry; coords: [number, number] } => !!m.coords);
 
     const draw = (now: number) => {
       const dt = (now - last) / 1000;
       last = now;
       elapsed += dt;
 
-      if (!draggingRef.current && spinSpeed > 0 && !reduceMotion) {
+      const theme = themeRef.current!;
+      const { map, markers, maxCount } = dataRef.current;
+      const reduced = reduceRef.current;
+      const spin = spinRef.current;
+
+      if (!draggingRef.current && spin > 0 && !reduced) {
         rotationRef.current = [
-          rotationRef.current[0] + spinSpeed * dt,
+          rotationRef.current[0] + spin * dt,
           rotationRef.current[1],
         ];
       }
       projection.rotate(rotationRef.current);
 
       ctx.clearRect(0, 0, size, size);
+
+      // Atmosphere. Drawn first so the ocean fill covers its inner half —
+      // no compositing tricks needed. Static, so reduced motion doesn't apply.
+      const [cx, cy] = projection.translate();
+      const radius = projection.scale();
+      if (theme.glow && theme.glow !== "transparent") {
+        const gradient = ctx.createRadialGradient(
+          cx, cy, radius,
+          cx, cy, radius + HALO_WIDTH
+        );
+        gradient.addColorStop(0, rgbaFromHex(theme.signal, 0.16));
+        gradient.addColorStop(1, rgbaFromHex(theme.signal, 0));
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius + HALO_WIDTH, 0, Math.PI * 2);
+        ctx.fillStyle = gradient;
+        ctx.fill();
+      }
 
       // Ocean disc
       ctx.beginPath();
@@ -192,13 +287,14 @@ export default function NewsGlobe({ countries, spinSpeed = 6 }: NewsGlobeProps) 
       ctx.beginPath();
       path(GRATICULE);
       ctx.strokeStyle = theme.line;
-      ctx.globalAlpha = 0.35;
+      ctx.globalAlpha = 0.45;
       ctx.lineWidth = 0.5;
       ctx.stroke();
       ctx.globalAlpha = 1;
 
       // Landmasses. Countries carrying news are tinted toward the accent in
-      // proportion to volume; everything else stays inert.
+      // proportion to volume; everything else stays inert. The seam between
+      // them is ocean-coloured because that is what it is.
       for (const f of world.features) {
         const entry = map.get(Number(f.id));
         ctx.beginPath();
@@ -211,7 +307,7 @@ export default function NewsGlobe({ countries, spinSpeed = 6 }: NewsGlobeProps) 
         }
         ctx.fill();
         ctx.strokeStyle = theme.ocean;
-        ctx.lineWidth = 0.4;
+        ctx.lineWidth = 0.5;
         ctx.stroke();
       }
 
@@ -223,7 +319,7 @@ export default function NewsGlobe({ countries, spinSpeed = 6 }: NewsGlobeProps) 
       ctx.stroke();
 
       // Event markers. Colour is sentiment (a direction), size is volume.
-      const pulse = reduceMotion ? 0 : (Math.sin(elapsed * 2) + 1) / 2;
+      const pulse = reduced ? 0 : (Math.sin(elapsed * 2) + 1) / 2;
       for (const { c, coords } of markers) {
         const projected = projection(coords);
         if (!projected) continue;
@@ -267,7 +363,7 @@ export default function NewsGlobe({ countries, spinSpeed = 6 }: NewsGlobeProps) 
 
     raf = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(raf);
-  }, [size, countries, byCode, spinSpeed, themeTick]);
+  }, [size]);
 
   // Drag to rotate
   const onPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
@@ -287,7 +383,11 @@ export default function NewsGlobe({ countries, spinSpeed = 6 }: NewsGlobeProps) 
   };
   const endDrag = (e: React.PointerEvent<HTMLCanvasElement>) => {
     draggingRef.current = null;
-    e.currentTarget.releasePointerCapture(e.pointerId);
+    // The window-level release above often wins the race, and releasing an
+    // uncaptured pointer throws.
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
   };
 
   return (

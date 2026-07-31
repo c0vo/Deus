@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo "======================================"
-echo " Project Scrooge V2 - Termux Setup"
+echo " Deus - Termux Setup"
 echo "======================================"
 
 # Update and upgrade packages

@@ -17,6 +17,7 @@ from datetime import datetime, timezone, timedelta
 
 from config.logging_config import get_logger
 from config.settings import settings
+from config.usage import track_llm
 from config.llm import get_client, DEFAULT_SAFETY_SETTINGS
 from data.database import Database
 from api.sse_manager import event_bus
@@ -369,15 +370,16 @@ class SectorAnalyzer:
             loop = asyncio.get_running_loop()
 
             def ask_llm():
-                response = client.models.generate_content(
-                    model=settings.gemini_model_chat,
-                    contents=prompt,
-                    config={
-                        "safety_settings": DEFAULT_SAFETY_SETTINGS,
-                        "response_mime_type": "application/json",
-                        "thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
-                    }
-                )
+                with track_llm(self.db, settings.gemini_model_chat, "sector_rationales") as u:
+                    u.response = response = client.models.generate_content(
+                        model=settings.gemini_model_chat,
+                        contents=prompt,
+                        config={
+                            "safety_settings": DEFAULT_SAFETY_SETTINGS,
+                            "response_mime_type": "application/json",
+                            "thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
+                        }
+                    )
                 return response.text.strip()
 
             raw = await loop.run_in_executor(None, ask_llm)

@@ -1,4 +1,4 @@
-"""Shared test fixtures for the Project Scrooge V2 test suite."""
+"""Shared test fixtures for the Deus test suite."""
 
 import pytest
 import numpy as np

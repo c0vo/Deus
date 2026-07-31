@@ -200,7 +200,38 @@ class TestLLMUsageLogging:
         assert row is not None
         assert row["model_name"] == "test-model"
         assert row["prompt_tokens"] == 100
-        assert row["completion_tokens"] == 50
+        assert row["candidate_tokens"] == 50
+
+    def test_pro_and_flash_are_priced_differently(self, db):
+        """
+        The old substring pricing matched "deepseek" before "pro", so the
+        expensive reasoning model billed at flash rates. Identical token counts
+        on the two models must not produce an identical cost.
+        """
+        for model in ("deepseek-v4-pro", "deepseek-v4-flash"):
+            db.log_llm_usage(
+                model_name=model, operation=f"price_{model}",
+                prompt_tokens=1000, candidate_tokens=1000,
+            )
+        with db.connection() as conn:
+            costs = {
+                r["model_name"]: r["cost_usd"]
+                for r in conn.execute(
+                    "SELECT model_name, cost_usd FROM llm_usage_log WHERE operation LIKE 'price_%'"
+                )
+            }
+        assert costs["deepseek-v4-pro"] > costs["deepseek-v4-flash"]
+
+    def test_unknown_model_falls_back_without_crashing(self, db):
+        db.log_llm_usage(
+            model_name="some-model-nobody-priced", operation="unknown_price",
+            prompt_tokens=1000, candidate_tokens=1000,
+        )
+        with db.connection() as conn:
+            row = conn.execute(
+                "SELECT cost_usd FROM llm_usage_log WHERE operation='unknown_price'"
+            ).fetchone()
+        assert row["cost_usd"] > 0
 
     def test_log_error_usage(self, db):
         db.log_llm_usage(

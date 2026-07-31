@@ -229,10 +229,12 @@ class MarketScanner:
 
     async def check_earnings(self) -> None:
         """Query Finnhub for upcoming earnings in the next 1 trading day."""
-        import os
         from datetime import datetime, timedelta
-        
-        api_key = os.getenv("FINNHUB_API_KEY")
+
+        # settings reads .env through pydantic-settings, which does NOT export
+        # into os.environ — os.getenv here returned None on every run, so this
+        # alert has never fired.
+        api_key = settings.finnhub_api_key
         if not api_key or not self.alert_manager:
             return
             

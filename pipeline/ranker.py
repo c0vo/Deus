@@ -14,7 +14,7 @@ from google import genai
 from google.genai import types
 
 from config.logging_config import get_logger
-from config.llm import get_client, is_configured, DEFAULT_SAFETY_SETTINGS
+from config.llm import get_client, is_configured, is_transient, DEFAULT_SAFETY_SETTINGS
 from config.settings import settings
 from data.models import NewsArticle
 from data.database import Database
@@ -103,7 +103,11 @@ class ArticleRanker:
                     config=types.GenerateContentConfig(
                         temperature=0.1,
                         safety_settings=DEFAULT_SAFETY_SETTINGS,
-                        response_mime_type="application/json"
+                        response_mime_type="application/json",
+                        # {"id","importance_score"} per article is ~25 tokens;
+                        # the headroom is because JSON mode truncates into
+                        # unparseable output rather than degrading.
+                        max_output_tokens=settings.rank_max_output_tokens_per_article * len(articles),
                     )
                 )
                 response_text = response.text
@@ -160,5 +164,10 @@ class ArticleRanker:
             
         except Exception as e:
             log.error("ranker.failed", error=str(e), count=len(articles))
-            
+            # Surface infrastructure faults so the caller can retry them. A
+            # parse failure is swallowed as before — at temperature 0.1 a retry
+            # buys substantially the same response for the same price.
+            if is_transient(e):
+                raise
+
         return articles

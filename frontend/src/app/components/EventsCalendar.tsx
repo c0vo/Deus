@@ -1,6 +1,8 @@
 "use client";
 
 import { Trash2 } from "lucide-react";
+import { EVENT_LABELS, daysUntil } from "../utils/calendar";
+import { confidenceTag, DateChip } from "./calendar/EventChrome";
 
 interface TickerEvent {
   id: number;
@@ -17,24 +19,6 @@ interface EventsCalendarProps {
   onRemove?: (id: number) => void;
 }
 
-const EVENT_LABELS: Record<string, string> = {
-  earnings: "Earnings",
-  product_launch: "Product launch",
-  investor_day: "Investor day",
-  fda_decision: "FDA decision",
-  conference: "Conference",
-  dividend: "Dividend",
-  split: "Stock split",
-  acquisition: "Acquisition",
-};
-
-/** Confidence is the only thing here that warrants colour. */
-function confidenceTag(confidence: string) {
-  if (confidence === "confirmed") return <span className="tag tag-up">Confirmed</span>;
-  if (confidence === "estimated") return <span className="tag tag-warn">Estimated</span>;
-  return <span className="tag">{confidence || "Unconfirmed"}</span>;
-}
-
 export default function EventsCalendar({ events, onRemove }: EventsCalendarProps) {
   if (!events || events.length === 0) {
     return (
@@ -48,12 +32,6 @@ export default function EventsCalendar({ events, onRemove }: EventsCalendarProps
       </div>
     );
   }
-
-  const daysUntil = (dateStr: string): number => {
-    const eventDate = new Date(dateStr);
-    if (isNaN(eventDate.getTime())) return -1;
-    return Math.ceil((eventDate.getTime() - Date.now()) / 86_400_000);
-  };
 
   const sorted = [...events].sort((a, b) =>
     a.event_date.localeCompare(b.event_date)
@@ -71,24 +49,13 @@ export default function EventsCalendar({ events, onRemove }: EventsCalendarProps
       <div className="flex flex-col max-h-80 overflow-y-auto">
         {sorted.slice(0, 12).map((ev) => {
           const days = daysUntil(ev.event_date);
-          const date = new Date(ev.event_date);
-          const valid = !isNaN(date.getTime());
 
           return (
             <div
               key={ev.id}
               className="group flex items-center gap-3 px-3.5 py-2.5 border-b border-border-soft last:border-b-0 hover:bg-bg-surface transition-colors"
             >
-              <div className="shrink-0 w-10 py-1 rounded bg-bg-surface text-center leading-tight">
-                <span className="block text-[9px] font-semibold tracking-widest text-terminal-muted-alt">
-                  {valid
-                    ? date.toLocaleDateString("en-US", { month: "short" }).toUpperCase()
-                    : "—"}
-                </span>
-                <span className="num block text-[13px] font-medium">
-                  {valid ? date.getDate() : "—"}
-                </span>
-              </div>
+              <DateChip date={ev.event_date} />
 
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">

@@ -1,5 +1,5 @@
 """
-Project Scrooge V2 — REST and SSE APIs
+Deus — REST and SSE APIs
 
 Implements all required REST and SSE endpoints for Milestone 1.
 """
@@ -10,7 +10,7 @@ import json
 import asyncio
 import time
 from typing import Optional
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 
 from fastapi import APIRouter, Request, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -33,7 +33,9 @@ from pipeline.geo_tagger import country_name
 from pipeline.event_tracker import EventTracker
 from pipeline.trend_forecaster import TrendForecaster
 from api.sse_manager import event_bus
-from config.llm import get_client, DEFAULT_SAFETY_SETTINGS
+from config.llm import get_client, parse_structured, DEFAULT_SAFETY_SETTINGS
+from data.models import TickerNote, notes_to_dict
+from config.usage import track_llm
 from google.genai import types
 
 router = APIRouter()
@@ -65,14 +67,30 @@ def _sse_event(event: str, data="") -> str:
     return f"event: {event}\n" + "".join(f"data: {line}\n" for line in lines) + "\n"
 
 
+# Spot training runs a 1200-day feature loop plus a RandomizedSearchCV on the
+# API event loop. /api/markets is polled every 10s by the globally-mounted
+# ticker tape and can request every (ticker, horizon) pair at once, so without
+# a cap a cold model directory would launch dozens of concurrent searches and
+# stall the API and Telegram bot. Queued tasks keep their active_trainings slot,
+# so the cap throttles rather than drops them.
+MAX_CONCURRENT_SPOT_TRAININGS = 2
+_spot_training_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SPOT_TRAININGS)
+
+
 async def background_train_and_predict(ticker: str, horizon_days: int, app_state):
     db = getattr(app_state, "db", None) or Database()
     predictor = StockPredictor(db)
     try:
-        log.info(f"Spot training ML model for {ticker} ({horizon_days}d) in background...")
-        await predictor.train_model(ticker, scope="per_ticker", horizon_days=horizon_days)
-        await predictor.predict(ticker, horizon_days=horizon_days, fast_fallback=False)
-        log.info(f"Spot training complete and prediction saved for {ticker} ({horizon_days}d)")
+        async with _spot_training_semaphore:
+            log.info(f"Spot training ML model for {ticker} ({horizon_days}d) in background...")
+            await predictor.train_model(ticker, scope="per_ticker", horizon_days=horizon_days)
+            await predictor.predict(ticker, horizon_days=horizon_days, fast_fallback=False)
+            log.info(f"Spot training complete and prediction saved for {ticker} ({horizon_days}d)")
+        # Clear any earlier failure: without this a pair that failed once stays
+        # pinned to the fast heuristic for the whole process lifetime, and that
+        # fabricated confidence gets written to `predictions` and later scored
+        # as if it were a real model output.
+        getattr(app_state, "failed_trainings", set()).discard((ticker, horizon_days))
     except Exception as e:
         log.error(f"Error in spot training for {ticker} ({horizon_days}d): {e}")
         failed_trainings = getattr(app_state, "failed_trainings", set())
@@ -108,6 +126,106 @@ class ReflectionRequest(BaseModel):
     scope: str = "ticker"           # 'ticker', 'sector', or 'market'
     sector: Optional[str] = None    # required when scope='sector'
     tags: Optional[str] = None      # comma-separated free-form tags
+
+
+# ── Smart Money (insider / institutional / KR flows) ─────────────────
+
+@router.get("/api/brain/smart-money")
+async def get_smart_money(
+    request: Request,
+    days: int = Query(30, ge=1, le=365),
+    limit: int = Query(40, ge=1, le=200),
+):
+    """Recent disclosed positioning across all tracked tickers.
+
+    Insider rows are open-market buys/sells only — grants, option exercises and
+    tax withholding are compensation mechanics and would drown the signal.
+    """
+    db = getattr(request.app.state, "db", None) or Database()
+    transactions = db.get_recent_insider_activity(days=days, limit=limit)
+    stakes = db.get_recent_stakes(days=max(days, 90), limit=25)
+
+    buy_value = sum(abs(t["value_usd"] or 0) for t in transactions
+                    if t["transaction_code"] == "P")
+    sell_value = sum(abs(t["value_usd"] or 0) for t in transactions
+                     if t["transaction_code"] == "S")
+    denom = buy_value + sell_value
+
+    # Per-ticker net, so the UI can rank who is being bought and who is being sold.
+    by_ticker: dict[str, dict] = {}
+    for t in transactions:
+        row = by_ticker.setdefault(t["ticker"], {
+            "ticker": t["ticker"], "buy_value": 0.0, "sell_value": 0.0,
+            "buy_count": 0, "sell_count": 0, "buyers": set(),
+        })
+        value = abs(t["value_usd"] or 0)
+        if t["transaction_code"] == "P":
+            row["buy_value"] += value
+            row["buy_count"] += 1
+            if t["insider_name"]:
+                row["buyers"].add(t["insider_name"])
+        else:
+            row["sell_value"] += value
+            row["sell_count"] += 1
+
+    tickers = []
+    for row in by_ticker.values():
+        row["distinct_buyers"] = len(row.pop("buyers"))
+        row["net_value"] = row["buy_value"] - row["sell_value"]
+        tickers.append(row)
+    tickers.sort(key=lambda r: r["net_value"], reverse=True)
+
+    return {"data": {
+        "window_days": days,
+        "totals": {
+            "buy_value": buy_value,
+            "sell_value": sell_value,
+            "net_value": buy_value - sell_value,
+            "buy_ratio": (buy_value / denom) if denom else None,
+            "transaction_count": len(transactions),
+        },
+        "by_ticker": tickers,
+        "transactions": transactions,
+        "stakes": stakes,
+    }}
+
+
+@router.get("/api/insider/{ticker}")
+async def get_insider_for_ticker(
+    request: Request,
+    ticker: str,
+    days: int = Query(90, ge=1, le=730),
+):
+    """Insider and >5%-stake summary for one ticker."""
+    db = getattr(request.app.state, "db", None) or Database()
+    from pipeline.insider_tracker import InsiderTracker
+    summary = InsiderTracker(db).get_summary(ticker.upper().strip(), days=days)
+    return {"data": summary}
+
+
+@router.get("/api/flows/kr/{ticker}")
+async def get_kr_flows(
+    request: Request,
+    ticker: str,
+    days: int = Query(60, ge=1, le=730),
+):
+    """Daily Korean institutional and foreign net trading for one ticker."""
+    db = getattr(request.app.state, "db", None) or Database()
+    from data.tickers import to_krx_code
+    from pipeline.kr_flows import KrFlowTracker
+
+    code = to_krx_code(ticker)
+    if not code:
+        raise HTTPException(status_code=400, detail=f"{ticker} is not a Korean listing")
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    series = [r for r in db.get_kr_flow_series(code) if r["trade_date"] >= cutoff]
+    return {"data": {
+        "ticker": ticker.upper(),
+        "krx_code": code,
+        "summary": KrFlowTracker(db).get_summary(ticker, days=days),
+        "series": series,
+    }}
 
 
 # ── Watchlist CRUD ───────────────────────────────────────────────────
@@ -618,15 +736,30 @@ async def chat_stream(request: Request, payload: ChatRequest):
             if decision == "complex":
                 config.thinking_config = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MEDIUM)
 
-            response = await client.aio.models.generate_content_stream(
-                model=model,
-                contents=prompt,
-                config=config
-            )
+            # This is the primary user-facing chat path and it recorded nothing
+            # at all until now. Streamed responses carry usage_metadata on the
+            # trailing chunks, so keep the last one seen and log it after the
+            # stream drains.
+            with track_llm(db, model, "chat_stream") as usage:
+                response = await client.aio.models.generate_content_stream(
+                    model=model,
+                    contents=prompt,
+                    config=config
+                )
 
-            async for chunk in response:
-                if chunk.text:
-                    await queue.put({"event": "token", "data": json.dumps({"text": chunk.text})})
+                collected = []
+                final_usage = None
+                async for chunk in response:
+                    if chunk.text:
+                        collected.append(chunk.text)
+                        await queue.put({"event": "token", "data": json.dumps({"text": chunk.text})})
+                    if getattr(chunk, "usage_metadata", None):
+                        final_usage = chunk.usage_metadata
+
+                if final_usage is not None:
+                    usage.prompt_tokens = final_usage.prompt_token_count
+                    usage.candidate_tokens = final_usage.candidates_token_count
+                usage.response_text = "".join(collected)
 
         except asyncio.CancelledError:
             pass  # cancelled due to client disconnect
@@ -722,7 +855,7 @@ async def get_trending(request: Request, hours: int = 24, limit: int = 15, refre
             f"For EACH ticker, write a concise 1-sentence explanation of exactly why it is trending based ONLY on the context.\n"
             f"You MUST include an exact quote from the context if available. Do NOT use emojis.\n"
             f"Do NOT use markdown or HTML tags in your summaries. Just plain text.\n"
-            f"You MUST format your response as a valid JSON dictionary where the keys are the tickers and the values are the 1-sentence summaries.\n\n"
+            f"Return one entry per ticker in the required response schema.\n\n"
         )
         for tk, sums in all_ticker_contexts.items():
             prompt += f"Ticker: {tk}\nContext:\n" + "\n".join(f"- {s}" for s in sums) + "\n\n"
@@ -741,6 +874,7 @@ async def get_trending(request: Request, hours: int = 24, limit: int = 15, refre
                         config={
                             'safety_settings': DEFAULT_SAFETY_SETTINGS,
                             'response_mime_type': 'application/json',
+                            'response_schema': list[TickerNote],
                             'thinking_config': types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
                         }
                     )
@@ -774,13 +908,11 @@ async def get_trending(request: Request, hours: int = 24, limit: int = 15, refre
                             prompt_text=prompt,
                             response_text=None
                         )
-                return response.text.strip()
+                if isinstance(response.parsed, list):
+                    return notes_to_dict(response.parsed)
+                return notes_to_dict(parse_structured(response.text, list[TickerNote]))
 
-            raw_json = await loop.run_in_executor(None, ask_batch_llm)
-            if raw_json.startswith("```json"): raw_json = raw_json[7:]
-            if raw_json.startswith("```"): raw_json = raw_json[3:]
-            if raw_json.endswith("```"): raw_json = raw_json[:-3]
-            ai_summaries = json.loads(raw_json.strip())
+            ai_summaries = await loop.run_in_executor(None, ask_batch_llm)
         except Exception as e:
             log.error("api.trending_batch_summary_failed", error=str(e))
 
@@ -793,7 +925,7 @@ async def get_trending(request: Request, hours: int = 24, limit: int = 15, refre
             "ticker": ticker,
             "mention_count": t["mention_count"],
             "avg_sentiment": t["avg_sentiment"],
-            "summary": ai_summaries.get(ticker) or "No AI summary available.",
+            "summary": ai_summaries.get(ticker.upper()) or "No AI summary available.",
             "articles": articles,
         })
 
@@ -1026,7 +1158,10 @@ async def get_status(request: Request):
 @router.get("/api/usage")
 async def get_usage(request: Request):
     db = getattr(request.app.state, "db", None) or Database()
-    usage = db.get_usage_stats()
+    # Explicit window: by_model is built from `details`, so the totals must be
+    # computed over the same period or the table can never sum to the headline.
+    # The lifetime figures ride along as all_time_* for the dashboard header.
+    usage = db.get_usage_stats(days=7)
     by_model = {}
     for row in usage.get("details", []):
         model = row.get("model_name") or "unknown"
@@ -1238,6 +1373,152 @@ async def delete_event(request: Request, event_id: int):
     return {"success": True}
 
 
+# ── Calendar ─────────────────────────────────────────────────────────────────
+# A merged view over ticker_events and ipo_tracker. It exists rather than
+# reusing /api/brain/events + /api/brain/ipos because those are shaped for the
+# dashboard cards: events has no from-date and caps at 90 days ahead, ipos
+# hardcodes LIMIT 30 and a status-priority ordering. A month grid needs an
+# arbitrary date window, no limit, and date ordering — and the two tables have
+# colliding integer PKs, so the merged rows carry prefixed ids.
+
+_CALENDAR_REFRESH_COOLDOWN_S = 60
+_last_calendar_refresh = 0.0
+
+IPO_CONFIDENCE = {
+    "priced": "confirmed",
+    "listed": "confirmed",
+    "upcoming": "estimated",
+}
+
+
+def _ipo_to_calendar_item(ipo: dict) -> dict:
+    meta = {}
+    if ipo.get("metadata_json"):
+        try:
+            meta = json.loads(ipo["metadata_json"])
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+
+    detail_parts = [p for p in (meta.get("exchange"), ipo.get("offering_price")) if p]
+    return {
+        "id": f"ipo:{ipo['id']}",
+        "kind": "ipo",
+        "date": ipo.get("ipo_date"),
+        "ticker": ipo.get("ticker"),
+        "title": ipo.get("company_name"),
+        "event_type": "ipo",
+        "confidence": IPO_CONFIDENCE.get(ipo.get("status") or "", "rumored"),
+        "source": meta.get("source") or "llm_extracted",
+        "sector": ipo.get("sector"),
+        "detail": " · ".join(str(p) for p in detail_parts),
+        "raw_id": ipo["id"],
+    }
+
+
+def _event_to_calendar_item(event: dict) -> dict:
+    return {
+        "id": f"event:{event['id']}",
+        "kind": "event",
+        "date": event.get("event_date"),
+        "ticker": event.get("ticker"),
+        "title": event.get("event_title") or f"{event.get('ticker', '')} {event.get('event_type', '')}".strip(),
+        "event_type": event.get("event_type"),
+        "confidence": event.get("confidence"),
+        "source": event.get("source"),
+        "sector": event.get("sector"),
+        "detail": event.get("notes") or "",
+        "raw_id": event["id"],
+    }
+
+
+@router.get("/api/calendar")
+async def get_calendar(
+    request: Request,
+    from_date: Optional[str] = Query(None, alias="from", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    to_date: Optional[str] = Query(None, alias="to", pattern=r"^\d{4}-\d{2}-\d{2}$"),
+):
+    """Events and IPOs in a date window, for the calendar page."""
+    today = datetime.now(timezone.utc).date()
+    if not from_date:
+        from_date = today.replace(day=1).isoformat()
+    if not to_date:
+        next_month = (today.replace(day=28) + timedelta(days=4)).replace(day=1)
+        to_date = (next_month - timedelta(days=1)).isoformat()
+
+    if from_date > to_date:
+        raise HTTPException(status_code=400, detail="`from` must not be after `to`")
+    span = (date.fromisoformat(to_date) - date.fromisoformat(from_date)).days
+    if span > 400:
+        raise HTTPException(status_code=400, detail="Range must be 400 days or fewer")
+
+    db = getattr(request.app.state, "db", None) or Database()
+
+    events = EventTracker(db).get_events_in_range(from_date, to_date)
+    items = [_event_to_calendar_item(e) for e in events]
+
+    with db.connection() as conn:
+        ipo_rows = conn.execute(
+            """
+            SELECT * FROM ipo_tracker
+            WHERE ipo_date IS NOT NULL
+              AND ipo_date >= ? AND ipo_date <= ?
+            ORDER BY ipo_date ASC
+            """,
+            (from_date, to_date),
+        ).fetchall()
+    items.extend(_ipo_to_calendar_item(dict(r)) for r in ipo_rows)
+
+    # Sorted server-side so the client never re-sorts.
+    items.sort(key=lambda i: (i["date"] or "", i["kind"], i["ticker"] or ""))
+
+    return {
+        "data": {
+            "from": from_date,
+            "to": to_date,
+            "items": items,
+            "counts": {
+                "event": sum(1 for i in items if i["kind"] == "event"),
+                "ipo": sum(1 for i in items if i["kind"] == "ipo"),
+            },
+            "sources": {"finnhub": bool(settings.finnhub_api_key)},
+        }
+    }
+
+
+@router.post("/api/calendar/refresh")
+async def refresh_calendar(request: Request):
+    """
+    Pull the Finnhub earnings and IPO calendars on demand.
+
+    Deliberately does NOT call scan_upcoming_events() — that would fire the
+    DeepSeek news extraction pass and spend tokens on a button press.
+    """
+    global _last_calendar_refresh
+
+    now = time.monotonic()
+    if now - _last_calendar_refresh < _CALENDAR_REFRESH_COOLDOWN_S:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Try again in {int(_CALENDAR_REFRESH_COOLDOWN_S - (now - _last_calendar_refresh))}s",
+        )
+    _last_calendar_refresh = now
+
+    db = getattr(request.app.state, "db", None) or Database()
+    started = time.monotonic()
+
+    earnings = await EventTracker(db)._scan_earnings_calendar()
+    ipos = await IPODetector(db).scan_finnhub_ipos()
+
+    return {
+        "data": {
+            "earnings_added": len(earnings),
+            "ipos_added": len(ipos),
+            "finnhub_configured": bool(settings.finnhub_api_key),
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        }
+    }
+
+
 @router.get("/api/brain/macro-themes")
 async def get_macro_themes(request: Request, refresh: bool = False):
     """Get LLM-generated macro themes from recent high-importance news."""
@@ -1306,7 +1587,7 @@ async def brain_stream(request: Request):
         "pipeline_status", "new_articles", "sector_heatmap",
         "rotation_signal", "ipo_alert", "trend_forecast",
         "hot_tickers", "market_ticker", "sentiment_distribution",
-        "embedding_status",
+        "embedding_status", "events_updated",
     ]
     subscriber = event_bus.subscribe(topics)
 

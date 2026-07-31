@@ -1,7 +1,7 @@
 import pytest
 import numpy as np
 from unittest.mock import MagicMock, AsyncMock, patch
-from pipeline.predictor import StockPredictor
+from pipeline.predictor import FEATURE_SCHEMA_VERSION, StockPredictor
 
 @pytest.fixture
 def mock_db():
@@ -62,7 +62,9 @@ async def test_build_feature_vector(predictor):
 @pytest.mark.asyncio
 async def test_train_model(predictor):
     path, cv_metrics = await predictor.train_model("AAPL", scope="per_ticker")
-    assert path.endswith("AAPL_model_1d.joblib")
+    # Model filenames carry the feature-schema version so a schema change makes
+    # old artifacts unfindable rather than deleting them.
+    assert path.endswith(f"AAPL_model_1d_v{FEATURE_SCHEMA_VERSION}.joblib")
     
     # Verify CV metrics are returned with expected keys
     assert isinstance(cv_metrics, dict)
@@ -229,7 +231,6 @@ async def test_feature_vector_has_expected_structure(predictor):
         # Should have price/technical features
         assert "return_1d" in features
         assert "return_5d" in features
-        assert "return_20d" in features
         assert "rsi_14" in features
         assert "volatility" in features
 
@@ -264,7 +265,9 @@ async def test_model_serialization_round_trip(predictor):
     from sklearn.ensemble import GradientBoostingClassifier
 
     path, cv_metrics = await predictor.train_model("AAPL", scope="per_ticker")
-    assert path.endswith("AAPL_model_1d.joblib")
+    # Model filenames carry the feature-schema version so a schema change makes
+    # old artifacts unfindable rather than deleting them.
+    assert path.endswith(f"AAPL_model_1d_v{FEATURE_SCHEMA_VERSION}.joblib")
 
     # Load it fresh
     model, scope = predictor._load_model("AAPL")

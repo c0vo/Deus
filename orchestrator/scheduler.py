@@ -1,5 +1,5 @@
 """
-Project Scrooge V2 — Pipeline Orchestrator
+Deus — Pipeline Orchestrator
 
 Manages the periodic execution of the entire data pipeline:
 1. Fetching from sources
@@ -17,12 +17,14 @@ import asyncio
 import numpy as np
 from zoneinfo import ZoneInfo
 from typing import Optional
+from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from google.genai import types
 from config.logging_config import get_logger
 from config.settings import settings
+from config.llm import is_transient, parse_structured
 from data.database import Database
 from pipeline.aggregator import NewsAggregator
 from pipeline.classifier import ArticleClassifier
@@ -34,13 +36,26 @@ from pipeline.ipo_detector import IPODetector
 from pipeline.geo_tagger import GeoTagger
 from pipeline.event_tracker import EventTracker
 from pipeline.trend_forecaster import TrendForecaster
+from pipeline.insider_tracker import InsiderTracker
+from pipeline.kr_flows import KrFlowTracker
 from bot.alerts import AlertManager
 from api.sse_manager import event_bus
 
 log = get_logger(__name__)
 
+
+class ReflectionLesson(BaseModel):
+    """One extracted lesson from a resolved prediction."""
+
+    lesson_learned: str
+    failure_mode: str = "none"
+    success_mode: str = "none"
+    actionable_fix: str = ""
+    should_adjust_strategy: bool = False
+
+
 class PipelineOrchestrator:
-    """Orchestrates the periodic execution of the Scrooge pipeline."""
+    """Orchestrates the periodic execution of the Deus pipeline."""
 
     def __init__(self, db: Database, alert_manager: Optional[AlertManager] = None):
         self.db = db
@@ -49,13 +64,15 @@ class PipelineOrchestrator:
         self.aggregator = NewsAggregator(db=self.db)
         self.classifier = ArticleClassifier(db=self.db)
         self.ranker = ArticleRanker(db=self.db)
-        self.embedder = GeminiEmbedder()
+        self.embedder = GeminiEmbedder(db=self.db)
         self.market_scanner = MarketScanner(db=self.db, alert_manager=self.alert_manager)
         self.sector_analyzer = SectorAnalyzer(db=self.db, alert_manager=self.alert_manager)
         self.ipo_detector = IPODetector(db=self.db)
         self.geo_tagger = GeoTagger(db=self.db)
         self.event_tracker = EventTracker(db=self.db, alert_manager=self.alert_manager)
         self.trend_forecaster = TrendForecaster(db=self.db)
+        self.insider_tracker = InsiderTracker(db=self.db)
+        self.kr_flow_tracker = KrFlowTracker(db=self.db)
 
         self.scheduler = AsyncIOScheduler()
         self.is_running = False
@@ -118,186 +135,255 @@ class PipelineOrchestrator:
             except Exception as e:
                 log.error("orchestrator.sse_publish_failed", error=str(e))
 
-        # Scan for IPO mentions and upcoming events on freshly classified articles
-        try:
-            ipo_results = await self.ipo_detector.scan_for_ipos()
-            if ipo_results:
-                log.info("orchestrator.ipos_detected_in_cycle", count=len(ipo_results))
-        except Exception as e:
-            log.warning("orchestrator.ipo_scan_failed", error=str(e))
-
-        try:
-            event_results = await self.event_tracker.scan_upcoming_events()
-            if event_results:
-                log.info("orchestrator.events_detected_in_cycle", count=len(event_results))
-        except Exception as e:
-            log.warning("orchestrator.event_scan_failed", error=str(e))
-
+        # IPO and event scanning deliberately do NOT run here. Both are already
+        # registered as their own jobs (ipo_scan hourly, event_scan every 6h);
+        # running them inline as well meant they fired once per pipeline cycle,
+        # which is over an order of magnitude more often than intended.
         log.info("orchestrator.cycle_complete", duration_seconds=round(duration, 2))
 
     async def _process_batch(self) -> None:
         """Process a batch of articles (Embed -> Classify -> Rank -> Alert)."""
         try:
 
-            # Step 2: Embed unembedded articles FIRST (for deduplication)
+            # Step 2: Embed unembedded articles FIRST (for deduplication).
+            #
+            # Rows already flagged noise by the aggregator's pre-insert filter
+            # are excluded — they are never classified, ranked or searched, so
+            # buying a vector for them is pure waste.
             with self.db.connection() as conn:
                 unembedded = conn.execute(
-                    "SELECT * FROM articles WHERE embedding IS NULL LIMIT 50"
+                    """
+                    SELECT * FROM articles
+                    WHERE embedding IS NULL
+                      AND (event_type IS NULL OR event_type != 'noise')
+                      AND COALESCE(embed_attempts, 0) < 3
+                    LIMIT 50
+                    """
                 ).fetchall()
 
             if unembedded:
-                log.info("orchestrator.embed", count=len(unembedded))
-                self._cycle_counts["embedded"] += len(unembedded)
-                articles_to_embed = [
-                    self.db.row_to_article(row) for row in unembedded
-                ]
-                # Parallel embedding: process up to 5 articles at once via asyncio.gather
-                BATCH_SIZE = 5
-                for i in range(0, len(articles_to_embed), BATCH_SIZE):
-                    batch = articles_to_embed[i:i+BATCH_SIZE]
+                candidates = [self.db.row_to_article(row) for row in unembedded]
 
-                    async def embed_single(a):
-                        embedding = None
-                        for _ in range(3):
-                            embedding = await self.embedder.embed_article(a)
-                            if embedding is not None:
-                                break
-                            await asyncio.sleep(2)
-                        return a.id, embedding
+                # Apply the classifier's free keyword heuristic here rather than
+                # one step later. It is the same verdict classify() would reach,
+                # and reaching it now avoids paying to embed a row that is about
+                # to be marked noise anyway.
+                to_embed, prefiltered = [], []
+                for a in candidates:
+                    (to_embed if self.classifier.should_classify(a) else prefiltered).append(a)
 
-                    results = await asyncio.gather(*[embed_single(a) for a in batch])
+                for a in prefiltered:
+                    self.db.update_classification(
+                        article_id=a.id,
+                        event_type="noise",
+                        sentiment_score=0.0,
+                        urgency="low",
+                        suggested_direction="neutral",
+                        affected_sectors=[],
+                        affected_tickers=[],
+                        classification_summary=ArticleClassifier.NOISE_SUMMARY,
+                    )
 
-                    for article_id, embedding in results:
+                if to_embed:
+                    log.info(
+                        "orchestrator.embed",
+                        count=len(to_embed), prefiltered_noise=len(prefiltered),
+                    )
+                    self._cycle_counts["embedded"] += len(to_embed)
+
+                    # One request per batch rather than one per article. The old
+                    # gather-of-5 was concurrency, not batching — still 50 HTTP
+                    # round-trips, each with its own 3x retry on top.
+                    vectors = await self.embedder.embed_articles(to_embed)
+
+                    for article, embedding in zip(to_embed, vectors):
                         if embedding is not None:
-                            self.db.update_embedding(article_id, embedding)
+                            self.db.update_embedding(article.id, embedding)
                         else:
-                            dummy_vector = np.zeros(3072, dtype=np.float32)
-                            self.db.update_embedding(article_id, dummy_vector)
+                            # Left NULL so a later pass retries it, bounded by
+                            # embed_attempts. The previous zero-vector
+                            # placeholder marked the row embedded forever and
+                            # poisoned every cosine comparison it entered.
+                            self.db.record_embed_failure(article.id)
 
             # Step 3: Classify unclassified articles (with Semantic Deduplication)
+            #
+            # Dedup runs as its own pass over the whole batch before any
+            # classification, then the survivors go out in batched calls. Dedup
+            # makes no LLM calls — it reads the article's own embedding and
+            # older persisted rows — so hoisting it costs nothing and still
+            # suppresses duplicates before the model sees them, as before.
             unclassified_data = self.db.get_unclassified_articles(limit=20)
             log.info("orchestrator.classify", count=len(unclassified_data))
             classified_count = 0
 
-            for row_dict in unclassified_data:
-                article = self.db.row_to_article(row_dict)
+            articles = [self.db.row_to_article(r) for r in unclassified_data]
+            needs_llm = [a for a in articles if not self._absorb_duplicate(a)]
 
-                # Fetch embedding
-                article_emb = None
-                with self.db.connection() as conn:
-                    row = conn.execute("SELECT embedding FROM articles WHERE id = ?", (article.id,)).fetchone()
-                    if row and row["embedding"]:
-                        article_emb = np.frombuffer(row["embedding"], dtype=np.float32)
-
-                is_duplicate = False
-
-                if article_emb is not None:
-                    # Windowed nearest-neighbour lookup. Bounding by publish date
-                    # keeps an old story from suppressing a current one and stops
-                    # every candidate query being a full scan of the corpus.
-                    match = self.db.find_duplicate(
-                        article_id=article.id,
-                        embedding=article_emb,
-                        published_at=article.published_at.isoformat()
-                        if hasattr(article.published_at, "isoformat")
-                        else str(article.published_at),
-                        window_days=settings.dedup_window_days,
-                        threshold=settings.dedup_similarity_threshold,
-                    )
-
-                    if match:
-                        best_match_id, highest_sim = match
-                        with self.db.connection() as conn:
-                            source_row = conn.execute(
-                                "SELECT * FROM articles WHERE id = ?", (best_match_id,)
-                            ).fetchone()
-
-                        if source_row and source_row["event_type"]:
-                            is_duplicate = True
-                            log.info(
-                                "orchestrator.semantic_dedup.flagged",
-                                article_id=article.id,
-                                source_id=best_match_id,
-                                sim=round(highest_sim, 3),
-                            )
-                            # Inherit the canonical article's classification so the
-                            # row stays queryable, then flag it. Flagged rows are
-                            # excluded from feeds, trending and coverage counts —
-                            # and deliberately NOT written to ticker_mentions,
-                            # which is what was inflating trending counts when the
-                            # same story arrived from five syndicating outlets.
-                            self.db.update_classification(
-                                article_id=article.id,
-                                event_type=source_row["event_type"],
-                                sentiment_score=source_row["sentiment_score"],
-                                urgency=source_row["urgency"],
-                                suggested_direction=source_row["suggested_direction"],
-                                affected_sectors=json.loads(source_row["affected_sectors"]) if source_row["affected_sectors"] else [],
-                                affected_tickers=json.loads(source_row["affected_tickers"]) if source_row["affected_tickers"] else [],
-                                classification_summary=source_row["classification_summary"],
-                            )
-                            self.db.mark_duplicate(article.id, best_match_id)
-                        else:
-                            # Nearest neighbour exists but isn't classified yet, so
-                            # there is nothing to inherit. Leave it for a later pass.
-                            log.debug(
-                                "orchestrator.semantic_dedup.match_unclassified",
-                                article_id=article.id,
-                                sim=round(highest_sim, 3),
-                            )
-                    else:
-                        self.db.mark_dedup_checked(article.id)
-
-                if not is_duplicate:
-                    classified_article = None
-                    for _ in range(3):
-                        classified_article = await self.classifier.classify(article)
-                        if classified_article.event_type:
-                            break
-                        await asyncio.sleep(2)
-
-                    if classified_article and classified_article.event_type:
-                        self.db.update_classification(
-                            article_id=classified_article.id,
-                            event_type=classified_article.event_type,
-                            sentiment_score=classified_article.sentiment_score,
-                            urgency=classified_article.urgency,
-                            suggested_direction=classified_article.suggested_direction,
-                            affected_sectors=classified_article.affected_sectors,
-                            affected_tickers=classified_article.affected_tickers,
-                            classification_summary=classified_article.classification_summary,
-                            countries=classified_article.countries or [],
-                        )
-
-                        self.db.insert_ticker_mentions(
-                            article_id=classified_article.id,
-                            tickers=classified_article.affected_tickers,
-                            sentiment_score=classified_article.sentiment_score,
-                            urgency=classified_article.urgency
-                        )
-                        asyncio.create_task(
-                            event_bus.publish("new_articles", {"articles": [classified_article.model_dump()]})
-                        )
-                        classified_count += 1
-                    else:
-                        # Fallback: Mark as failed so it doesn't infinite loop
-                        self.db.update_classification(
-                            article_id=article.id,
-                            event_type="error",
-                            sentiment_score=0.0,
-                            urgency="low",
-                            suggested_direction="neutral",
-                            affected_sectors=[],
-                            affected_tickers=[],
-                            classification_summary="Classification failed due to parsing error."
-                        )
-                        asyncio.create_task(
-                            event_bus.publish("new_articles", {"articles": [article.model_dump()]})
-                        )
+            size = settings.classify_batch_size
+            for i in range(0, len(needs_llm), size):
+                chunk = needs_llm[i:i + size]
+                if await self._classify_chunk_with_retry(chunk):
+                    classified_count += self._persist_classifications(chunk)
 
             self._cycle_counts["classified"] += classified_count
 
             # Step 4: Rank unranked articles (skip low-signal articles to save LLM calls)
+            await self._rank_pending()
+
+        except Exception as e:
+            log.error("orchestrator.batch_failed", error=str(e))
+            self._cycle_counts["errors"] += 1
+
+    async def _classify_chunk_with_retry(self, chunk: list) -> bool:
+        """
+        Classifies a chunk, retrying only infrastructure faults.
+
+        Returns True if the results are safe to persist. A False means every
+        attempt hit a transient fault, so the rows are left with event_type
+        NULL for a later pass rather than being written off as 'error' — an
+        outage should not permanently discard a batch of articles.
+        """
+        for attempt in range(settings.llm_max_retries):
+            try:
+                await self.classifier.classify_batch(chunk)
+                return True
+            except Exception as e:
+                if not is_transient(e) or attempt == settings.llm_max_retries - 1:
+                    log.error(
+                        "orchestrator.classify_batch_failed",
+                        error=str(e), count=len(chunk),
+                        transient=is_transient(e), attempts=attempt + 1,
+                    )
+                    return not is_transient(e)
+                # Exponential, not a flat 2s — a rate limit needs room to clear.
+                await asyncio.sleep(2 ** attempt)
+        return False
+
+    def _absorb_duplicate(self, article) -> bool:
+        """
+        Semantic-dedup a single article. Returns True if it was absorbed into an
+        already-classified near-duplicate, in which case it needs no LLM call.
+
+        No LLM calls here — this reads the article's own embedding and compares
+        against older persisted rows only.
+        """
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT embedding FROM articles WHERE id = ?", (article.id,)
+            ).fetchone()
+        if not (row and row["embedding"]):
+            return False
+
+        article_emb = np.frombuffer(row["embedding"], dtype=np.float32)
+
+        # Windowed nearest-neighbour lookup. Bounding by publish date keeps an
+        # old story from suppressing a current one and stops every candidate
+        # query being a full scan of the corpus.
+        match = self.db.find_duplicate(
+            article_id=article.id,
+            embedding=article_emb,
+            published_at=article.published_at.isoformat()
+            if hasattr(article.published_at, "isoformat")
+            else str(article.published_at),
+            window_days=settings.dedup_window_days,
+            threshold=settings.dedup_similarity_threshold,
+        )
+
+        if not match:
+            self.db.mark_dedup_checked(article.id)
+            return False
+
+        best_match_id, highest_sim = match
+        with self.db.connection() as conn:
+            source_row = conn.execute(
+                "SELECT * FROM articles WHERE id = ?", (best_match_id,)
+            ).fetchone()
+
+        if not (source_row and source_row["event_type"]):
+            # Nearest neighbour exists but isn't classified yet, so there is
+            # nothing to inherit. Leave it for a later pass.
+            log.debug(
+                "orchestrator.semantic_dedup.match_unclassified",
+                article_id=article.id,
+                sim=round(highest_sim, 3),
+            )
+            return False
+
+        log.info(
+            "orchestrator.semantic_dedup.flagged",
+            article_id=article.id,
+            source_id=best_match_id,
+            sim=round(highest_sim, 3),
+        )
+        # Inherit the canonical article's classification so the row stays
+        # queryable, then flag it. Flagged rows are excluded from feeds,
+        # trending and coverage counts — and deliberately NOT written to
+        # ticker_mentions, which is what was inflating trending counts when the
+        # same story arrived from five syndicating outlets.
+        self.db.update_classification(
+            article_id=article.id,
+            event_type=source_row["event_type"],
+            sentiment_score=source_row["sentiment_score"],
+            urgency=source_row["urgency"],
+            suggested_direction=source_row["suggested_direction"],
+            affected_sectors=json.loads(source_row["affected_sectors"]) if source_row["affected_sectors"] else [],
+            affected_tickers=json.loads(source_row["affected_tickers"]) if source_row["affected_tickers"] else [],
+            classification_summary=source_row["classification_summary"],
+        )
+        self.db.mark_duplicate(article.id, best_match_id)
+        return True
+
+    def _persist_classifications(self, chunk: list) -> int:
+        """
+        Writes back a classified chunk. Returns how many succeeded.
+
+        Articles the model never answered for come back with event_type still
+        unset; those are marked 'error' so they do not requeue forever.
+        """
+        succeeded = 0
+        for article in chunk:
+            if article.event_type:
+                self.db.update_classification(
+                    article_id=article.id,
+                    event_type=article.event_type,
+                    sentiment_score=article.sentiment_score,
+                    urgency=article.urgency,
+                    suggested_direction=article.suggested_direction,
+                    affected_sectors=article.affected_sectors,
+                    affected_tickers=article.affected_tickers,
+                    classification_summary=article.classification_summary,
+                    countries=article.countries or [],
+                )
+                self.db.insert_ticker_mentions(
+                    article_id=article.id,
+                    tickers=article.affected_tickers,
+                    sentiment_score=article.sentiment_score,
+                    urgency=article.urgency,
+                )
+                succeeded += 1
+            else:
+                # Mark as failed so it doesn't infinite loop
+                self.db.update_classification(
+                    article_id=article.id,
+                    event_type="error",
+                    sentiment_score=0.0,
+                    urgency="low",
+                    suggested_direction="neutral",
+                    affected_sectors=[],
+                    affected_tickers=[],
+                    classification_summary="Classification failed due to parsing error.",
+                )
+
+            asyncio.create_task(
+                event_bus.publish("new_articles", {"articles": [article.model_dump()]})
+            )
+
+        return succeeded
+
+    async def _rank_pending(self) -> None:
+        """Batch-rank classified articles that have no importance score yet."""
+        try:
             unranked_data = self.db.get_unranked_articles(limit=20)
             log.info("orchestrator.rank", count=len(unranked_data))
             ranked_count = 0
@@ -321,12 +407,23 @@ class PipelineOrchestrator:
                         self.db.row_to_article(row_dict) for row_dict in to_rank
                     ]
 
+                    # Retry infrastructure faults only. The old loop retried on
+                    # any falsy result, so an unparseable response cost three
+                    # identical calls at temperature 0.1.
                     ranked_articles = []
-                    for _ in range(3):
-                        ranked_articles = await self.ranker.rank_batch(articles_to_rank)
-                        if ranked_articles and any(r.importance_score is not None for r in ranked_articles):
+                    for attempt in range(settings.llm_max_retries):
+                        try:
+                            ranked_articles = await self.ranker.rank_batch(articles_to_rank)
                             break
-                        await asyncio.sleep(2)
+                        except Exception as e:
+                            if attempt == settings.llm_max_retries - 1:
+                                log.error(
+                                    "orchestrator.rank_failed",
+                                    error=str(e), count=len(articles_to_rank),
+                                )
+                                ranked_articles = []
+                                break
+                            await asyncio.sleep(2 ** attempt)
 
                     for r in ranked_articles:
                         if r.importance_score is not None:
@@ -389,7 +486,8 @@ class PipelineOrchestrator:
             
         try:
             from bot.formatters import escape_html
-            from config.llm import get_client, DEFAULT_SAFETY_SETTINGS
+            from config.llm import get_client, parse_structured, DEFAULT_SAFETY_SETTINGS
+            from data.models import TickerNote, notes_to_dict
 
             tracked = self.db.get_tracked_tickers()
             if not tracked:
@@ -411,7 +509,8 @@ class PipelineOrchestrator:
                     "Guidelines:\n"
                     "- HOLD: News is neutral-to-positive, or no significant negative catalyst. Default to HOLD unless there's a clear reason to sell.\n"
                     "- SELL: Specific negative catalyst in the news (earnings miss, downgrade, regulatory issue, macro headwind directly impacting the ticker).\n"
-                    "Format: valid JSON dictionary. Keys = tickers. Values = 'HOLD - [1 sentence reason]' or 'SELL - [1 sentence reason]'.\n"
+                    "Return one entry per ticker in the required response schema. Each "
+                    "summary must read 'HOLD - [1 sentence reason]' or 'SELL - [1 sentence reason]'.\n"
                     "Plain text only — no markdown, no HTML.\n\n"
                 )
                 for tk, sums in all_ticker_contexts.items():
@@ -428,6 +527,7 @@ class PipelineOrchestrator:
                         config={
                             'safety_settings': DEFAULT_SAFETY_SETTINGS,
                             'response_mime_type': 'application/json',
+                            'response_schema': list[TickerNote],
                             'thinking_config': types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
                         }
                     )
@@ -462,14 +562,17 @@ class PipelineOrchestrator:
                             prompt_text=prompt,
                             response_text=None
                         )
-                ai_summaries = json.loads(response.text.strip())
-                
+                if isinstance(response.parsed, list):
+                    ai_summaries = notes_to_dict(response.parsed)
+                else:
+                    ai_summaries = notes_to_dict(parse_structured(response.text, list[TickerNote]))
+
             text = "<b>🎯 Tracked Tickers Daily Advisor</b>\n\n"
             text += "Based on today's news flow, here is my outlook for your portfolio tomorrow:\n\n"
             
             for t in tracked:
                 if t in all_ticker_contexts:
-                    advice = ai_summaries.get(t, "HOLD - Unable to generate advice.")
+                    advice = ai_summaries.get(t.upper(), "HOLD - Unable to generate advice.")
                     emoji = "🛑" if advice.startswith("SELL") else "✋"
                     text += f"{emoji} <b>{t}</b>: {escape_html(advice)}\n\n"
                 else:
@@ -774,9 +877,15 @@ class PipelineOrchestrator:
             replace_existing=True
         )
 
-        # Every hour: IPO scan
+        # Every hour: IPO scan — the LLM pass over recent news, then the Finnhub
+        # calendar. Finnhub runs second so its confirmed dates and tickers land
+        # on top of anything the news pass guessed in the same run.
+        async def run_ipo_scan():
+            await self.ipo_detector.scan_for_ipos()
+            await self.ipo_detector.scan_finnhub_ipos()
+
         self.scheduler.add_job(
-            self.ipo_detector.scan_for_ipos,
+            run_ipo_scan,
             'interval', minutes=60,
             id='ipo_scan',
             replace_existing=True
@@ -787,6 +896,36 @@ class PipelineOrchestrator:
             self.event_tracker.scan_upcoming_events,
             'interval', hours=6,
             id='event_scan',
+            replace_existing=True
+        )
+
+        # 07:00 KST daily: SEC insider (Form 4) and >5% stake (13D/G) disclosures.
+        # EDGAR accepts filings until 22:00 ET, which is ~11:00 KST the same
+        # morning, so this picks up the previous US session's filings and lands
+        # ahead of daily_predictions at 08:30.
+        async def run_insider_scan():
+            tickers = self.db.get_tracked_tickers()
+            if tickers:
+                await self.insider_tracker.sync_all(tickers)
+
+        self.scheduler.add_job(
+            run_insider_scan,
+            'cron', hour=7, minute=0,
+            id='insider_scan',
+            replace_existing=True
+        )
+
+        # 18:00 KST daily: Korean investor flows, after the KRX close (15:30)
+        # and after the day's figures are published.
+        async def run_kr_flow_scan():
+            tickers = self.db.get_tracked_tickers()
+            if tickers:
+                await self.kr_flow_tracker.sync_all(tickers, days=30)
+
+        self.scheduler.add_job(
+            run_kr_flow_scan,
+            'cron', hour=18, minute=0,
+            id='kr_flow_scan',
             replace_existing=True
         )
 
@@ -943,16 +1082,26 @@ class PipelineOrchestrator:
                 return
                 
             predictor = StockPredictor(self.db)
-            training_results = []  # (ticker, cv_metrics) tuples
+            training_results = []  # (label, cv_metrics) tuples
             failed_tickers = []
-            
+
+            # Retrain every horizon the UI actually reads. This used to call
+            # train_model with its default horizon_days=1, producing *_1d models
+            # that nothing loads while the 5/21/63/252d models the dashboard
+            # needs were never refreshed here at all.
+            from api.server import HORIZON_LABELS
+
             for t in tracked:
-                try:
-                    _path, cv_metrics = await predictor.train_model(t, scope="per_ticker")
-                    training_results.append((t, cv_metrics))
-                except Exception as e:
-                    log.error("orchestrator.retrain_model_failed", ticker=t, error=str(e))
-                    failed_tickers.append((t, str(e)))
+                for horizon_days in HORIZON_LABELS:
+                    label = f"{t} ({horizon_days}d)"
+                    try:
+                        _path, cv_metrics = await predictor.train_model(
+                            t, scope="per_ticker", horizon_days=horizon_days)
+                        training_results.append((label, cv_metrics))
+                    except Exception as e:
+                        log.error("orchestrator.retrain_model_failed",
+                                  ticker=t, horizon_days=horizon_days, error=str(e))
+                        failed_tickers.append((label, str(e)))
                     
             log.info("orchestrator.models_retrained")
             
@@ -1101,22 +1250,21 @@ async def run_reflection_job(db, alert_manager=None):
             completion_tokens = response.usage.completion_tokens if response.usage else 0
             db.log_llm_usage(model_name=model_name, operation="reflection", prompt_tokens=prompt_tokens, candidate_tokens=completion_tokens)
 
-            raw = response.choices[0].message.content.strip()
-            if raw.startswith("```json"): raw = raw[7:]
-            if raw.startswith("```"): raw = raw[3:]
-            if raw.endswith("```"): raw = raw[:-3]
+            raw = response.choices[0].message.content
 
             try:
-                data = json.loads(raw.strip())
-                lesson = data.get("lesson_learned", raw)
-                failure_mode = data.get("failure_mode", "none")
-                actionable_fix = data.get("actionable_fix", "")
-                should_adjust = data.get("should_adjust_strategy", False)
-            except (json.JSONDecodeError, AttributeError):
-                lesson = raw
-                failure_mode = "none"
-                actionable_fix = ""
-                should_adjust = False
+                parsed = parse_structured(raw, ReflectionLesson)
+                lesson = parsed.lesson_learned
+                failure_mode = parsed.failure_mode
+                actionable_fix = parsed.actionable_fix
+                should_adjust = parsed.should_adjust_strategy
+            except Exception as parse_e:
+                # Skip rather than store `raw`: these lessons are replayed into
+                # future debate prompts, so a malformed blob written here would
+                # keep poisoning every later advisory for this ticker.
+                log.warning("reflection.parse_failed", ticker=ticker,
+                            pred_id=pred_id, error=str(parse_e))
+                continue
 
             # Insert into reflection_log with structured metadata in tags
             if hasattr(db, "insert_reflection"):

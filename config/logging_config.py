@@ -1,5 +1,5 @@
 """
-Project Scrooge V2 — Structured Logging Configuration
+Deus — Structured Logging Configuration
 
 Uses structlog for JSON-formatted, structured logging.
 Call setup_logging() once at startup (auto-called at import time).

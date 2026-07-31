@@ -14,7 +14,7 @@ async def test_telegram():
     try:
         await bot.send_message(
             chat_id=settings.telegram_chat_id,
-            text="👋 Hello from Project Scrooge V2!\n\nThis is a test message to verify the Telegram Bot configuration. If you received this, the setup was successful! ✅"
+            text="👋 Hello from Deus!\n\nThis is a test message to verify the Telegram Bot configuration. If you received this, the setup was successful! ✅"
         )
         log.info("Test message sent successfully!")
     except Exception as e:

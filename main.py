@@ -1,5 +1,5 @@
 """
-Project Scrooge V2 - Main Entry Point
+Deus - Main Entry Point
 
 Refactored into a FastAPI application.
 Provides WebSocket endpoints for real-time market data, news, and chat.
@@ -20,7 +20,7 @@ from api.server import router as api_router
 from config.logging_config import get_logger, setup_logging
 from config.settings import settings
 from data.database import Database
-from bot.telegram_bot import ScroogeBot
+from bot.telegram_bot import DeusBot
 from orchestrator.scheduler import PipelineOrchestrator
 
 log = get_logger(__name__)
@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
     app.state.db = db
     
     # 2. Init Bot
-    bot = ScroogeBot(db=db)
+    bot = DeusBot(db=db)
     bot.initialize()
     app.state.bot = bot
     
@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
             await bot.application.start()
             await bot.application.updater.start_polling()
             
-        orchestrator.start(interval_minutes=5)
+        orchestrator.start(interval_minutes=settings.pipeline_interval_minutes)
         log.info("system.ready")
         
         yield  # Let the FastAPI app run
@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
             await bot.application.shutdown()
         log.info("system.shutdown_complete")
 
-app = FastAPI(title="Project Scrooge V2", lifespan=lifespan)
+app = FastAPI(title="Deus", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -179,7 +179,7 @@ else:
     @app.get("/")
     async def root():
         return {
-            "message": "Project Scrooge API is running",
+            "message": "Deus API is running",
             "frontend": "Use 'npm run dev' in frontend/ for dev mode, or 'npm run build' for static serving"
         }
 

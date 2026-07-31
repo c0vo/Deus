@@ -3,12 +3,12 @@ from datetime import datetime, timezone
 from data.models import NewsArticle
 from bot.alerts import AlertManager
 from data.database import Database
-from bot.telegram_bot import ScroogeBot
+from bot.telegram_bot import DeusBot
 
 async def send_test_alert():
     db = Database()
     db.initialize()
-    bot = ScroogeBot(db=db)
+    bot = DeusBot(db=db)
     bot.initialize()
     
     if not bot.application:

@@ -5,6 +5,10 @@ import pytest
 from pathlib import Path
 from pydantic import ValidationError
 from pipeline.classifier import ClassifierResult
+from config.llm import parse_structured, salvage_json_field
+from data.models import TickerNote, notes_to_dict
+from pipeline.agents import TraderAdvisory
+from pipeline.predictor import LlmPrediction
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -170,3 +174,69 @@ class TestDebateResponseSchema:
         data = json.loads(path.read_text())
         summary = data["executive_summary"].upper()
         assert any(word in summary for word in ["BUY", "SELL", "HOLD"])
+
+
+class TestStructuredOutputParsing:
+    """
+    Regression cover for the malformed-advisory bug.
+
+    A Trader response with real newlines inside `full_advisory` used to raise
+    `Invalid control character`, and the except branch handed `response.text`
+    — the raw JSON blob — to the frontend, which rendered it verbatim.
+    """
+
+    def test_parses_unescaped_newlines_in_string_field(self):
+        raw = (
+            '{"executive_summary": "TLDR: BUY - asymmetric setup.",'
+            ' "full_advisory": "\nTrade Action\nAction: BUY\n"}'
+        )
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(raw)  # the failure this guards against
+
+        result = parse_structured(raw, TraderAdvisory)
+        assert result.executive_summary.startswith("TLDR: BUY")
+        assert "Trade Action" in result.full_advisory
+
+    def test_parses_fenced_json(self):
+        raw = '```json\n{"executive_summary": "TLDR: HOLD.", "full_advisory": "### Call\nHold."}\n```'
+        result = parse_structured(raw, TraderAdvisory)
+        assert result.executive_summary == "TLDR: HOLD."
+
+    def test_missing_required_field_is_rejected(self):
+        with pytest.raises(ValidationError):
+            parse_structured('{"executive_summary": "TLDR: BUY."}', TraderAdvisory)
+
+    def test_salvages_prose_from_unparseable_blob(self):
+        # Truncated mid-object with a doubled tail — beyond any JSON decoder.
+        broken = (
+            '{"executive_summary": "TLDR: BUY - dense catalysts.",'
+            ' "full_advisory": "\nTrade Action\n'
+        )
+        assert salvage_json_field(broken, "executive_summary") == "TLDR: BUY - dense catalysts."
+
+    def test_salvage_returns_none_for_absent_field(self):
+        assert salvage_json_field('{"other": "x"}', "full_advisory") is None
+
+    def test_llm_prediction_rejects_out_of_range_confidence(self):
+        with pytest.raises(ValidationError):
+            parse_structured(
+                '{"direction": "UP", "confidence": 1.4, "narrative": "x"}', LlmPrediction
+            )
+
+    def test_llm_prediction_rejects_unknown_direction(self):
+        with pytest.raises(ValidationError):
+            parse_structured(
+                '{"direction": "SIDEWAYS", "confidence": 0.6, "narrative": "x"}', LlmPrediction
+            )
+
+    def test_ticker_notes_collapse_to_dict(self):
+        raw = '[{"ticker": "skhy", "summary": "HBM demand."}, {"ticker": "NVDA", "summary": "AI capex."}]'
+        assert notes_to_dict(parse_structured(raw, list[TickerNote])) == {
+            "SKHY": "HBM demand.",
+            "NVDA": "AI capex.",
+        }
+
+    def test_notes_to_dict_accepts_raw_dicts(self):
+        # `response.parsed` is typed loosely enough that a list schema is not
+        # guaranteed to come back as model instances.
+        assert notes_to_dict([{"ticker": "aapl", "summary": "x"}]) == {"AAPL": "x"}

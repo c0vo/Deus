@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-#  Project Scrooge V2 — Auto-Deploy Watcher (Termux)
+#  Deus — Auto-Deploy Watcher (Termux)
 #
 #  Polls GitHub for new commits every N seconds.
 #  When a change is detected, pulls the latest code and
@@ -19,7 +19,7 @@ POLL_INTERVAL="${1:-30}"       # seconds between checks (default 30)
 BRANCH="main"                  # git branch to track
 VENV_DIR="venv"
 MAIN_SCRIPT="main.py"
-PID_FILE=".scrooge.pid"
+PID_FILE=".deus.pid"
 FRONTEND_DIR="frontend"
 
 # ---- Colors ----
@@ -119,7 +119,7 @@ start_app() {
     log "Cleaning up invalid embeddings from database..."
     python -c "
 import sqlite3, os
-db_path = 'storage/scrooge.db'
+db_path = 'storage/deus.db'
 if os.path.exists(db_path):
     conn = sqlite3.connect(db_path)
     cur = conn.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='articles'\")
@@ -205,7 +205,7 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 cd "$(dirname "$0")"
-log "Project Scrooge V2 — Auto-Deploy Watcher"
+log "Deus — Auto-Deploy Watcher"
 log "Tracking: origin/$BRANCH"
 
 # --once mode: single pull + restart, then exit

@@ -15,12 +15,18 @@ from email.utils import parsedate_to_datetime
 from typing import Optional
 
 import feedparser
+import httpx
 
 from config.logging_config import get_logger
+from config.settings import settings
 from data.models import NewsArticle
 from data.sources.base import NewsSource
 
 log = get_logger(__name__)
+
+# Some publishers 403 an unidentified client; matches the UA used by reddit_source.
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Deus/2.0"
+FEED_TIMEOUT = 15.0
 
 
 class RSSSource(NewsSource):
@@ -48,9 +54,22 @@ class RSSSource(NewsSource):
     async def fetch(self) -> list[NewsArticle]:
         """Fetch and parse the RSS feed."""
         try:
-            # feedparser is synchronous — run in executor
+            # Fetch over httpx so the request is actually bounded. Handing the URL
+            # to feedparser directly makes it do its own blocking urllib fetch with
+            # Python's default socket timeout of None — a blackholing host then pins
+            # an executor thread forever, and that pool is shared process-wide with
+            # the LLM call sites. Only the CPU-bound parse goes to the executor.
+            async with httpx.AsyncClient(
+                timeout=FEED_TIMEOUT,
+                follow_redirects=True,
+                headers={"User-Agent": USER_AGENT},
+            ) as client:
+                response = await client.get(self._feed_url)
+                response.raise_for_status()
+                raw = response.content
+
             loop = asyncio.get_event_loop()
-            feed = await loop.run_in_executor(None, feedparser.parse, self._feed_url)
+            feed = await loop.run_in_executor(None, feedparser.parse, raw)
 
             if feed.bozo and not feed.entries:
                 log.warning(
@@ -74,7 +93,15 @@ class RSSSource(NewsSource):
             return articles
 
         except Exception as e:
-            log.error("rss.fetch_failed", source=self._name, error=str(e))
+            # Connection errors often stringify to "", so name the type too —
+            # otherwise a dead feed logs a blank reason.
+            log.error(
+                "rss.fetch_failed",
+                source=self._name,
+                url=self._feed_url,
+                error=str(e) or repr(e),
+                error_type=type(e).__name__,
+            )
             return []
 
     def _parse_entry(self, entry: dict) -> Optional[NewsArticle]:
@@ -150,30 +177,15 @@ class RSSSource(NewsSource):
 # ── Pre-configured RSS feed instances ────────────────────────────────────
 
 def create_default_rss_sources() -> list[RSSSource]:
-    """Create the default set of RSS feed sources."""
-    return [
-        RSSSource(
-            "reuters",
-            "https://feeds.reuters.com/reuters/businessNews",
-        ),
-        RSSSource(
-            "cnbc",
-            "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
-        ),
-        RSSSource(
-            "wsj_markets",
-            "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-        ),
-        RSSSource(
-            "yahoo_finance",
-            "https://finance.yahoo.com/news/rssindex",
-        ),
-        RSSSource(
-            "nyt_business",
-            "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml",
-        ),
-        RSSSource(
-            "google_news_business",
-            "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtVnVHZ0pWVXlnQVAB",
-        ),
+    """Create the configured set of RSS feed sources.
+
+    Driven by settings.rss_feeds (see DEFAULT_RSS_FEEDS in config.settings), so
+    feeds can be added or swapped from .env without a code change.
+    """
+    sources = [
+        RSSSource(name, url, max_items=max_items)
+        for name, url, max_items in settings.rss_feed_list
     ]
+    log.info("rss.sources_configured", count=len(sources),
+             names=[s.name for s in sources])
+    return sources

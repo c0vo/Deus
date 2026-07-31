@@ -38,7 +38,7 @@ def _build_orchestrator(db_mock: MagicMock) -> PipelineOrchestrator:
     orchestrator.aggregator.fetch_all = AsyncMock()
 
     orchestrator.embedder = MagicMock()
-    orchestrator.embedder.embed_unembedded_articles = AsyncMock()
+    orchestrator.embedder.embed_articles = AsyncMock(return_value=[])
 
     classified = MagicMock()
     classified.id = "C"
@@ -52,6 +52,21 @@ def _build_orchestrator(db_mock: MagicMock) -> PipelineOrchestrator:
 
     orchestrator.classifier = MagicMock()
     orchestrator.classifier.classify = AsyncMock(return_value=classified)
+
+    # Classification is batched: the scheduler hands a whole chunk to
+    # classify_batch, which labels the articles in place and returns them.
+    async def _classify_batch(chunk):
+        for article in chunk:
+            article.event_type = "earnings"
+            article.sentiment_score = 0.5
+            article.urgency = "low"
+            article.suggested_direction = "bullish"
+            article.affected_sectors = []
+            article.affected_tickers = []
+            article.classification_summary = "test"
+        return chunk
+
+    orchestrator.classifier.classify_batch = AsyncMock(side_effect=_classify_batch)
 
     orchestrator.ranker = MagicMock()
     orchestrator.ranker.rank_batch = AsyncMock(return_value=[])
@@ -162,7 +177,10 @@ async def test_unique_article_is_classified_not_flagged():
     orchestrator = _build_orchestrator(db_mock)
     await _run_batch(orchestrator)
 
-    assert orchestrator.classifier.classify.await_count == 3
+    # One batched call carrying all three, rather than three separate calls.
+    assert orchestrator.classifier.classify_batch.await_count == 1
+    sent = {a.id for a in orchestrator.classifier.classify_batch.call_args.args[0]}
+    assert sent == {"A", "B", "C"}
     assert not db_mock.mark_duplicate.called
     assert db_mock.mark_dedup_checked.call_count == 3
 
@@ -183,7 +201,9 @@ async def test_one_duplicate_does_not_abort_the_batch():
     await _run_batch(orchestrator)
 
     classified_ids = {
-        call.args[0].id for call in orchestrator.classifier.classify.call_args_list
+        article.id
+        for call in orchestrator.classifier.classify_batch.call_args_list
+        for article in call.args[0]
     }
     assert classified_ids == {"B", "C"}, (
         f"expected B and C to be classified after the duplicate, got {classified_ids}"

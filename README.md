@@ -14,10 +14,12 @@ Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Ha
 
 - **News ingestion** — 6 source types fetched concurrently, deduplicated by URL and by embedding cosine similarity
 - **Dual-LLM pipeline** — DeepSeek classifies event type, sentiment, urgency and tickers; Gemini scores importance 0–10 and pushes high-impact stories to Telegram
-- **ML prediction** — per-ticker `GradientBoostingClassifier` with Platt scaling, 23 features (sentiment, technicals, market regime), 5-fold walk-forward CV
+- **ML prediction** — per-ticker `GradientBoostingClassifier` with Platt scaling, 32 features (sentiment, technicals, market regime, disclosed positioning), 5-fold walk-forward CV
+- **Smart money** — SEC Form 4 insider trades and 13D/13G >5% stakes for US tickers, daily institutional and foreign investor flows for Korean ones. Both feed the debate and the model, not just a dashboard panel
 - **Multi-agent debate** — Bull and Bear researchers argue over two rounds, synthesized into a Buy/Sell/Hold call by a trader agent
 - **RAG analyst chat** — vector search over classified news with shallow/complex routing, with supplemental information pulled in real-time from the internet.
 - **Market intelligence** — sector rotation, IPO tracking, earnings calendar, macro themes, trend scenarios, ≥5% price-swing alerts
+- **Structured LLM output** — response schemas constrain decoding at the API, so a malformed JSON blob can't leak into the UI
 - **Runs on a phone** — Originally built to run on Termux. Had a spare phone lying around :)
 
 ## Architecture
@@ -27,9 +29,10 @@ flowchart LR
     subgraph SOURCES["Sources"]
         NEWS["RSS · Reddit · HN · Nitter<br/>Finnhub · Alpha Vantage"]
         PRICES["Yahoo Finance"]
+        SM["SEC EDGAR · Naver Finance<br/>insider · stakes · KR flows"]
     end
 
-    subgraph PIPELINE["Pipeline · every 5 min"]
+    subgraph PIPELINE["Pipeline · every 15 min"]
         AGG["Aggregate<br/>URL dedupe"]
         EMB["Embed<br/>Gemini"]
         SEM["Semantic dedupe"]
@@ -56,6 +59,7 @@ flowchart LR
     NEWS --> AGG
     RNK --> DB
     PRICES --> ML
+    SM --> DB
     DB --> ML
     DB --> DEB
     DB --> RAG
@@ -78,7 +82,15 @@ Work is split across two providers to keep cost down on the high-volume path:
 | Chat and trader synthesis | `gemini-3-flash-preview` |
 | Embeddings (3072-dim) | `gemini-embedding-001` |
 
-Background jobs run on APScheduler: the ETL cycle every 5 minutes, market scanning every 10, sector analysis every 15, daily predictions and resolution, and weekly model retraining.
+Background jobs run on APScheduler: the ETL cycle every 15 minutes, market scanning every 10, sector analysis every 15, an insider scan at 07:00 and Korean investor flows at 18:00 KST, daily predictions and resolution, and weekly model retraining.
+
+### Smart money
+
+Positioning gets treated as a real input rather than a sidebar widget — `data/tickers.py` routes each ticker to the right source, so the US/KR split lives in one place.
+
+SEC EDGAR gives **Form 4** (an insider traded, disclosed within 2 business days) and **SC 13D/13G** (someone crossed 5% ownership, within 10 days). Both are free, need no key, and are far timelier than a quarterly 13F. The client is `httpx` + `xml.etree` rather than a filing SDK, because `pyarrow` and `lxml` are miserable to build on the phone.
+
+Korea has no equivalent, so Deus reads the daily 기관 (institutional) and 외국인 (foreign) net-trading figures from Naver Finance — one of the few places that question has a genuinely daily answer.
 
 ## Quick start
 
@@ -120,7 +132,15 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 ```
 
-Optional: `FINNHUB_API_KEY`, `ALPHA_VANTAGE_API_KEY` and `TAVILY_API_KEY` add sources and web search, `REDDIT_SUBREDDITS` and `NITTER_ACCOUNTS` tune what gets scraped, and `SQLITE_VEC_PATH` points at a prebuilt `vec0` extension (needed on Termux).
+Optional: `FINNHUB_API_KEY`, `ALPHA_VANTAGE_API_KEY` and `TAVILY_API_KEY` add sources and web search, `REDDIT_SUBREDDITS` and `NITTER_ACCOUNTS` tune what gets scraped, `PIPELINE_INTERVAL_MINUTES` sets the ETL cadence, and `SQLITE_VEC_PATH` points at a prebuilt `vec0` extension (needed on Termux).
+
+EDGAR has no API key, but it returns 403 unless the User-Agent carries a contact address, so insider tracking needs:
+
+```ini
+SEC_USER_AGENT=Your Name you@example.com
+```
+
+Leave it empty and the insider and stake jobs simply don't run; everything else is unaffected.
 
 ## Telegram
 

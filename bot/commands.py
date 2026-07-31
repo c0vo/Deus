@@ -112,12 +112,12 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         db = get_db(context)
-        usage = db.get_usage_stats()
-        
+        usage = db.get_usage_stats(days=7)
+
         text = "<b>💸 LLM API Usage & Costs</b>\n\n"
-        text += f"<b>Total Tokens:</b> {usage['total_tokens']:,}\n"
-        text += f"<b>Total Est. Cost:</b> ${usage['total_cost_usd']:.4f}\n\n"
-        
+        text += f"<b>Last 7 Days:</b> {usage['total_tokens']:,} tokens / ${usage['total_cost_usd']:.4f}\n"
+        text += f"<b>All Time:</b> {usage['all_time_tokens']:,} tokens / ${usage['all_time_cost_usd']:.4f}\n\n"
+
         if usage.get('details'):
             text += "<b>Last 7 Days Breakdown:</b>\n"
             for d in usage['details']:
@@ -166,7 +166,8 @@ async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             
         text = f"<b>📈 Top 15 Trending Tickers (Last {hours}h)</b>\n\n"
         
-        from config.llm import get_client, DEFAULT_SAFETY_SETTINGS
+        from config.llm import get_client, parse_structured, DEFAULT_SAFETY_SETTINGS
+        from data.models import TickerNote, notes_to_dict
         client = get_client()
         loop = asyncio.get_running_loop()
         
@@ -187,7 +188,7 @@ async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"For EACH ticker, write a concise 1-sentence explanation of exactly why it is trending based ONLY on the context.\n"
                 f"You MUST include an exact quote from the context if available. Do NOT use emojis.\n"
                 f"Do NOT use markdown or HTML tags in your summaries. Just plain text.\n"
-                f"You MUST format your response as a valid JSON dictionary where the keys are the tickers and the values are the 1-sentence summaries.\n\n"
+                f"Return one entry per ticker in the required response schema.\n\n"
             )
             for tk, sums in all_ticker_contexts.items():
                 prompt += f"Ticker: {tk}\nContext:\n" + "\n".join(f"- {s}" for s in sums) + "\n\n"
@@ -204,6 +205,7 @@ async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         config={
                             'safety_settings': DEFAULT_SAFETY_SETTINGS,
                             'response_mime_type': 'application/json',
+                            'response_schema': list[TickerNote],
                             'thinking_config': types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
                         }
                     )
@@ -238,11 +240,12 @@ async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                             prompt_text=prompt,
                             response_text=None
                         )
-                return response.text.strip()
-                
+                if isinstance(response.parsed, list):
+                    return notes_to_dict(response.parsed)
+                return notes_to_dict(parse_structured(response.text, list[TickerNote]))
+
             try:
-                raw_json = await loop.run_in_executor(None, ask_batch_llm)
-                ai_summaries = json.loads(raw_json)
+                ai_summaries = await loop.run_in_executor(None, ask_batch_llm)
             except Exception as e:
                 log.error("trending.batch_summary_failed", error=str(e))
 
@@ -256,7 +259,7 @@ async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             text += f"<b>{i}. ${ticker_name}</b> - {t['mention_count']} mentions {emoji}\n"
             
             if ticker_name in all_ticker_contexts:
-                summary = ai_summaries.get(ticker_name)
+                summary = ai_summaries.get(ticker_name.upper())
                 if summary:
                     text += f"   <i>Summary:</i> {escape_html(summary)}\n\n"
                 else:

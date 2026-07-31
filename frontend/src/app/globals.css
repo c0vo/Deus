@@ -142,6 +142,12 @@
 
   --radius-sm: 3px;
   --radius-DEFAULT: 4px;
+
+  /* Motion utilities. Tailwind v4 resolves animate-* through these variables,
+     so a class with no entry here compiles to nothing at all. */
+  --animate-fadeIn: fadeIn 0.25s ease-out both;
+  --animate-slideUp: slideUp 0.3s ease-out both;
+  --animate-shake: shake 0.4s ease-in-out;
 }
 
 body {
@@ -357,6 +363,24 @@ body {
   100% { opacity: 1; transform: translateY(0) scale(1); }
 }
 
+@keyframes fadeIn {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@keyframes slideUp {
+  0% { opacity: 0; transform: translateY(8px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-4px); }
+  40% { transform: translateX(4px); }
+  60% { transform: translateX(-3px); }
+  80% { transform: translateX(2px); }
+}
+
 @keyframes ping {
   0% { box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 55%, transparent); }
   70% { box-shadow: 0 0 0 5px transparent; }
@@ -372,13 +396,53 @@ body {
   flex: none;
 }
 
+/* Reduced motion.
+   This previously flattened every animation on the page to 0.001ms via a
+   blanket `*` rule with !important, so nothing downstream could opt back in.
+   That froze the live status indicators along with the decoration, and is the
+   rule the ticker tape had to escape by driving itself from rAF (see above).
+
+   The line drawn instead: entrance and decorative motion is suppressed, since
+   it carries no information and large translations are the usual vestibular
+   trigger. Looping status indicators — spinners, pulses, pings, the speaking-
+   agent arrows, .live-dot — keep running, because they encode live pipeline and
+   debate state. Freezing those hides information rather than removing
+   decoration.
+
+   Motion is also an app setting, not only an OS one. layout.tsx stamps
+   `data-motion` on <html> before first paint, so an explicit opt-in beats the
+   OS query. With JS disabled the attribute is absent and the OS wins, as
+   before. The explicit opt-out is the separate [data-motion="off"] rule below,
+   which is a full freeze — that one is a deliberate choice by the user rather
+   than an inference from an OS setting, so it is allowed to stop everything. */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: 0.001ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.001ms !important;
+  :root:not([data-motion="on"]) .animate-fadeIn,
+  :root:not([data-motion="on"]) .animate-slideUp,
+  :root:not([data-motion="on"]) .animate-shake {
+    animation: none;
+  }
+
+  /* Entrance motion applied inline, e.g. the research source cards. */
+  :root:not([data-motion="on"]) [style*="slideUpFade"] {
+    animation: none !important;
+  }
+
+  /* State changes still land, but nothing travels across the screen. */
+  :root:not([data-motion="on"]) *,
+  :root:not([data-motion="on"]) *::before,
+  :root:not([data-motion="on"]) *::after {
+    transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
   }
+}
+
+:root[data-motion="off"] *,
+:root[data-motion="off"] *::before,
+:root[data-motion="off"] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
 }
 
 /* ============================================================================

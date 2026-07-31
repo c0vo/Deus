@@ -238,8 +238,8 @@ class TestResearcherNodes:
 
     @pytest.mark.asyncio
     async def test_bull_uses_correct_system_message(self, advisory_graph, minimal_state):
-        """Bull node should pass _BULL_SYSTEM_MESSAGE to _call_deepseek."""
-        from pipeline.agents import _BULL_SYSTEM_MESSAGE
+        """Bull node should pass the composed bull system message."""
+        from pipeline.agents import _BULL_SYSTEM, _BULL_SYSTEM_MESSAGE, _COMMON_RULES
         advisory_graph._call_deepseek = AsyncMock(return_value="Bull case.")
 
         await advisory_graph.bull_researcher_node(minimal_state)
@@ -247,7 +247,28 @@ class TestResearcherNodes:
         # Verify _call_deepseek was called with the bull system message
         call_kwargs = advisory_graph._call_deepseek.call_args
         assert call_kwargs is not None, "_call_deepseek was not called"
-        assert call_kwargs[1].get("system_message") == _BULL_SYSTEM_MESSAGE
+        assert call_kwargs[1].get("system_message") == _BULL_SYSTEM
+        assert _BULL_SYSTEM_MESSAGE in _BULL_SYSTEM
+
+    def test_shared_rules_live_in_the_system_message_not_the_user_prompt(self):
+        """
+        The rules are invariant, so they belong in the cacheable prefix. If they
+        drift back into the user prompt they land after the debate history,
+        which changes every round and defeats prefix caching.
+        """
+        from pipeline.agents import _BULL_SYSTEM, _BEAR_SYSTEM, _COMMON_RULES
+        assert _COMMON_RULES in _BULL_SYSTEM
+        assert _COMMON_RULES in _BEAR_SYSTEM
+
+    @pytest.mark.asyncio
+    async def test_bull_prompt_does_not_repeat_the_shared_rules(self, advisory_graph, minimal_state):
+        from pipeline.agents import _COMMON_RULES
+        advisory_graph._call_deepseek = AsyncMock(return_value="Bull case.")
+
+        await advisory_graph.bull_researcher_node(minimal_state)
+
+        user_prompt = advisory_graph._call_deepseek.call_args[0][0]
+        assert _COMMON_RULES not in user_prompt
 
     @pytest.mark.asyncio
     async def test_bull_rebuttal_uses_debate_history(self, advisory_graph):

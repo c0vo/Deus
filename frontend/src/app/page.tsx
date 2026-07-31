@@ -7,6 +7,7 @@ import TickerTape from "./components/TickerTape";
 import StatStrip, { StatTile } from "./components/StatStrip";
 import SectorHeatmap from "./components/SectorHeatmap";
 import LiveNewsFeed from "./components/LiveNewsFeed";
+import SmartMoneyPanel from "./components/SmartMoneyPanel";
 import EventsCalendar from "./components/EventsCalendar";
 import MacroThemesCard from "./components/MacroThemesCard";
 import TrendForecaster from "./components/TrendForecaster";
@@ -58,6 +59,9 @@ function DashboardContent() {
     onNewArticles,
     onPipelineStatus,
     onSectorHeatmap,
+    // The event tracker publishes on its own 6-hourly schedule, so the card
+    // refreshes on the push rather than waiting out the 5-minute poll.
+    onEventsUpdated: () => fetchEvents(),
     onError: (msg) => {
       setError(msg);
       setSseConnected(false);
@@ -249,6 +253,10 @@ function DashboardContent() {
             <LiveNewsFeed initialArticles={liveArticles} />
           </div>
         </div>
+
+        {/* Sits directly under the classified-news feed so disclosed
+            institutional conviction reads against news sentiment. */}
+        <SmartMoneyPanel />
 
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           <EventsCalendar events={events} onRemove={handleRemoveEvent} />

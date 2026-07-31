@@ -35,12 +35,18 @@ class NewsAggregator:
     and inserts only new articles. Returns the list of newly inserted articles.
     """
 
+    # Cap on sources fetched at once. Without it every source starts
+    # simultaneously; the RSS list alone is configurable and can grow past the
+    # default executor's worker count, which is shared with the LLM call sites.
+    MAX_CONCURRENT_FETCHES = 8
+
     def __init__(self, db: Database, sources: Optional[list[NewsSource]] = None):
         self.db = db
         self.sources = sources or self._create_default_sources()
         # Per-source URL cache to avoid re-fetching recently seen URLs at high frequency
         self._recent_urls: dict[str, dict[str, float]] = {}
         self._url_cache_ttl = 4 * 3600  # 4 hours in seconds
+        self._fetch_semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_FETCHES)
 
     def _create_default_sources(self) -> list[NewsSource]:
         """Instantiate all configured news sources."""
@@ -148,15 +154,16 @@ class NewsAggregator:
 
     async def _safe_fetch(self, source: NewsSource) -> list[NewsArticle]:
         """Fetch from a single source with error handling."""
-        try:
-            return await source.fetch()
-        except Exception as e:
-            log.error(
-                "aggregator.source_failed",
-                source=source.name,
-                error=str(e),
-            )
-            return []
+        async with self._fetch_semaphore:
+            try:
+                return await source.fetch()
+            except Exception as e:
+                log.error(
+                    "aggregator.source_failed",
+                    source=source.name,
+                    error=str(e),
+                )
+                return []
 
 
 

@@ -32,6 +32,7 @@ export interface SSEOptions {
   onSectorHeatmap?: (data: any) => void;
   onRotationSignal?: (data: any) => void;
   onIpoAlert?: (data: any) => void;
+  onEventsUpdated?: (data: any) => void;
   onTrendForecast?: (data: any) => void;
   onHotTickers?: (data: any) => void;
   onMarketTicker?: (data: any) => void;
@@ -109,7 +110,7 @@ export function useBrainSSE(options: SSEOptions) {
               continue;
             }
 
-            const { onSnapshot, onPipelineStatus, onNewArticles, onSectorHeatmap, onRotationSignal, onIpoAlert, onTrendForecast, onHotTickers, onMarketTicker, onSentimentDistribution, onEmbeddingStatus, onReconnect } = optionsRef.current;
+            const { onSnapshot, onPipelineStatus, onNewArticles, onSectorHeatmap, onRotationSignal, onIpoAlert, onEventsUpdated, onTrendForecast, onHotTickers, onMarketTicker, onSentimentDistribution, onEmbeddingStatus, onReconnect } = optionsRef.current;
 
             switch (currentEvent) {
               case "snapshot":
@@ -130,6 +131,9 @@ export function useBrainSSE(options: SSEOptions) {
                 break;
               case "ipo_alert":
                 onIpoAlert?.(data);
+                break;
+              case "events_updated":
+                onEventsUpdated?.(data);
                 break;
               case "trend_forecast":
                 onTrendForecast?.(data);

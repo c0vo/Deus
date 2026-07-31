@@ -292,3 +292,128 @@ class TestClassify:
         call_kwargs = classifier.db.log_llm_usage.call_args[1]
         assert call_kwargs["operation"] == "classify"
         assert call_kwargs["model_name"] == "deepseek-v4-flash"
+
+
+class TestClassifyBatch:
+    """
+    Batch classification. The failure mode that matters here is silently
+    attaching one article's classification to a different article, so these
+    focus on the id mapping rather than on happy-path parsing.
+    """
+
+    @staticmethod
+    def _articles():
+        return [
+            NewsArticle(
+                id=f"batch_{i}",
+                headline=f"Company {i} beats earnings estimates",
+                summary=f"Revenue and EPS both ahead of consensus for company {i}.",
+                source_name="reuters",
+                source_type="rss",
+                url=f"https://example.com/{i}",
+                published_at=datetime.now(timezone.utc),
+            )
+            for i in range(3)
+        ]
+
+    @staticmethod
+    def _result(article_id, sentiment):
+        return {
+            "id": article_id,
+            "event_type": "earnings",
+            "sentiment_score": sentiment,
+            "urgency": "high",
+            "suggested_direction": "bullish",
+            "affected_sectors": ["Technology"],
+            "affected_tickers": [f"TCK{article_id[-1]}"],
+            "countries": ["US"],
+            "classification_summary": f"Summary for {article_id}",
+        }
+
+    @pytest.mark.asyncio
+    async def test_results_map_by_id_not_position(self, classifier):
+        """A reordered response must still land on the right articles."""
+        articles = self._articles()
+        # Deliberately reversed relative to the input order.
+        payload = [
+            self._result("batch_2", 0.2),
+            self._result("batch_0", 0.9),
+            self._result("batch_1", -0.5),
+        ]
+        with patch.object(
+            classifier, "_call_with_fallback",
+            AsyncMock(return_value=json.dumps(payload)),
+        ):
+            result = await classifier.classify_batch(articles)
+
+        by_id = {a.id: a for a in result}
+        assert by_id["batch_0"].sentiment_score == 0.9
+        assert by_id["batch_1"].sentiment_score == -0.5
+        assert by_id["batch_2"].sentiment_score == 0.2
+        assert by_id["batch_0"].classification_summary == "Summary for batch_0"
+
+    @pytest.mark.asyncio
+    async def test_one_malformed_item_does_not_lose_the_others(self, classifier):
+        articles = self._articles()
+        payload = [
+            self._result("batch_0", 0.4),
+            {"id": "batch_1", "sentiment_score": "not-a-number", "urgency": "nope"},
+            self._result("batch_2", -0.3),
+        ]
+        with patch.object(
+            classifier, "_call_with_fallback",
+            AsyncMock(return_value=json.dumps(payload)),
+        ):
+            result = await classifier.classify_batch(articles)
+
+        by_id = {a.id: a for a in result}
+        assert by_id["batch_0"].event_type == "earnings"
+        assert by_id["batch_2"].event_type == "earnings"
+        # The bad item is left untouched for the caller to mark as failed.
+        assert by_id["batch_1"].event_type is None
+
+    @pytest.mark.asyncio
+    async def test_missing_result_leaves_article_untouched(self, classifier):
+        articles = self._articles()
+        payload = [self._result("batch_0", 0.4)]
+        with patch.object(
+            classifier, "_call_with_fallback",
+            AsyncMock(return_value=json.dumps(payload)),
+        ):
+            result = await classifier.classify_batch(articles)
+
+        by_id = {a.id: a for a in result}
+        assert by_id["batch_0"].event_type == "earnings"
+        assert by_id["batch_1"].event_type is None
+        assert by_id["batch_2"].event_type is None
+
+    @pytest.mark.asyncio
+    async def test_prefiltered_noise_is_never_sent_to_the_llm(self, classifier, noise_article):
+        mock_call = AsyncMock(return_value="[]")
+        with patch.object(classifier, "_call_with_fallback", mock_call):
+            result = await classifier.classify_batch([noise_article])
+
+        assert result[0].event_type == "noise"
+        mock_call.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unparseable_response_leaves_batch_untouched(self, classifier):
+        articles = self._articles()
+        with patch.object(
+            classifier, "_call_with_fallback",
+            AsyncMock(return_value="not json at all"),
+        ):
+            result = await classifier.classify_batch(articles)
+
+        assert all(a.event_type is None for a in result)
+
+    @pytest.mark.asyncio
+    async def test_reddit_and_news_are_sent_as_separate_calls(self, classifier, reddit_article):
+        articles = self._articles() + [reddit_article]
+        mock_call = AsyncMock(return_value="[]")
+        with patch.object(classifier, "_call_with_fallback", mock_call):
+            await classifier.classify_batch(articles)
+
+        assert mock_call.await_count == 2
+        operations = {c[0][3] for c in mock_call.await_args_list}
+        assert operations == {"classify_batch", "classify_batch_reddit"}

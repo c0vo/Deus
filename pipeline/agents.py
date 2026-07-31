@@ -3,12 +3,40 @@ import asyncio
 from typing import TypedDict, Optional, Dict, Callable, Awaitable
 import yfinance as yf
 from langgraph.graph import StateGraph, START, END
+from pydantic import BaseModel, Field
 
-from config.llm import get_client, get_deepseek_client
+from config.llm import (
+    get_client,
+    get_deepseek_client,
+    parse_structured,
+    salvage_json_field,
+)
 from config.settings import settings
 from config.logging_config import get_logger
+from data.tickers import KR, US, classify_market
+from pipeline.insider_tracker import InsiderTracker
+from pipeline.kr_flows import KrFlowTracker
 
 log = get_logger(__name__)
+
+
+# Passed to Gemini as `response_schema`, which constrains decoding so the long
+# markdown body lands in `full_advisory` correctly escaped. Describing the shape
+# in the prompt alone was not enough: the model reliably emitted literal
+# newlines inside the string, which the JSON decoder rejects as control
+# characters — and the parse failure then leaked the raw blob to the UI.
+#
+# The docstring is sent to the model as the schema `description`, so it stays short.
+class TraderAdvisory(BaseModel):
+    """The trade advisory, split into a headline verdict and the full write-up."""
+
+    executive_summary: str = Field(
+        description="TLDR: [BUY/SELL/HOLD] — 1-2 sentence actionable reason, no markdown."
+    )
+    full_advisory: str = Field(
+        description="Complete markdown analysis with ### section headers."
+    )
+
 
 # ── Differentiated system messages for debate agents ──────────────────────
 # Previously both Bull and Bear shared a generic "top-tier financial researcher"
@@ -52,8 +80,21 @@ _COMMON_RULES = (
     "1. Be extremely direct, concise, and fact-driven. No fluff, rhetoric, or sassy language.\n"
     "2. Ground your arguments primarily in the RECENT news context. You MUST explicitly call out and analyze any specific upcoming catalysts, exact dates (e.g., IPOs, earnings), and figures mentioned in the news.\n"
     "3. If the opposing side makes a valid point, intelligently acknowledge it. Meaningful debate requires conceding undeniable facts.\n"
-    "4. News is presented in two sections — 'IN-HOUSE NEWS' (curated, classified by importance) and 'LIVE WEB SEARCH RESULTS' (real-time web data). Treat both as current and factual, but prioritize in-house news when available as it has been through classification."
+    "4. News is presented in two sections — 'IN-HOUSE NEWS' (curated, classified by importance) and 'LIVE WEB SEARCH RESULTS' (real-time web data). Treat both as current and factual, but prioritize in-house news when available as it has been through classification.\n"
+    "5. 'SMART MONEY' sections carry disclosed positioning and are factual filings, not opinion. Insider activity comes from SEC Form 4 and covers OPEN-MARKET buys and sells only — grants and option exercises are excluded because they are compensation, not conviction. A sale marked '10b5-1 pre-scheduled' was set up months in advance and is weak evidence of a view; an unscheduled purchase is strong evidence. A 13D means a holder intends to influence the company; a 13G is passive. Korean flows show what institutions (기관) and foreign investors (외국인) net bought or sold. Absence of insider buying is NOT the same as insider selling — do not treat 'no disclosures' as bearish."
 )
+
+# Persona + rules composed into the system message so the ENTIRE invariant part
+# of the prompt sits ahead of everything that changes between rounds.
+#
+# _COMMON_RULES used to be spliced into the user message *after* the debate
+# history — which grows on every turn — so the shared prefix ended at the
+# context block and the rules were re-billed at full price each round. Both
+# providers price a cached prefix well below a fresh one, and the prefix only
+# extends as far as the first byte that differs.
+_BULL_SYSTEM = f"{_BULL_SYSTEM_MESSAGE}\n\n{_COMMON_RULES}"
+_BEAR_SYSTEM = f"{_BEAR_SYSTEM_MESSAGE}\n\n{_COMMON_RULES}"
+
 
 class AdvisoryState(TypedDict):
     ticker: str
@@ -63,6 +104,7 @@ class AdvisoryState(TypedDict):
 
     fundamentals_report: str
     technical_report: str
+    smart_money_report: str
 
     debate_history: list[str]
     debate_round_count: int
@@ -152,12 +194,31 @@ class AdvisoryGraph:
             except Exception:
                 technicals = f"Quantitative ML Predicts {direction} with {int(conf*100)}% confidence."
 
+        # Smart money — disclosed positioning. US tickers get SEC Form 4 insider
+        # trades and 13D/G stakes; Korean tickers get daily 기관/외국인 flows.
+        # Both read from local tables, so this stays a zero-token, zero-network step.
+        smart_money = self._build_smart_money_report(ticker)
+
         return {
             "fundamentals_report": fundamentals,
             "technical_report": technicals,
+            "smart_money_report": smart_money,
             "debate_round_count": 0,
             "debate_history": []
         }
+
+    def _build_smart_money_report(self, ticker: str) -> str:
+        """Insider / stake / flow context for the debate, by market."""
+        market = classify_market(ticker)
+        try:
+            if market == US:
+                return InsiderTracker(self.db).get_report(ticker, days=90)
+            if market == KR:
+                return KrFlowTracker(self.db).get_report(ticker, days=20)
+        except Exception as e:
+            log.warning("agents.smart_money_report_failed", ticker=ticker, error=str(e))
+            return "Smart money data unavailable."
+        return "No insider or institutional flow data applies to this instrument."
 
     async def _call_deepseek(self, prompt: str, speaker: Optional[str] = None, round_num: Optional[int] = None, system_message: Optional[str] = None) -> str:
         client = get_deepseek_client()
@@ -174,18 +235,35 @@ class AdvisoryGraph:
                         {"role": "user", "content": prompt}
                     ],
                     reasoning_effort="high",
+                    max_tokens=settings.debate_max_output_tokens,
                     extra_body={"thinking": {"type": "enabled"}},
+                    # Without this the SDK reports no usage at all on a stream,
+                    # which is why this call used to log a hardcoded zero — the
+                    # most expensive operation in the system, costed at $0.00.
+                    stream_options={"include_usage": True},
                     stream=True
                 )
                 collected_chunks = []
+                usage = None
                 async for chunk in response:
                     if chunk.choices and len(chunk.choices) > 0:
                         delta = chunk.choices[0].delta.content or ""
                         if delta:
                             collected_chunks.append(delta)
                             await self.debate_chunk_callback(speaker, round_num, delta)
+                    # The usage chunk arrives last and carries an empty choices
+                    # list, so it has to be read outside the branch above.
+                    elif getattr(chunk, "usage", None):
+                        usage = chunk.usage
                 full_content = "".join(collected_chunks)
-                self.db.log_llm_usage(model_name=model_name, operation="debate_research", prompt_tokens=0, candidate_tokens=0)
+                self.db.log_llm_usage(
+                    model_name=model_name,
+                    operation="debate_research",
+                    prompt_tokens=usage.prompt_tokens if usage else 0,
+                    candidate_tokens=usage.completion_tokens if usage else 0,
+                    prompt_text=prompt,
+                    response_text=full_content,
+                )
                 return full_content
             else:
                 response = await client.chat.completions.create(
@@ -195,6 +273,7 @@ class AdvisoryGraph:
                         {"role": "user", "content": prompt}
                     ],
                     reasoning_effort="high",
+                    max_tokens=settings.debate_max_output_tokens,
                     extra_body={"thinking": {"type": "enabled"}}
                 )
                 prompt_tokens = response.usage.prompt_tokens if response.usage else 0
@@ -215,6 +294,8 @@ class AdvisoryGraph:
             f"Fundamentals: {state.get('fundamentals_report')}\n"
             f"Technicals (ML Base): {state.get('technical_report')}\n"
             f"News Context (Sentiment/Urgency): {state.get('news_context')}\n"
+            f"SMART MONEY (disclosed insider & institutional positioning):\n"
+            f"{state.get('smart_money_report') or 'Not available.'}\n"
             f"Past Lessons (relevance-ranked):\n"
             f"{self._format_lessons(state.get('past_lessons', {}))}"
         )
@@ -224,7 +305,6 @@ class AdvisoryGraph:
         if not history:
             prompt = (
                 f"{context}\n\n"
-                f"{_COMMON_RULES}\n\n"
                 f"Write your initial Bull Case for {ticker} over the next 1-3 months. "
                 f"Structure your argument: (a) Key catalysts from the news with specific dates/figures, "
                 f"(b) Fundamental or technical support, (c) Estimated upside magnitude with reasoning, "
@@ -235,13 +315,12 @@ class AdvisoryGraph:
             prompt = (
                 f"{context}\n\n"
                 f"Debate History so far:\n{debate_log}\n\n"
-                f"{_COMMON_RULES}\n\n"
                 f"Write your rebuttal defending the Bull Case for {ticker}. "
                 f"Address the Bear's specific criticisms directly. If the Bear raised a valid point "
                 f"you cannot refute, concede it and explain why your thesis still holds despite it."
             )
 
-        result = await self._call_deepseek(prompt, speaker="bull", round_num=round_num, system_message=_BULL_SYSTEM_MESSAGE)
+        result = await self._call_deepseek(prompt, speaker="bull", round_num=round_num, system_message=_BULL_SYSTEM)
         history.append(f"Bull: {result}")
 
         return {"debate_history": history}
@@ -256,6 +335,8 @@ class AdvisoryGraph:
             f"Fundamentals: {state.get('fundamentals_report')}\n"
             f"Technicals (ML Base): {state.get('technical_report')}\n"
             f"News Context (Sentiment/Urgency): {state.get('news_context')}\n"
+            f"SMART MONEY (disclosed insider & institutional positioning):\n"
+            f"{state.get('smart_money_report') or 'Not available.'}\n"
             f"Past Lessons (relevance-ranked):\n"
             f"{self._format_lessons(state.get('past_lessons', {}))}"
         )
@@ -266,7 +347,6 @@ class AdvisoryGraph:
         prompt = (
             f"{context}\n\n"
             f"Debate History so far:\n{debate_log}\n\n"
-            f"{_COMMON_RULES}\n\n"
             f"Write your Bear Case attacking the Bull's thesis for {ticker}. "
             f"Structure your argument: (a) Specific risks or catalysts the Bull ignored or downplayed, "
             f"(b) Why those risks could materialize (cite precedent or context), "
@@ -274,7 +354,7 @@ class AdvisoryGraph:
             f"(d) One part of the Bull case you concede is genuinely strong."
         )
 
-        result = await self._call_deepseek(prompt, speaker="bear", round_num=round_num, system_message=_BEAR_SYSTEM_MESSAGE)
+        result = await self._call_deepseek(prompt, speaker="bear", round_num=round_num, system_message=_BEAR_SYSTEM)
         history.append(f"Bear: {result}")
 
         return {
@@ -373,9 +453,8 @@ class AdvisoryGraph:
             f"5. State your time horizon (days/weeks/months) and the #1 risk that would invalidate your call.\n"
             f"6. If relevant, cite historical precedent for similar setups.\n"
             f"7. Format the full advisory in clean Markdown with ### section headers. No emojis.\n\n"
-            f"OUTPUT FORMAT — valid JSON with exactly these two keys:\n"
-            f'{{"executive_summary": "TLDR: [BUY/SELL/HOLD] — [1-2 sentence actionable reason, no markdown]", '
-            f'"full_advisory": "Complete markdown analysis per instructions above"}}'
+            f"Return the executive summary and the full markdown advisory in the "
+            f"two fields of the required response schema."
         )
 
         try:
@@ -390,7 +469,8 @@ class AdvisoryGraph:
                     config={
                         'system_instruction': _TRADER_SYSTEM_MESSAGE,
                         'thinking_config': types.ThinkingConfig(thinking_level=types.ThinkingLevel.HIGH),
-                        'response_mime_type': 'application/json'
+                        'response_mime_type': 'application/json',
+                        'response_schema': TraderAdvisory,
                     }
                 )
 
@@ -399,48 +479,55 @@ class AdvisoryGraph:
             completion_tokens = response.usage_metadata.candidates_token_count if response.usage_metadata else 0
             self.db.log_llm_usage(model_name=model_name, operation="trader_advisory", prompt_tokens=prompt_tokens, candidate_tokens=completion_tokens)
 
-            try:
-                text = response.text.strip()
-                if text.startswith("```json"): text = text[7:]
-                if text.startswith("```"): text = text[3:]
-                if text.endswith("```"): text = text[:-3]
-                data = json.loads(text.strip())
+            advisory: Optional[TraderAdvisory] = None
+            if isinstance(response.parsed, TraderAdvisory):
+                advisory = response.parsed
+            else:
+                # Schema-constrained decoding did not populate `.parsed` — parse
+                # the text ourselves, tolerating unescaped control characters.
+                try:
+                    advisory = parse_structured(response.text, TraderAdvisory)
+                except Exception as parse_e:
+                    log.error("agents.trader_parse_failed", error=str(parse_e))
 
-                final_advisory = data.get("full_advisory", response.text)
-                executive_summary = data.get("executive_summary", "No executive summary provided.")
+            if advisory is not None:
+                final_advisory = advisory.full_advisory
+                executive_summary = advisory.executive_summary
+            else:
+                # Never surface a raw JSON blob to the UI: pull the prose out if
+                # we can, and only fall back to the raw text if it is not JSON.
+                salvaged = salvage_json_field(response.text, "full_advisory")
+                final_advisory = salvaged or (
+                    "Advisory generated but could not be formatted for display."
+                    if response.text.lstrip().startswith("{")
+                    else response.text
+                )
+                executive_summary = (
+                    salvage_json_field(response.text, "executive_summary")
+                    or "No executive summary available."
+                )
 
-                if self.debate_chunk_callback:
-                    words = final_advisory.split(" ")
-                    for i, word in enumerate(words):
-                        chunk = word + (" " if i < len(words) - 1 else "")
-                        await self.debate_chunk_callback("trader", 3, chunk)
-                        await asyncio.sleep(0.01)
-
-                return {
-                    "final_advisory": final_advisory,
-                    "executive_summary": executive_summary
-                }
-            except Exception as parse_e:
-                log.error(f"Failed to parse JSON from Trader: {parse_e}")
-                final_advisory = response.text
-                if self.debate_chunk_callback:
-                    words = final_advisory.split(" ")
-                    for i, word in enumerate(words):
-                        chunk = word + (" " if i < len(words) - 1 else "")
-                        await self.debate_chunk_callback("trader", 3, chunk)
-                        await asyncio.sleep(0.01)
-                return {"final_advisory": final_advisory, "executive_summary": "No executive summary available."}
+            await self._stream_trader(final_advisory)
+            return {
+                "final_advisory": final_advisory,
+                "executive_summary": executive_summary,
+            }
 
         except Exception as e:
             log.error(f"Trader/Risk Manager Gemini call failed: {e}")
             final_advisory = f"Error generating final advisory: {e}"
-            if self.debate_chunk_callback:
-                words = final_advisory.split(" ")
-                for i, word in enumerate(words):
-                    chunk = word + (" " if i < len(words) - 1 else "")
-                    await self.debate_chunk_callback("trader", 3, chunk)
-                    await asyncio.sleep(0.01)
+            await self._stream_trader(final_advisory)
             return {"final_advisory": final_advisory, "executive_summary": "Error generating advisory."}
+
+    async def _stream_trader(self, text: str) -> None:
+        """Replay the finished advisory to the SSE client word by word."""
+        if not self.debate_chunk_callback:
+            return
+        words = text.split(" ")
+        for i, word in enumerate(words):
+            chunk = word + (" " if i < len(words) - 1 else "")
+            await self.debate_chunk_callback("trader", 3, chunk)
+            await asyncio.sleep(0.01)
 
     def build_graph(self):
         builder = StateGraph(AdvisoryState)

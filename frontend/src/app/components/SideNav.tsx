@@ -12,12 +12,14 @@ import {
   BookOpen,
   Newspaper,
   Globe2,
+  CalendarDays,
 } from "lucide-react";
 
 const NAV_ITEMS: { href: string; label: string; icon: React.ElementType }[] = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/briefing", label: "Briefing", icon: Newspaper },
   { href: "/globe", label: "Globe", icon: Globe2 },
+  { href: "/calendar", label: "Calendar", icon: CalendarDays },
   { href: "/watchlist", label: "Markets", icon: TrendingUp },
   { href: "/trending", label: "Trending", icon: Flame },
   { href: "/predict", label: "Debate", icon: Swords },

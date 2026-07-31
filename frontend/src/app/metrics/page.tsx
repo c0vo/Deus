@@ -12,8 +12,14 @@ interface StatusInfo {
 }
 
 interface UsageInfo {
+  // total_* and by_model cover the same window (window_days); all_time_* is
+  // lifetime. Keeping them distinct is deliberate — the two used to be mixed,
+  // so the per-model table could never sum to the headline above it.
+  window_days: number | null;
   total_tokens: number;
   total_cost_usd: number;
+  all_time_tokens: number;
+  all_time_cost_usd: number;
   by_model?: Record<string, { tokens: number; cost: number }>;
 }
 
@@ -152,12 +158,20 @@ export default function Metrics() {
               </h3>
               <div className="space-y-3 text-xs">
                 <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
+                  <span className="text-terminal-muted">7-DAY TOKENS:</span>
+                  <span className="num text-terminal-text font-medium">{(usage?.total_tokens ?? 0).toLocaleString()}</span>
+                </div>
+                <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
+                  <span className="text-terminal-muted">7-DAY COST:</span>
+                  <span className="num text-terminal-text font-medium">${(usage?.total_cost_usd ?? 0).toFixed(4)}</span>
+                </div>
+                <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">CUMULATIVE TOKENS:</span>
-                  <span className="num text-terminal-text font-medium">{(usage?.total_tokens || 0).toLocaleString()}</span>
+                  <span className="num text-terminal-text font-medium">{(usage?.all_time_tokens ?? 0).toLocaleString()}</span>
                 </div>
                 <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">CUMULATIVE COST:</span>
-                  <span className="num text-terminal-text font-medium">${usage?.total_cost_usd.toFixed(4) || "0.00"}</span>
+                  <span className="num text-terminal-text font-medium">${(usage?.all_time_cost_usd ?? 0).toFixed(4)}</span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-terminal-muted">BILLING STATE:</span>
@@ -275,7 +289,10 @@ export default function Metrics() {
                   Deus utilizes a hybrid routing pattern: shallow queries use fast, low-cost LLM instances. Complex reasoning, debates, or qualitative synthesis route to high-parameter reasoning engines.
                 </p>
 
-                {usage?.by_model ? (
+                {/* No placeholder rows here on purpose. This panel used to fall
+                    back to hardcoded figures labelled "STATUS: LIVE", which
+                    rendered invented costs as though they were measured. */}
+                {usage?.by_model && Object.keys(usage.by_model).length > 0 ? (
                   <div className="space-y-3 text-xs">
                     {Object.keys(usage.by_model).map((model) => {
                       const data = usage.by_model![model];
@@ -287,44 +304,15 @@ export default function Metrics() {
                           </div>
                           <div className="flex justify-between text-[10px] text-terminal-muted">
                             <span>TOKENS INGESTED: {data.tokens.toLocaleString()}</span>
-                            <span>STATUS: LIVE</span>
+                            <span>LAST 7 DAYS</span>
                           </div>
                         </div>
                       );
                     })}
                   </div>
                 ) : (
-                  <div className="space-y-3 text-xs">
-                    <div className="border border-border-dim/40 p-3 bg-bg-surface/30 space-y-1.5">
-                      <div className="flex justify-between font-bold text-terminal-text">
-                        <span className="uppercase">gemini-2.5-flash-lite (Router/Shallow)</span>
-                        <span className="num text-terminal-text">$0.0042</span>
-                      </div>
-                      <div className="flex justify-between text-[10px] text-terminal-muted">
-                        <span>TOKENS INGESTED: 420,123</span>
-                        <span>STATUS: LIVE</span>
-                      </div>
-                    </div>
-                    <div className="border border-border-dim/40 p-3 bg-bg-surface/30 space-y-1.5">
-                      <div className="flex justify-between font-bold text-terminal-text">
-                        <span className="uppercase">gemini-3-flash-preview (Synthesis)</span>
-                        <span className="num text-terminal-text">$0.0195</span>
-                      </div>
-                      <div className="flex justify-between text-[10px] text-terminal-muted">
-                        <span>TOKENS INGESTED: 110,845</span>
-                        <span>STATUS: LIVE</span>
-                      </div>
-                    </div>
-                    <div className="border border-border-dim/40 p-3 bg-bg-surface/30 space-y-1.5">
-                      <div className="flex justify-between font-bold text-terminal-text">
-                        <span className="uppercase">deepseek-chat (Debate Agents)</span>
-                        <span className="num text-terminal-text">$0.0078</span>
-                      </div>
-                      <div className="flex justify-between text-[10px] text-terminal-muted">
-                        <span>TOKENS INGESTED: 225,910</span>
-                        <span>STATUS: LIVE</span>
-                      </div>
-                    </div>
+                  <div className="border border-border-dim/40 p-3 bg-bg-surface/30 text-xs text-terminal-muted">
+                    No metered LLM calls in the last 7 days.
                   </div>
                 )}
               </div>

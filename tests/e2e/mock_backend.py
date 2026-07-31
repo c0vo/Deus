@@ -6,7 +6,7 @@ import asyncio
 import random
 from typing import List, Dict, Any, Optional
 
-app = FastAPI(title="Project Scrooge V2 Mock Backend")
+app = FastAPI(title="Deus Mock Backend")
 
 # --- In-Memory State ---
 watchlist = ["AAPL", "TSLA", "MSFT"]

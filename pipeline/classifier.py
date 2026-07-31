@@ -16,7 +16,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from config.logging_config import get_logger
-from config.llm import get_client, is_configured, DEFAULT_SAFETY_SETTINGS, get_deepseek_client, is_deepseek_configured
+from config.llm import get_client, is_configured, is_transient, DEFAULT_SAFETY_SETTINGS, get_deepseek_client, is_deepseek_configured
 from config.settings import settings
 from data.models import NewsArticle
 from data.database import Database
@@ -34,14 +34,15 @@ class ClassifierResult(BaseModel):
     countries: list[str] = Field(default_factory=list)
     classification_summary: str = ""
 
-CLASSIFICATION_PROMPT = """
-You are a professional financial analyst AI. Analyze the following news article and extract structured information.
-Respond ONLY with a valid JSON object matching the requested schema. No markdown formatting, no backticks.
-
-Article Headline: {headline}
-Article Summary: {summary}
-
-─── EVENT TYPE TAXONOMY ───
+# Taxonomy, calibration anchors, few-shot examples and country rules are
+# identical whether one article or twenty are being classified, so they live in
+# one constant and both prompts compose from it.
+#
+# This block is ~4.4k characters — roughly 1.1k tokens, and the bulk of a
+# single-article classification prompt. Sent once per article it dominates the
+# input bill; sent once per batch of N it amortises away. That is the whole
+# argument for classify_batch.
+_CLASSIFICATION_GUIDANCE = """─── EVENT TYPE TAXONOMY ───
 Choose the most specific category that fits:
 - "earnings": Quarterly/annual reports, guidance updates, revenue warnings, profit warnings
 - "macro": Central bank decisions, inflation/CPI/PPI, employment reports, GDP, PMI, interest rates
@@ -87,7 +88,16 @@ List the countries this story is materially about, as ISO 3166-1 alpha-2 codes
 article was published: a Reuters story about Chinese export controls is ["CN"],
 or ["CN", "US"] if it turns on the trade relationship. Use at most three, and
 return [] for a story with no clear geography.
+"""
 
+CLASSIFICATION_PROMPT = """
+You are a professional financial analyst AI. Analyze the following news article and extract structured information.
+Respond ONLY with a valid JSON object matching the requested schema. No markdown formatting, no backticks.
+
+Article Headline: {headline}
+Article Summary: {summary}
+
+""" + _CLASSIFICATION_GUIDANCE + """
 Now classify the actual article using the same JSON schema:
 {{
   "event_type": "string",
@@ -99,6 +109,35 @@ Now classify the actual article using the same JSON schema:
   "countries": ["string"],
   "classification_summary": "string"
 }}
+"""
+
+BATCH_CLASSIFICATION_PROMPT = """
+You are a professional financial analyst AI. Analyze EVERY news article in the list below and extract structured information for each one independently.
+Respond ONLY with a valid JSON array. No markdown formatting, no backticks.
+
+""" + _CLASSIFICATION_GUIDANCE + """
+Articles to classify:
+{articles_json}
+
+Return exactly one object per input article. Echo each article's "id" back
+verbatim — results are matched by id, not by position, and an object with a
+missing or invented id is discarded. Judge each article on its own; do not let
+one article's sentiment influence another's.
+
+Schema:
+[
+  {{
+    "id": "string",
+    "event_type": "string",
+    "sentiment_score": 0.0,
+    "urgency": "string",
+    "suggested_direction": "string",
+    "affected_sectors": ["string"],
+    "affected_tickers": ["string"],
+    "countries": ["string"],
+    "classification_summary": "string"
+  }}
+]
 """
 
 REDDIT_CLASSIFICATION_PROMPT = """
@@ -195,6 +234,277 @@ class ArticleClassifier:
         # If no tickers, no financial words, and no options slang are present, skip it.
         return False
 
+    # ── Shared helpers (used by both the single and batch paths) ─────────
+
+    NOISE_SUMMARY = "Filtered out by pre-classification noise heuristics."
+
+    def _mark_noise(self, article: NewsArticle) -> NewsArticle:
+        """Applies the terminal 'noise' verdict locally, without an LLM call."""
+        log.info("classifier.pre_filtered", article_id=article.id, headline=article.headline)
+        article.event_type = "noise"
+        article.sentiment_score = 0.0
+        article.urgency = "low"
+        article.suggested_direction = "neutral"
+        article.classification_summary = self.NOISE_SUMMARY
+        return article
+
+    @staticmethod
+    def _is_reddit(article: NewsArticle) -> bool:
+        return article.source_type == "social" and article.source_name.startswith("reddit")
+
+    @staticmethod
+    def _reddit_comments_text(article: NewsArticle) -> str:
+        comments_data = article.raw_data.get("comments", [])
+        comments = [
+            f"- {c.get('author', '[unknown]')}: {c.get('body', '')}"
+            for c in comments_data
+            if isinstance(c, dict) and c.get("body")
+        ]
+        return "\n".join(comments) if comments else "(No comments)"
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        """Models occasionally wrap JSON in markdown despite being told not to."""
+        text = text.strip()
+        if text.startswith("```json"):
+            text = text[7:]
+        if text.startswith("```"):
+            text = text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        return text.strip()
+
+    @staticmethod
+    def _apply_result(article: NewsArticle, parsed: ClassifierResult) -> None:
+        """Writes a parsed result onto an article. Shared by single and batch."""
+        article.event_type = parsed.event_type
+        article.sentiment_score = parsed.sentiment_score
+        article.urgency = parsed.urgency
+        article.suggested_direction = parsed.suggested_direction
+        article.affected_sectors = parsed.affected_sectors
+        # Normalise to upper-case ISO codes; models sometimes return "us".
+        article.countries = [
+            c.strip().upper() for c in parsed.countries if c and len(c.strip()) == 2
+        ]
+        # Combine with existing tickers if alpha vantage provided them
+        article.affected_tickers = list(
+            set(article.affected_tickers) | set(parsed.affected_tickers)
+        )
+        article.classification_summary = parsed.classification_summary
+
+    # ── Batch classification ────────────────────────────────────────────
+
+    async def classify_batch(self, articles: list[NewsArticle]) -> list[NewsArticle]:
+        """
+        Classifies many articles in as few calls as possible.
+
+        The ~1.1k-token guidance preamble is the bulk of a classification
+        prompt, and per-article calls re-sent it every single time. Batching
+        amortises it across the group.
+
+        Reddit posts use both a different prompt and a different model, so a
+        mixed input goes out as at most two calls. Articles rejected by the free
+        should_classify() heuristic are marked noise locally and never sent.
+
+        Returns the same list, modified in place. Articles the model did not
+        answer for are returned untouched — the caller decides what that means.
+        """
+        if not articles:
+            return []
+
+        if not is_configured() and not is_deepseek_configured():
+            log.warning("classifier.skipped", reason="No LLM configured", count=len(articles))
+            return articles
+
+        to_send: list[NewsArticle] = []
+        for article in articles:
+            if self.should_classify(article):
+                to_send.append(article)
+            else:
+                self._mark_noise(article)
+
+        reddit_group = [a for a in to_send if self._is_reddit(a)]
+        news_group = [a for a in to_send if not self._is_reddit(a)]
+
+        if news_group:
+            await self._classify_group(news_group, is_reddit=False)
+        if reddit_group:
+            await self._classify_group(reddit_group, is_reddit=True)
+
+        return articles
+
+    async def _classify_group(self, articles: list[NewsArticle], is_reddit: bool) -> None:
+        """One LLM call for a homogeneous group. Modifies articles in place."""
+        payload = []
+        for a in articles:
+            item = {"id": a.id, "headline": a.headline, "summary": a.summary or ""}
+            if is_reddit:
+                item["top_comments"] = self._reddit_comments_text(a)
+            payload.append(item)
+
+        base = REDDIT_CLASSIFICATION_PROMPT if is_reddit else BATCH_CLASSIFICATION_PROMPT
+        if is_reddit:
+            # The Reddit template is single-article; wrap it for batch use by
+            # reusing its lingo guide and calibration, then swapping the tail.
+            prompt = (
+                base.split("Post Title:")[0]
+                + "\nClassify EVERY post in the list below independently.\n"
+                  "Respond ONLY with a valid JSON array, one object per input id.\n\n"
+                  f"Posts:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+                  'Echo each "id" back verbatim. Schema per object: '
+                  '{"id": "string", "event_type": "string", "sentiment_score": 0.0, '
+                  '"urgency": "string", "suggested_direction": "string", '
+                  '"affected_sectors": ["string"], "affected_tickers": ["string"], '
+                  '"countries": ["string"], "classification_summary": "string"}'
+            )
+            ds_model = settings.deepseek_model_reddit_sentiment
+            gemini_model = settings.gemini_model_reddit_sentiment
+        else:
+            # No indent= — pretty-printing a batch payload is pure token waste.
+            prompt = base.format(articles_json=json.dumps(payload, ensure_ascii=False))
+            ds_model = settings.deepseek_model_classifier
+            gemini_model = self.model_name
+
+        operation = "classify_batch_reddit" if is_reddit else "classify_batch"
+        # The cap has to scale with the batch: with response_format=json_object,
+        # running out of budget yields truncated, unparseable JSON rather than a
+        # short answer, which would cost the whole batch.
+        max_output = settings.classify_max_output_tokens_per_article * len(articles)
+        text = await self._call_with_fallback(
+            prompt, ds_model, gemini_model, operation, max_output
+        )
+        if not text:
+            log.error("classifier.batch_no_response", count=len(articles), operation=operation)
+            return
+
+        try:
+            results = json.loads(self._strip_code_fence(text))
+            if not isinstance(results, list):
+                raise ValueError(f"Expected a JSON array, got {type(results).__name__}")
+        except Exception as e:
+            log.error("classifier.batch_parse_failed", error=str(e), count=len(articles))
+            return
+
+        # Match by id, never by position — a model that drops or reorders an
+        # item would otherwise silently attach the wrong classification to the
+        # wrong article, which is far worse than not classifying it at all.
+        by_id = {
+            str(item["id"]): item
+            for item in results
+            if isinstance(item, dict) and item.get("id")
+        }
+
+        applied = 0
+        for article in articles:
+            item = by_id.get(str(article.id))
+            if item is None:
+                log.warning("classifier.batch_missing_result", article_id=article.id)
+                continue
+            try:
+                # Per-item validation: one malformed object must not cost the
+                # whole batch.
+                parsed = ClassifierResult.model_validate(
+                    {k: v for k, v in item.items() if k != "id"}
+                )
+                self._apply_result(article, parsed)
+                applied += 1
+            except Exception as e:
+                log.error(
+                    "classifier.batch_item_invalid",
+                    article_id=article.id, error=str(e),
+                )
+
+        log.info(
+            "classifier.batch_complete",
+            operation=operation, sent=len(articles), applied=applied,
+        )
+
+    async def _call_with_fallback(
+        self, prompt: str, ds_model: str, gemini_model: str, operation: str,
+        max_output_tokens: int,
+    ) -> Optional[str]:
+        """
+        DeepSeek first, Gemini on failure. Returns raw response text.
+
+        Raises if every configured provider failed transiently, so the caller
+        can leave the batch unclassified for a later pass instead of writing a
+        permanent 'error' verdict over an outage.
+        """
+        import time
+
+        last_transient: Optional[BaseException] = None
+
+        if is_deepseek_configured() and self.deepseek_client:
+            start = time.time()
+            try:
+                response = await self.deepseek_client.chat.completions.create(
+                    model=ds_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    response_format={"type": "json_object"},
+                    temperature=0.0,
+                    max_tokens=max_output_tokens,
+                    extra_body={"thinking": {"type": "disabled"}},
+                )
+                text = response.choices[0].message.content.strip()
+                if response.usage:
+                    self.db.log_llm_usage(
+                        model_name=ds_model, operation=operation,
+                        prompt_tokens=response.usage.prompt_tokens,
+                        candidate_tokens=response.usage.completion_tokens,
+                        latency_ms=int((time.time() - start) * 1000),
+                        prompt_text=prompt, response_text=text,
+                    )
+                return text
+            except Exception as e:
+                self.db.log_llm_usage(
+                    model_name=ds_model, operation=operation,
+                    prompt_tokens=0, candidate_tokens=0,
+                    latency_ms=int((time.time() - start) * 1000),
+                    is_error=True, error_message=str(e), prompt_text=prompt,
+                )
+                log.warning("classifier.deepseek_batch_failed", error=str(e), fallback="gemini")
+                if is_transient(e):
+                    last_transient = e
+
+        if is_configured() and self.client:
+            start = time.time()
+            try:
+                response = await self.client.aio.models.generate_content(
+                    model=gemini_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        safety_settings=DEFAULT_SAFETY_SETTINGS,
+                        response_mime_type="application/json",
+                        max_output_tokens=max_output_tokens,
+                    ),
+                )
+                text = response.text.strip()
+                if response.usage_metadata:
+                    self.db.log_llm_usage(
+                        model_name=gemini_model, operation=operation,
+                        prompt_tokens=response.usage_metadata.prompt_token_count,
+                        candidate_tokens=response.usage_metadata.candidates_token_count,
+                        latency_ms=int((time.time() - start) * 1000),
+                        prompt_text=prompt, response_text=text,
+                    )
+                return text
+            except Exception as e:
+                self.db.log_llm_usage(
+                    model_name=gemini_model, operation=operation,
+                    prompt_tokens=0, candidate_tokens=0,
+                    latency_ms=int((time.time() - start) * 1000),
+                    is_error=True, error_message=str(e), prompt_text=prompt,
+                )
+                log.error("classifier.gemini_batch_failed", error=str(e))
+                if is_transient(e):
+                    last_transient = e
+
+        if last_transient is not None:
+            raise last_transient
+
+        return None
+
     async def classify(self, article: NewsArticle) -> NewsArticle:
         """
         Classifies the given article and populates its classification fields.
@@ -206,25 +516,13 @@ class ArticleClassifier:
 
         # Apply pre-filter
         if not self.should_classify(article):
-            log.info("classifier.pre_filtered", article_id=article.id, headline=article.headline)
-            article.event_type = "noise"
-            article.sentiment_score = 0.0
-            article.urgency = "low"
-            article.suggested_direction = "neutral"
-            article.classification_summary = "Filtered out by pre-classification noise heuristics."
-            return article
+            return self._mark_noise(article)
 
-        is_reddit = article.source_type == "social" and article.source_name.startswith("reddit")
-        
+        is_reddit = self._is_reddit(article)
+
         if is_reddit:
-            comments_data = article.raw_data.get("comments", [])
-            comments = [
-                f"- {c.get('author', '[unknown]')}: {c.get('body', '')}"
-                for c in comments_data
-                if isinstance(c, dict) and c.get("body")
-            ]
-            comments_text = "\n".join(comments) if comments else "(No comments)"
-            
+            comments_text = self._reddit_comments_text(article)
+
             prompt = REDDIT_CLASSIFICATION_PROMPT.format(
                 headline=article.headline,
                 summary=article.summary,
@@ -256,6 +554,7 @@ class ArticleClassifier:
                     messages=[{"role": "user", "content": prompt}],
                     response_format={"type": "json_object"},
                     temperature=0.0,
+                    max_tokens=settings.classify_max_output_tokens_per_article,
                     extra_body={"thinking": {"type": "disabled"}}
                 )
                 text = response.choices[0].message.content.strip()
@@ -303,7 +602,8 @@ class ArticleClassifier:
                     config=types.GenerateContentConfig(
                         temperature=0.0,
                         safety_settings=DEFAULT_SAFETY_SETTINGS,
-                        response_mime_type="application/json"
+                        response_mime_type="application/json",
+                        max_output_tokens=settings.classify_max_output_tokens_per_article
                     )
                 )
                 text = response.text.strip()
@@ -343,36 +643,11 @@ class ArticleClassifier:
             return article
 
         try:
-            # Clean up potential markdown formatting just in case
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-                
-            parsed = ClassifierResult.model_validate_json(text.strip())
-            
-            # Update article fields
-            article.event_type = parsed.event_type
-            article.sentiment_score = parsed.sentiment_score
-            article.urgency = parsed.urgency
-            article.suggested_direction = parsed.suggested_direction
-            article.affected_sectors = parsed.affected_sectors
-            # Normalise to upper-case ISO codes; models sometimes return "us".
-            article.countries = [
-                c.strip().upper() for c in parsed.countries if c and len(c.strip()) == 2
-            ]
+            parsed = ClassifierResult.model_validate_json(self._strip_code_fence(text))
+            self._apply_result(article, parsed)
 
-            # Combine with existing tickers if alpha vantage provided them
-            existing_tickers = set(article.affected_tickers)
-            new_tickers = set(parsed.affected_tickers)
-            article.affected_tickers = list(existing_tickers | new_tickers)
-            
-            article.classification_summary = parsed.classification_summary
-            
             log.debug("classifier.success", article_id=article.id, event_type=article.event_type)
-            
+
         except Exception as e:
             log.error("classifier.parse_failed", article_id=article.id, error=str(e), text=text)
             

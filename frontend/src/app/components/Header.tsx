@@ -2,6 +2,7 @@
 
 import { useSystemStatus } from "../hooks/useSystemStatus";
 import LiveClock from "./LiveClock";
+import MotionToggle from "./MotionToggle";
 import ThemeToggle from "./ThemeToggle";
 
 export default function Header() {
@@ -28,6 +29,7 @@ export default function Header() {
         <span className="num hidden sm:inline text-terminal-muted-alt">
           <LiveClock />
         </span>
+        <MotionToggle />
         <ThemeToggle />
       </div>
     </header>

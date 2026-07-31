@@ -19,6 +19,7 @@ from typing import Optional
 from config.logging_config import get_logger
 from config.llm import get_client, get_deepseek_client, DEFAULT_SAFETY_SETTINGS
 from config.settings import settings
+from config.usage import track_llm
 from data.database import Database
 from api.sse_manager import event_bus
 from google.genai import types
@@ -135,17 +136,21 @@ class TrendForecaster:
         )
 
         try:
-            response = await client.chat.completions.create(
-                model=settings.deepseek_model_reasoner,
-                messages=[
-                    {"role": "system", "content": "You generate forward-looking scenario analyses for stocks. Output valid JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                response_format={"type": "json_object"},
-                reasoning_effort="high",
-                extra_body={"thinking": {"type": "enabled"}},
-            )
+            # deepseek-v4-pro at high reasoning effort — the second most
+            # expensive call in the system, and previously unlogged entirely.
+            with track_llm(self.db, settings.deepseek_model_reasoner, "trend_forecast") as u:
+                u.response = response = await client.chat.completions.create(
+                    model=settings.deepseek_model_reasoner,
+                    messages=[
+                        {"role": "system", "content": "You generate forward-looking scenario analyses for stocks. Output valid JSON only."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                    reasoning_effort="high",
+                    max_tokens=settings.debate_max_output_tokens,
+                    extra_body={"thinking": {"type": "enabled"}},
+                )
 
             raw = response.choices[0].message.content.strip()
             if raw.startswith("```json"): raw = raw[7:]
@@ -223,15 +228,16 @@ class TrendForecaster:
             loop = asyncio.get_running_loop()
 
             def ask_llm():
-                response = client.models.generate_content(
-                    model=settings.gemini_model_chat,
-                    contents=prompt,
-                    config={
-                        "safety_settings": DEFAULT_SAFETY_SETTINGS,
-                        "response_mime_type": "application/json",
-                        "thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
-                    }
-                )
+                with track_llm(self.db, settings.gemini_model_chat, "sector_outlook") as u:
+                    u.response = response = client.models.generate_content(
+                        model=settings.gemini_model_chat,
+                        contents=prompt,
+                        config={
+                            "safety_settings": DEFAULT_SAFETY_SETTINGS,
+                            "response_mime_type": "application/json",
+                            "thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
+                        }
+                    )
                 return response.text.strip()
 
             raw = await loop.run_in_executor(None, ask_llm)
@@ -327,15 +333,16 @@ class TrendForecaster:
             loop = asyncio.get_running_loop()
 
             def ask_llm():
-                response = client.models.generate_content(
-                    model=settings.gemini_model_chat,
-                    contents=prompt,
-                    config={
-                        "safety_settings": DEFAULT_SAFETY_SETTINGS,
-                        "response_mime_type": "application/json",
-                        "thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
-                    }
-                )
+                with track_llm(self.db, settings.gemini_model_chat, "macro_themes") as u:
+                    u.response = response = client.models.generate_content(
+                        model=settings.gemini_model_chat,
+                        contents=prompt,
+                        config={
+                            "safety_settings": DEFAULT_SAFETY_SETTINGS,
+                            "response_mime_type": "application/json",
+                            "thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
+                        }
+                    )
                 return response.text.strip()
 
             raw = await loop.run_in_executor(None, ask_llm)

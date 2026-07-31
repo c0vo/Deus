@@ -1,5 +1,5 @@
 """
-Project Scrooge V2 — SQLite Database Manager
+Deus — SQLite Database Manager
 
 Manages the SQLite database: connection lifecycle, schema creation,
 and common query helpers. Uses FTS5 for full-text search.
@@ -21,6 +21,46 @@ from config.settings import settings
 from data.models import NewsArticle
 
 log = get_logger(__name__)
+
+# ── LLM Pricing ──────────────────────────────────────────────────────────
+#
+# USD per 1M tokens, as (prompt, completion). Keys are matched EXACTLY against
+# the model_name that was logged — deliberately not a substring ladder.
+#
+# The previous substring version silently mispriced the two most expensive
+# operations in the system: `"deepseek" in name` was tested before `"pro"`, so
+# deepseek-v4-pro billed at flash rates, and no Gemini model in settings.py
+# contains "pro" or "8b", so every Gemini call fell through to a stale default.
+#
+# VERIFY THESE AGAINST YOUR PROVIDER'S CURRENT PRICE LIST. Model names in this
+# project are env-configurable, so a model can be swapped in without a price;
+# that case logs a warning and falls back to a deliberately pessimistic rate,
+# on the principle that an unpriced model should over-report, never under-.
+MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "deepseek-v4-flash":      (0.14, 0.28),
+    "deepseek-v4-pro":        (1.25, 5.00),
+    "gemini-2.5-flash-lite":  (0.075, 0.30),
+    "gemini-3.1-flash-lite":  (0.075, 0.30),
+    "gemini-3-flash-preview": (0.30, 1.20),
+    "gemini-embedding-001":   (0.15, 0.0),
+}
+
+_PRICING_FALLBACK = (0.30, 1.20)
+
+
+def _resolve_pricing(model_name: str) -> tuple[float, float]:
+    """Returns (per-prompt-token, per-completion-token) cost in USD."""
+    rates = MODEL_PRICING.get(model_name)
+    if rates is None:
+        rates = _PRICING_FALLBACK
+        log.warning(
+            "db.pricing.unknown_model",
+            model_name=model_name,
+            fallback_per_1m=rates,
+            hint="Add this model to MODEL_PRICING in data/database.py",
+        )
+    return rates[0] / 1_000_000, rates[1] / 1_000_000
+
 
 # ── Schema Definition ────────────────────────────────────────────────────
 
@@ -131,6 +171,8 @@ CREATE INDEX IF NOT EXISTS idx_articles_source ON articles(source_name);
 CREATE INDEX IF NOT EXISTS idx_articles_urgency ON articles(urgency);
 CREATE INDEX IF NOT EXISTS idx_articles_importance ON articles(importance_score DESC);
 CREATE INDEX IF NOT EXISTS idx_ticker_mentions_ticker ON ticker_mentions(ticker);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_timestamp ON llm_usage_log(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_model_op ON llm_usage_log(model_name, operation);
 
 -- ML Predictions tracking
 CREATE TABLE IF NOT EXISTS predictions (
@@ -335,12 +377,87 @@ CREATE TABLE IF NOT EXISTS trend_forecasts (
     is_active INTEGER DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_trend_forecasts_active ON trend_forecasts(is_active, sector, ticker);
+
+-- ── Smart money: insider trades, >5% stakes, institutional flow ──────────
+--
+-- Every table here is indexed on the date the information became PUBLIC, not
+-- the date the underlying event happened. A Form 4 covers a trade made up to
+-- two business days before it was filed; a 13F reports a quarter that ended up
+-- to 45 days earlier. Feature queries filter on filed_at so the model is never
+-- shown something that had not been disclosed yet.
+
+-- SEC Form 4 — insider transactions (non-derivative only)
+CREATE TABLE IF NOT EXISTS insider_transactions (
+    id TEXT PRIMARY KEY,                 -- accession_no + row index
+    ticker TEXT NOT NULL,
+    issuer_cik TEXT,
+    insider_name TEXT,
+    insider_title TEXT,
+    is_officer INTEGER DEFAULT 0,
+    is_director INTEGER DEFAULT 0,
+    is_ten_pct_owner INTEGER DEFAULT 0,
+    transaction_date DATE NOT NULL,      -- when the trade happened
+    filed_at DATETIME NOT NULL,          -- when it became public (as-of key)
+    transaction_code TEXT,               -- P=buy, S=sale, A=grant, M=exercise, F=tax, G=gift
+    is_discretionary INTEGER DEFAULT 0,  -- 1 only for P/S; the rest are comp mechanics
+    shares REAL,
+    price_per_share REAL,
+    value_usd REAL,                      -- signed: negative when disposed
+    shares_owned_after REAL,
+    is_10b5_1 INTEGER,                   -- NULL = unknown (checkbox only exists post-Apr-2023)
+    accession_no TEXT,
+    raw_data TEXT DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_insider_ticker_filed
+    ON insider_transactions(ticker, filed_at);
+
+-- SEC Schedule 13D / 13G — crossing the 5% ownership threshold
+CREATE TABLE IF NOT EXISTS institutional_stakes (
+    id TEXT PRIMARY KEY,                 -- accession number
+    ticker TEXT NOT NULL,
+    filer_name TEXT,
+    filer_cik TEXT,
+    form_type TEXT,                      -- 'SC 13D', 'SC 13G', or an /A amendment
+    is_activist INTEGER DEFAULT 0,       -- 13D signals intent to influence; 13G is passive
+    is_amendment INTEGER DEFAULT 0,
+    pct_of_class REAL,
+    shares REAL,
+    event_date DATE,
+    filed_at DATETIME NOT NULL,          -- as-of key
+    accession_no TEXT,
+    raw_data TEXT DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_stakes_ticker_filed
+    ON institutional_stakes(ticker, filed_at);
+
+-- Korean daily net buy/sell by investor class. Korea discloses per-ticker
+-- institutional flow daily, which the US has no free equivalent for.
+--
+-- flow_unit records whether the net columns are share counts or KRW: Naver
+-- publishes volume, the KRX Open API publishes value. Features normalise
+-- against total_value in the same unit, so the two must never be summed
+-- together without conversion.
+CREATE TABLE IF NOT EXISTS kr_investor_flows (
+    ticker TEXT NOT NULL,                -- bare six-digit KRX code
+    trade_date DATE NOT NULL,
+    inst_net REAL,                       -- 기관합계
+    foreign_net REAL,                    -- 외국인
+    retail_net REAL,                     -- 개인 (NULL from Naver)
+    pension_net REAL,                    -- 연기금 (NULL from Naver)
+    financial_inv_net REAL,              -- 금융투자 (NULL from Naver)
+    trust_net REAL,                      -- 투신 (NULL from Naver)
+    total_value REAL,                    -- 거래량 or 거래대금, for normalisation
+    flow_unit TEXT DEFAULT 'shares',     -- 'shares' | 'krw'
+    source TEXT DEFAULT 'naver',
+    PRIMARY KEY (ticker, trade_date)
+);
+CREATE INDEX IF NOT EXISTS idx_kr_flows_date ON kr_investor_flows(trade_date);
 """
 
 
 class Database:
     """
-    SQLite database manager for Project Scrooge V2.
+    SQLite database manager for Deus.
 
     Usage:
         db = Database()
@@ -362,12 +479,30 @@ class Database:
             conn.executescript(SCHEMA_SQL)
             
             # Migration: add new columns for in-depth LLM tracking
+            #
+            # The two articles.*_scanned_at columns record that an extraction
+            # was *attempted*, which is not the same as it having produced a
+            # row in ipo_tracker / ticker_events. Without them the scanners
+            # select their candidates purely by "has no tracker row yet", so
+            # every article the model declines to extract from comes back on
+            # the next scan and is paid for again, for the whole 48-72h window.
             for col_sql in [
                 "ALTER TABLE llm_usage_log ADD COLUMN latency_ms INTEGER",
                 "ALTER TABLE llm_usage_log ADD COLUMN is_error INTEGER DEFAULT 0",
                 "ALTER TABLE llm_usage_log ADD COLUMN error_message TEXT",
                 "ALTER TABLE llm_usage_log ADD COLUMN prompt_text TEXT",
                 "ALTER TABLE llm_usage_log ADD COLUMN response_text TEXT",
+                "ALTER TABLE articles ADD COLUMN ipo_scanned_at DATETIME",
+                "ALTER TABLE articles ADD COLUMN event_scanned_at DATETIME",
+                # Bounds embedding retries. A permanently unembeddable row (empty
+                # text, say) would otherwise sit in the `embedding IS NULL` queue
+                # forever, occupying a slot in every batch.
+                "ALTER TABLE articles ADD COLUMN embed_attempts INTEGER DEFAULT 0",
+                # Which provider supplied a KR flow row, and in what unit. Naver
+                # reports share counts, the KRX Open API reports KRW; summing the
+                # two without conversion would silently corrupt the feature.
+                "ALTER TABLE kr_investor_flows ADD COLUMN flow_unit TEXT DEFAULT 'shares'",
+                "ALTER TABLE kr_investor_flows ADD COLUMN source TEXT DEFAULT 'naver'",
             ]:
                 try:
                     conn.execute(col_sql)
@@ -433,6 +568,17 @@ class Database:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_articles_dedup_checked "
                 "ON articles(dedup_checked) WHERE embedding IS NOT NULL"
+            )
+
+            # Migration: purge ticker_events rows with an empty event_date.
+            # The column is DATE NOT NULL but SQLite does not reject '', and ''
+            # sorts below every real date — so these rows satisfied the
+            # `event_date <= end` bound on every "upcoming events" query and
+            # leaked into the calendar forever. Both write paths now skip
+            # undated events, so this is a one-time cleanup.
+            conn.execute(
+                "DELETE FROM ticker_events "
+                "WHERE event_date IS NULL OR TRIM(event_date) = ''"
             )
 
         log.info("database.initialized", path=self.db_path)
@@ -1071,6 +1217,35 @@ class Database:
                 "UPDATE articles SET dedup_checked = 1 WHERE id = ?", (article_id,)
             )
 
+    def record_embed_failure(self, article_id: str) -> None:
+        """Counts a failed embedding attempt so the retry loop terminates."""
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE articles SET embed_attempts = COALESCE(embed_attempts, 0) + 1 WHERE id = ?",
+                (article_id,),
+            )
+
+    def mark_scan_attempted(self, article_id: str, scan: str) -> None:
+        """
+        Record that an extraction scan was attempted on this article.
+
+        Deliberately separate from whether the scan produced anything. The IPO
+        and event scanners only ever wrote a row on a *successful* extraction,
+        so an article the model declined to extract from stayed in the
+        candidate pool and was re-sent on every subsequent scan until it aged
+        out of the window. Stamping the attempt caps the cost at one call per
+        article.
+        """
+        column = {"ipo": "ipo_scanned_at", "event": "event_scanned_at"}.get(scan)
+        if not column:
+            raise ValueError(f"Unknown scan type: {scan!r}")
+
+        with self.connection() as conn:
+            conn.execute(
+                f"UPDATE articles SET {column} = CURRENT_TIMESTAMP WHERE id = ?",
+                (article_id,),
+            )
+
     def get_dedup_backlog(self, limit: int = 200) -> list[dict]:
         """Embedded articles that have never been compared, oldest first."""
         with self.connection() as conn:
@@ -1493,20 +1668,8 @@ class Database:
         response_text: Optional[str] = None
     ) -> None:
         """Logs LLM token usage, latencies, errors, and text."""
-        model_lower = model_name.lower()
-        if "deepseek" in model_lower:
-            price_per_prompt = 0.14 / 1_000_000
-            price_per_candidate = 0.28 / 1_000_000
-        elif "pro" in model_lower:
-            price_per_prompt = 1.25 / 1_000_000
-            price_per_candidate = 5.00 / 1_000_000
-        elif "8b" in model_lower:
-            price_per_prompt = 0.0375 / 1_000_000
-            price_per_candidate = 0.15 / 1_000_000
-        else:
-            price_per_prompt = 0.075 / 1_000_000
-            price_per_candidate = 0.30 / 1_000_000
-        
+        price_per_prompt, price_per_candidate = _resolve_pricing(model_name)
+
         cost_usd = (prompt_tokens * price_per_prompt) + (candidate_tokens * price_per_candidate)
         total_tokens = prompt_tokens + candidate_tokens
 
@@ -1524,33 +1687,75 @@ class Database:
         except sqlite3.Error as e:
             log.error("db.usage_log_failed", error=str(e))
 
-    def get_usage_stats(self) -> dict:
-        """Returns total usage statistics."""
+    def get_usage_stats(self, days: Optional[int] = None) -> dict:
+        """
+        Usage totals plus a per-day/model/operation breakdown.
+
+        `total_tokens` / `total_cost_usd` and `details` are computed over the
+        SAME window, so the per-model table always sums to the headline. Pass
+        `days=None` for all time. All-time figures are returned alongside under
+        `all_time_*` so a windowed view can still show the lifetime number
+        without conflating the two — previously the headline was all-time while
+        `details` was hardcoded to 7 days, and the two could never reconcile.
+        """
         try:
             with self.connection() as conn:
-                row = conn.execute("SELECT SUM(total_tokens) as t, SUM(cost_usd) as c FROM llm_usage_log").fetchone()
-                
-                # Fetch detailed breakdown by model and operation for the last 7 days
-                details_rows = conn.execute("""
-                    SELECT date(timestamp) as day, model_name, operation, 
+                if days is not None:
+                    window_clause = "WHERE timestamp >= date('now', ?)"
+                    params: tuple = (f"-{int(days)} days",)
+                else:
+                    window_clause = ""
+                    params = ()
+
+                row = conn.execute(
+                    f"""
+                    SELECT SUM(total_tokens) as t, SUM(cost_usd) as c,
+                           SUM(prompt_tokens) as p, SUM(candidate_tokens) as k,
+                           COUNT(*) as n
+                    FROM llm_usage_log {window_clause}
+                    """,
+                    params,
+                ).fetchone()
+
+                all_time = conn.execute(
+                    "SELECT SUM(total_tokens) as t, SUM(cost_usd) as c FROM llm_usage_log"
+                ).fetchone()
+
+                details_rows = conn.execute(
+                    f"""
+                    SELECT date(timestamp) as day, model_name, operation,
                            SUM(total_tokens) as tokens, SUM(cost_usd) as cost,
                            COUNT(*) as requests_count,
                            SUM(is_error) as error_count,
                            AVG(latency_ms) as avg_latency_ms
-                    FROM llm_usage_log
-                    WHERE timestamp >= date('now', '-7 days')
+                    FROM llm_usage_log {window_clause}
                     GROUP BY day, model_name, operation
                     ORDER BY day DESC, cost DESC
-                """).fetchall()
-                
+                    """,
+                    params,
+                ).fetchall()
+
                 return {
+                    "window_days": days,
                     "total_tokens": row["t"] or 0,
                     "total_cost_usd": row["c"] or 0.0,
-                    "details": [dict(r) for r in details_rows]
+                    "total_prompt_tokens": row["p"] or 0,
+                    "total_candidate_tokens": row["k"] or 0,
+                    "total_requests": row["n"] or 0,
+                    "all_time_tokens": all_time["t"] or 0,
+                    "all_time_cost_usd": all_time["c"] or 0.0,
+                    "details": [dict(r) for r in details_rows],
                 }
         except sqlite3.Error as e:
             log.error("db.usage_stats_failed", error=str(e))
-            return {"total_tokens": 0, "total_cost_usd": 0.0, "details": []}
+            return {
+                "window_days": days,
+                "total_tokens": 0, "total_cost_usd": 0.0,
+                "total_prompt_tokens": 0, "total_candidate_tokens": 0,
+                "total_requests": 0,
+                "all_time_tokens": 0, "all_time_cost_usd": 0.0,
+                "details": [],
+            }
 
     def check_for_api_spikes(self) -> Optional[str]:
         """
@@ -1744,55 +1949,70 @@ class Database:
 
     # ── Sentiment Features ───────────────────────────────────────────────
 
-    def get_ticker_sentiment_features(self, ticker: str, lookback_days: int = 7) -> dict:
+    def get_ticker_sentiment_features(
+        self,
+        ticker: str,
+        lookback_days: int = 7,
+        as_of: Optional[datetime] = None,
+    ) -> dict:
         """Aggregate sentiment from ticker_mentions + articles with temporal granularity.
-        
+
         Returns separate 1d/3d/7d sentiment averages so the model can distinguish
         between fresh vs stale sentiment signals. Also computes momentum (1d - 7d)
         and news velocity (recent article rate vs historical baseline).
+
+        Args:
+            as_of: Point in time to evaluate from. Defaults to now. Every window is
+                bounded on BOTH sides by this — during model training the caller
+                walks backwards through history, and an unbounded upper edge would
+                feed the model news that had not been published yet.
         """
         with self.connection() as conn:
-            now = datetime.now(timezone.utc)
+            now = as_of or datetime.now(timezone.utc)
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            upper = now.isoformat()
             cutoff_1d = (now - timedelta(days=1)).isoformat()
             cutoff_3d = (now - timedelta(days=3)).isoformat()
             cutoff_7d = (now - timedelta(days=7)).isoformat()
             cutoff_14d = (now - timedelta(days=14)).isoformat()
-            
+            cutoff_lookback = (now - timedelta(days=lookback_days)).isoformat()
+
             # ── Sentiment averages over 1d, 3d, 7d windows ──
             def _avg_sentiment(cutoff):
                 row = conn.execute(
                     """
                     SELECT AVG(sentiment_score) as avg_s, COUNT(*) as cnt
                     FROM ticker_mentions
-                    WHERE ticker = ? AND mentioned_at >= ?
+                    WHERE ticker = ? AND mentioned_at >= ? AND mentioned_at <= ?
                       AND sentiment_score IS NOT NULL
                     """,
-                    (ticker, cutoff)
+                    (ticker, cutoff, upper)
                 ).fetchone()
                 return (row["avg_s"] or 0.0, row["cnt"] or 0)
-            
+
             avg_1d, count_1d = _avg_sentiment(cutoff_1d)
             avg_3d, count_3d = _avg_sentiment(cutoff_3d)
             avg_7d, count_7d = _avg_sentiment(cutoff_7d)
-            
+
             # Sentiment momentum: how much has sentiment shifted recently vs baseline
             sentiment_momentum = avg_1d - avg_7d
-            
+
             # ── News velocity: articles per day in last 3d vs last 14d ──
             _, count_14d = _avg_sentiment(cutoff_14d)
             recent_rate = count_3d / 3.0 if count_3d else 0.0
             baseline_rate = count_14d / 14.0 if count_14d else 0.0
             news_velocity = (recent_rate / baseline_rate) if baseline_rate > 0 else 1.0
-            
+
             # ── Article-level features (importance, direction, urgency) ──
             articles = conn.execute(
                 """
                 SELECT a.importance_score, a.suggested_direction, a.urgency
                 FROM articles a
                 JOIN ticker_mentions tm ON a.id = tm.article_id
-                WHERE tm.ticker = ? AND a.published_at >= ?
+                WHERE tm.ticker = ? AND a.published_at >= ? AND a.published_at <= ?
                 """,
-                (ticker, cutoff_7d)
+                (ticker, cutoff_lookback, upper)
             ).fetchall()
             
             importance_scores = [a["importance_score"] for a in articles if a["importance_score"] is not None]
@@ -1815,6 +2035,196 @@ class Database:
                 "bullish_ratio": float(bullish_ratio),
                 "max_urgency_24h": float(max_urgency),
             }
+
+    # ── Smart money: insider / institutional / KR flows ──────────────────
+
+    def upsert_insider_transactions(self, rows: list[dict]) -> int:
+        """Insert Form 4 transaction rows, ignoring ones already stored.
+
+        Returns the number of new rows. INSERT OR IGNORE on the accession-derived
+        primary key makes re-scanning a window idempotent, which matters because
+        the scheduled job always re-reads a few days of overlap.
+        """
+        if not rows:
+            return 0
+        inserted = 0
+        with self.connection() as conn:
+            for r in rows:
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO insider_transactions (
+                        id, ticker, issuer_cik, insider_name, insider_title,
+                        is_officer, is_director, is_ten_pct_owner,
+                        transaction_date, filed_at, transaction_code,
+                        is_discretionary, shares, price_per_share, value_usd,
+                        shares_owned_after, is_10b5_1, accession_no, raw_data
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        r["id"], r["ticker"], r.get("issuer_cik"),
+                        r.get("insider_name"), r.get("insider_title"),
+                        r.get("is_officer", 0), r.get("is_director", 0),
+                        r.get("is_ten_pct_owner", 0),
+                        r["transaction_date"], r["filed_at"],
+                        r.get("transaction_code"), r.get("is_discretionary", 0),
+                        r.get("shares"), r.get("price_per_share"), r.get("value_usd"),
+                        r.get("shares_owned_after"), r.get("is_10b5_1"),
+                        r.get("accession_no"), json.dumps(r.get("raw_data", {})),
+                    ),
+                )
+                inserted += cur.rowcount or 0
+        return inserted
+
+    def upsert_institutional_stakes(self, rows: list[dict]) -> int:
+        """Insert 13D/13G filing rows, ignoring duplicates."""
+        if not rows:
+            return 0
+        inserted = 0
+        with self.connection() as conn:
+            for r in rows:
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO institutional_stakes (
+                        id, ticker, filer_name, filer_cik, form_type,
+                        is_activist, is_amendment, pct_of_class, shares,
+                        event_date, filed_at, accession_no, raw_data
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        r["id"], r["ticker"], r.get("filer_name"), r.get("filer_cik"),
+                        r.get("form_type"), r.get("is_activist", 0),
+                        r.get("is_amendment", 0), r.get("pct_of_class"), r.get("shares"),
+                        r.get("event_date"), r["filed_at"], r.get("accession_no"),
+                        json.dumps(r.get("raw_data", {})),
+                    ),
+                )
+                inserted += cur.rowcount or 0
+        return inserted
+
+    def upsert_kr_flows(self, rows: list[dict]) -> int:
+        """Insert or replace daily KRX investor-flow rows."""
+        if not rows:
+            return 0
+        with self.connection() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO kr_investor_flows (
+                    ticker, trade_date, inst_net, foreign_net, retail_net,
+                    pension_net, financial_inv_net, trust_net, total_value,
+                    flow_unit, source
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        r["ticker"], r["trade_date"], r.get("inst_net"),
+                        r.get("foreign_net"), r.get("retail_net"),
+                        r.get("pension_net"), r.get("financial_inv_net"),
+                        r.get("trust_net"), r.get("total_value"),
+                        r.get("flow_unit", "shares"), r.get("source", "naver"),
+                    )
+                    for r in rows
+                ],
+            )
+        return len(rows)
+
+    def get_insider_series(self, ticker: str) -> list[dict]:
+        """Full insider history for one ticker, ordered by disclosure date.
+
+        Returned whole rather than windowed because model training evaluates
+        ~1200 as-of dates per ticker; the caller caches this once and slices it
+        in memory instead of opening a connection per date.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT filed_at, transaction_date, transaction_code,
+                       is_discretionary, insider_name, insider_title,
+                       is_officer, is_director, is_ten_pct_owner,
+                       shares, price_per_share, value_usd, is_10b5_1
+                FROM insider_transactions
+                WHERE ticker = ?
+                ORDER BY filed_at ASC
+                """,
+                (ticker.upper(),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_stakes_series(self, ticker: str) -> list[dict]:
+        """Full 13D/13G filing history for one ticker, ordered by disclosure date."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT filed_at, form_type, is_activist, is_amendment,
+                       filer_name, pct_of_class, shares, event_date
+                FROM institutional_stakes
+                WHERE ticker = ?
+                ORDER BY filed_at ASC
+                """,
+                (ticker.upper(),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_kr_flow_series(self, ticker: str) -> list[dict]:
+        """Full daily KRX investor-flow history for one ticker."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT trade_date, inst_net, foreign_net, retail_net,
+                       pension_net, financial_inv_net, trust_net, total_value,
+                       flow_unit, source
+                FROM kr_investor_flows
+                WHERE ticker = ?
+                ORDER BY trade_date ASC
+                """,
+                (ticker,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_last_insider_filed_at(self, ticker: str) -> Optional[str]:
+        """Most recent disclosure date stored, so a sync can resume from there."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT MAX(filed_at) AS m FROM insider_transactions WHERE ticker = ?",
+                (ticker.upper(),),
+            ).fetchone()
+        return row["m"] if row and row["m"] else None
+
+    def get_recent_insider_activity(self, days: int = 30, limit: int = 100,
+                                    discretionary_only: bool = True) -> list[dict]:
+        """Cross-ticker recent insider transactions, newest disclosure first."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        clause = "AND is_discretionary = 1" if discretionary_only else ""
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT ticker, insider_name, insider_title, is_officer, is_director,
+                       is_ten_pct_owner, transaction_date, filed_at, transaction_code,
+                       shares, price_per_share, value_usd, is_10b5_1
+                FROM insider_transactions
+                WHERE filed_at >= ? {clause}
+                ORDER BY filed_at DESC, ABS(COALESCE(value_usd, 0)) DESC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_recent_stakes(self, days: int = 90, limit: int = 50) -> list[dict]:
+        """Cross-ticker recent 13D/13G filings, newest first."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT ticker, filer_name, form_type, is_activist, is_amendment,
+                       pct_of_class, shares, event_date, filed_at
+                FROM institutional_stakes
+                WHERE filed_at >= ?
+                ORDER BY filed_at DESC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── Conversations & Messages ─────────────────────────────────────────
 

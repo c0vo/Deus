@@ -1,5 +1,5 @@
 """
-Project Scrooge V2 — News Article Data Models
+Deus — News Article Data Models
 
 Pydantic models representing news articles at various pipeline stages.
 """
@@ -87,3 +87,38 @@ class NewsArticle(BaseModel):
             content = f"{self.headline}{self.summary}".encode("utf-8")
             self.content_hash = hashlib.sha256(content).hexdigest()
         return self
+
+
+# The element type for every batch "summarise these tickers" call — trending
+# summaries and the daily advisor.
+#
+# Those prompts used to ask for a JSON object keyed by ticker, which cannot be
+# expressed as a response schema: there is no way to say "an object whose keys
+# are arbitrary strings" that Gemini's structured output accepts. A list of
+# these is expressible, so the call can be schema-constrained; the caller
+# rebuilds the dict with `notes_to_dict`.
+#
+# Docstring and field descriptions are sent to the model as the schema
+# `description` on every call, so both are kept to one line.
+class TickerNote(BaseModel):
+    """One ticker plus one line of commentary."""
+
+    ticker: str = Field(description="The ticker symbol, exactly as given in the prompt.")
+    summary: str = Field(description="Plain-text commentary. No markdown, no HTML, no emojis.")
+
+
+def notes_to_dict(notes: list) -> dict[str, str]:
+    """
+    Collapse a TickerNote list back into the {ticker: summary} shape callers use.
+
+    Accepts raw dicts as well as models: `response.parsed` is only typed as
+    `BaseModel | dict | Enum | None`, so a list schema is not guaranteed to come
+    back as model instances on every SDK version.
+    """
+    out: dict[str, str] = {}
+    for n in notes:
+        ticker = (n.get("ticker") if isinstance(n, dict) else getattr(n, "ticker", None)) or ""
+        summary = (n.get("summary") if isinstance(n, dict) else getattr(n, "summary", None)) or ""
+        if ticker.strip():
+            out[ticker.strip().upper()] = summary
+    return out

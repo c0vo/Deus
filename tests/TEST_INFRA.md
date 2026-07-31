@@ -1,4 +1,4 @@
-# E2E Test Infra: Project Scrooge V2
+# E2E Test Infra: Deus
 
 ## Test Philosophy
 - Opaque-box, requirement-driven. No dependency on implementation design.

@@ -1,6 +1,6 @@
 @echo off
 echo ======================================
-echo  Project Scrooge V2 - Windows Setup
+echo  Deus - Windows Setup
 echo ======================================
 
 echo [1/3] Creating Python virtual environment...

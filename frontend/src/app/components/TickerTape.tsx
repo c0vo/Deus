@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { getApiUrl } from "../utils/api";
+import { useReducedMotion } from "../hooks/useReducedMotion";
 
 /** Scroll rate in px/sec. Real brokerage tapes run roughly 60-100. */
 const TAPE_SPEED = 70;
@@ -15,7 +16,7 @@ interface TickerSnapshot {
 export default function TickerTape() {
   const [items, setItems] = useState<TickerSnapshot[]>([]);
   const [isPaused, setIsPaused] = useState(false);
-  const [reducedMotion, setReducedMotion] = useState(false);
+  const reducedMotion = useReducedMotion();
   const trackRef = useRef<HTMLDivElement>(null);
   const offsetRef = useRef(0);
 
@@ -42,19 +43,10 @@ export default function TickerTape() {
     return () => clearInterval(interval);
   }, []);
 
-  useEffect(() => {
-    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const sync = () => setReducedMotion(query.matches);
-    sync();
-    query.addEventListener("change", sync);
-    return () => query.removeEventListener("change", sync);
-  }, []);
-
-  // The scroll is driven from JS rather than a CSS keyframe animation.
-  // globals.css carries a blanket `prefers-reduced-motion` rule that forces
-  // animation-duration to ~0 with !important on every element, which silently
-  // froze the tape. Reduced motion is honoured explicitly below instead, and
-  // the marquee itself can no longer be switched off by a stylesheet rule.
+  // The scroll is driven from JS rather than a CSS keyframe animation, so the
+  // blanket reduced-motion rule in globals.css cannot silently freeze it.
+  // Motion now follows the app-level toggle in the header rather than the OS
+  // media query directly — see utils/motion.ts for why.
   useEffect(() => {
     if (reducedMotion || isPaused || items.length === 0) return;
     const el = trackRef.current;
