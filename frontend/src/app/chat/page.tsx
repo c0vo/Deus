@@ -250,13 +250,13 @@ export default function Chat() {
   };
 
   return (
-    <div className="h-full flex flex-col md:flex-row overflow-hidden">
+    <div className="h-full min-h-0 flex flex-col md:flex-row overflow-hidden">
       
       {/* Main Chat Panel */}
-      <div className="flex-1 flex flex-col border-r border-border-dim overflow-hidden bg-bg-main">
+      <div className="flex-1 min-h-0 flex flex-col border-r border-border-dim overflow-hidden bg-bg-main">
         
         {/* Chat Header */}
-        <div className="px-6 h-12 border-b border-border-dim flex items-center bg-bg-card shrink-0 justify-between">
+        <div className="px-4 md:px-6 h-12 border-b border-border-dim flex items-center bg-bg-card shrink-0 justify-between">
           <h2 className="text-xs font-bold text-terminal-text uppercase tracking-wider">
             Analyst
           </h2>
@@ -269,7 +269,7 @@ export default function Chat() {
         </div>
 
         {/* Scrollable messages log */}
-        <div className="flex-1 overflow-auto p-6 space-y-6 scrollbar-thin">
+        <div className="flex-1 min-h-0 overflow-auto overscroll-contain p-4 md:p-6 space-y-4 md:space-y-6 scrollbar-thin">
           {messages.length === 0 && (
             <div className="h-full flex flex-col items-center justify-center text-center space-y-4 max-w-md mx-auto">
               <TerminalIcon size={48} className="text-terminal-signal/50" />
@@ -283,14 +283,14 @@ export default function Chat() {
           )}
 
           {messages.map((msg, i) => (
-            <div key={i} className={`flex flex-col space-y-2 ${msg.sender === "user" ? "items-end ml-auto max-w-[80%]" : "items-start w-full"}`}>
+            <div key={i} className={`flex flex-col space-y-2 ${msg.sender === "user" ? "items-end ml-auto max-w-[90%] md:max-w-[80%]" : "items-start w-full"}`}>
               {/* Sender Tag */}
               <span className={`text-[10px] uppercase font-bold tracking-wider ${msg.sender === "user" ? "text-terminal-signal" : "text-terminal-violet"}`}>
                 {msg.sender === "user" ? "[user@client]" : "[deus@analyst]"}
               </span>
 
               {/* Message content bubble */}
-              <div className={`p-5 border leading-relaxed text-sm ${
+              <div className={`p-3.5 md:p-5 border leading-relaxed text-sm ${
                 msg.sender === "user"
                   ? "bg-bg-surface border-terminal-signal text-terminal-text rounded-[18px_18px_0_18px]"
                   : "bg-bg-card border-border-dim text-terminal-text font-sans rounded-[18px_18px_18px_0] w-full"
@@ -351,7 +351,7 @@ export default function Chat() {
 
               {/* Streaming text bubble */}
               {streamingText && (
-                <div className="p-5 border border-border-dim bg-bg-card text-terminal-text rounded-[18px_18px_18px_0] w-full text-sm font-sans leading-relaxed">
+                <div className="p-3.5 md:p-5 border border-border-dim bg-bg-card text-terminal-text rounded-[18px_18px_18px_0] w-full text-sm font-sans leading-relaxed">
                   <FormattedText text={streamingText} />
                   <span className="inline-block w-1.5 h-3.5 bg-terminal-text animate-pulse ml-1 align-middle" />
                 </div>
@@ -363,20 +363,20 @@ export default function Chat() {
         </div>
 
         {/* Messaging Input Form */}
-        <div className="p-4 border-t border-border-dim bg-bg-card shrink-0">
-          <form onSubmit={handleSend} className="flex gap-3">
+        <div className="p-3 md:p-4 safe-b border-t border-border-dim bg-bg-card shrink-0">
+          <form onSubmit={handleSend} className="flex gap-2">
             <input
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
               disabled={loading}
               placeholder="Ask a question or input transaction command..."
-              className="flex-1 bg-bg-surface border border-border-dim text-sm text-terminal-text px-4 py-2 focus:border-terminal-text focus:outline-none font-mono"
+              className="flex-1 min-w-0 bg-bg-surface border border-border-dim text-sm text-terminal-text px-4 py-2 focus:border-terminal-text focus:outline-none font-mono"
             />
             <button
               type="submit"
               disabled={loading || !input.trim()}
-              className="px-4 py-2 border border-terminal-signal text-terminal-signal hover:bg-terminal-signal/10 text-sm font-bold flex items-center justify-center gap-1.5 transition-all disabled:opacity-50 disabled:pointer-events-none"
+              className="px-3 md:px-4 py-2.5 shrink-0 border border-terminal-signal text-terminal-signal hover:bg-terminal-signal/10 text-sm font-bold flex items-center justify-center gap-1.5 transition-all disabled:opacity-50 disabled:pointer-events-none"
             >
               <Send size={14} />
               SEND
@@ -387,7 +387,7 @@ export default function Chat() {
       </div>
 
       {/* Citations & Real-Time Research Side Panel (Debate Hub Blueprint) */}
-      <div className="w-full md:w-88 bg-bg-card border-t md:border-t-0 md:border-l border-border-dim flex flex-col shrink-0 overflow-hidden">
+      <div className="w-full md:w-88 max-h-[45dvh] md:max-h-none min-h-0 bg-bg-card border-t md:border-t-0 md:border-l border-border-dim flex flex-col shrink-0 overflow-hidden">
         
         {/* Drawer Header */}
         <div className="px-4 h-12 border-b border-border-dim flex items-center justify-between bg-bg-card shrink-0">
@@ -413,7 +413,7 @@ export default function Chat() {
         {/* Live Search Query Banner (if web search is running or completed) */}
         {researchQuery && (
           <div className="px-4 py-2 border-b border-border-dim/40 bg-bg-surface text-[10px] font-mono flex items-center justify-between shrink-0">
-            <span className="text-terminal-muted truncate max-w-[200px]" title={researchQuery}>
+            <span className="text-terminal-muted truncate min-w-0 flex-1 md:max-w-[200px] md:flex-none" title={researchQuery}>
               Query: {researchQuery}
             </span>
             {Math.max(researchTotal, currentSources.length) > 0 && (
@@ -425,7 +425,7 @@ export default function Chat() {
         )}
 
         {/* Citations List with Animated Source Cards (Debate Hub Style) */}
-        <div className="flex-1 overflow-auto p-4 space-y-3 scrollbar-thin bg-bg-main">
+        <div className="flex-1 min-h-0 overflow-auto overscroll-contain p-4 space-y-3 scrollbar-thin bg-bg-main">
           {currentSources.length === 0 && researchPhase !== "searching" && (
             <div className="h-full flex flex-col items-center justify-center text-center text-xs text-terminal-muted p-4 space-y-2">
               <AlertTriangle size={24} className="text-terminal-muted/40" />

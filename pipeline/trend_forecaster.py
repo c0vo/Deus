@@ -17,18 +17,23 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from config.logging_config import get_logger
-from config.llm import get_client, get_deepseek_client, DEFAULT_SAFETY_SETTINGS
+from config.llm import complete, is_llm_configured, strip_code_fence
 from config.settings import settings
 from config.usage import track_llm
 from data.database import Database
 from api.sse_manager import event_bus
-from google.genai import types
 
 log = get_logger(__name__)
 
 # Module-level in-memory cache for macro themes (shared across all TrendForecaster instances)
 _macro_themes_cache: dict = {"data": None, "timestamp": 0}
 _MACRO_THEMES_TTL = 14400  # 4 hours (matches scheduler cadence)
+
+# Per-sector outlook cache, keyed by normalised sector name. /forecast takes a
+# free-text sector from the user, so the key space is unbounded — expired
+# entries are evicted on write rather than left to accumulate.
+_sector_outlook_cache: dict[str, tuple[Optional[dict], float]] = {}
+_SECTOR_OUTLOOK_TTL = 14400  # 4 hours (matches scheduler cadence)
 
 
 class TrendForecaster:
@@ -62,7 +67,7 @@ class TrendForecaster:
         # 2. Generate sector-level outlooks
         sector_data = self._get_top_sectors(hours=24, limit=max_sectors)
         for sd in sector_data:
-            forecast = await self._generate_sector_outlook(sd["sector"])
+            forecast = await self.get_sector_outlook(sd["sector"])
             if forecast:
                 self._store_forecast(forecast)
                 all_forecasts.append(forecast)
@@ -107,10 +112,9 @@ class TrendForecaster:
     async def _batch_generate_ticker_forecasts(self, ticker_contexts: dict) -> list[dict]:
         """
         Batch LLM call to generate forecasts for multiple tickers at once.
-        Uses DeepSeek v4-pro for reasoning-heavy scenario generation.
+        Runs on MODEL_REASONER, at high reasoning effort.
         """
-        client = get_deepseek_client()
-        if not client:
+        if not is_llm_configured() or not settings.model_reasoner:
             return []
 
         context_text = ""
@@ -138,26 +142,18 @@ class TrendForecaster:
         try:
             # deepseek-v4-pro at high reasoning effort — the second most
             # expensive call in the system, and previously unlogged entirely.
-            with track_llm(self.db, settings.deepseek_model_reasoner, "trend_forecast") as u:
-                u.response = response = await client.chat.completions.create(
-                    model=settings.deepseek_model_reasoner,
-                    messages=[
-                        {"role": "system", "content": "You generate forward-looking scenario analyses for stocks. Output valid JSON only."},
-                        {"role": "user", "content": prompt}
-                    ],
+            with track_llm(self.db, settings.model_reasoner, "trend_forecast") as u:
+                u.response = response = await complete(
+                    model=settings.model_reasoner,
+                    system="You generate forward-looking scenario analyses for stocks. Output valid JSON only.",
+                    prompt=prompt,
                     temperature=0.3,
-                    response_format={"type": "json_object"},
-                    reasoning_effort="high",
+                    json_mode=True,
+                    reasoning="high",
                     max_tokens=settings.debate_max_output_tokens,
-                    extra_body={"thinking": {"type": "enabled"}},
                 )
 
-            raw = response.choices[0].message.content.strip()
-            if raw.startswith("```json"): raw = raw[7:]
-            if raw.startswith("```"): raw = raw[3:]
-            if raw.endswith("```"): raw = raw[:-3]
-
-            parsed = json.loads(raw.strip())
+            parsed = json.loads(strip_code_fence(response.text))
             forecasts = []
             for ticker, data in parsed.items():
                 scenarios = data.get("scenarios", [])
@@ -178,10 +174,36 @@ class TrendForecaster:
             log.warning("trend_forecaster.batch_failed", error=str(e))
             return []
 
+    async def get_sector_outlook(self, sector: str) -> Optional[dict]:
+        """
+        Cached sector outlook — the entry point every caller should use.
+
+        The scheduled 4-hourly forecast run and the /forecast command share this
+        cache, so the scheduled job acts as the producer that warms the top
+        sectors and the on-demand command usually costs nothing.
+        """
+        key = sector.strip().lower()
+        now = time.time()
+
+        cached = _sector_outlook_cache.get(key)
+        if cached and (now - cached[1]) < _SECTOR_OUTLOOK_TTL:
+            log.info("trend_forecaster.sector_outlook_cache_hit", sector=sector)
+            return cached[0]
+
+        outlook = await self._generate_sector_outlook(sector)
+
+        # Drop expired keys before inserting, so a stream of one-off /forecast
+        # arguments cannot grow this dict without bound.
+        for stale in [k for k, (_, ts) in _sector_outlook_cache.items()
+                      if (now - ts) >= _SECTOR_OUTLOOK_TTL]:
+            del _sector_outlook_cache[stale]
+        _sector_outlook_cache[key] = (outlook, now)
+
+        return outlook
+
     async def _generate_sector_outlook(self, sector: str) -> Optional[dict]:
         """Generate a forward-looking outlook for a specific sector."""
-        client = get_client()
-        if not client:
+        if not is_llm_configured() or not settings.model_trend_outlook:
             return None
 
         # Get recent high-importance articles for this sector
@@ -225,27 +247,16 @@ class TrendForecaster:
         )
 
         try:
-            loop = asyncio.get_running_loop()
+            with track_llm(self.db, settings.model_trend_outlook, "sector_outlook") as u:
+                u.response = response = await complete(
+                    model=settings.model_trend_outlook,
+                    prompt=prompt,
+                    json_mode=True,
+                    reasoning="low",
+                )
+            raw = strip_code_fence(response.text)
 
-            def ask_llm():
-                with track_llm(self.db, settings.gemini_model_chat, "sector_outlook") as u:
-                    u.response = response = client.models.generate_content(
-                        model=settings.gemini_model_chat,
-                        contents=prompt,
-                        config={
-                            "safety_settings": DEFAULT_SAFETY_SETTINGS,
-                            "response_mime_type": "application/json",
-                            "thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
-                        }
-                    )
-                return response.text.strip()
-
-            raw = await loop.run_in_executor(None, ask_llm)
-            if raw.startswith("```json"): raw = raw[7:]
-            if raw.startswith("```"): raw = raw[3:]
-            if raw.endswith("```"): raw = raw[:-3]
-
-            parsed = json.loads(raw.strip())
+            parsed = json.loads(raw)
             scenarios = parsed.get("scenarios", [])
             if not scenarios:
                 return None
@@ -303,8 +314,7 @@ class TrendForecaster:
             for r in rows
         )
 
-        client = get_client()
-        if not client:
+        if not is_llm_configured() or not settings.model_trend_outlook:
             return []
 
         prompt = (
@@ -330,27 +340,16 @@ class TrendForecaster:
         )
 
         try:
-            loop = asyncio.get_running_loop()
+            with track_llm(self.db, settings.model_trend_outlook, "macro_themes") as u:
+                u.response = response = await complete(
+                    model=settings.model_trend_outlook,
+                    prompt=prompt,
+                    json_mode=True,
+                    reasoning="low",
+                )
+            raw = strip_code_fence(response.text)
 
-            def ask_llm():
-                with track_llm(self.db, settings.gemini_model_chat, "macro_themes") as u:
-                    u.response = response = client.models.generate_content(
-                        model=settings.gemini_model_chat,
-                        contents=prompt,
-                        config={
-                            "safety_settings": DEFAULT_SAFETY_SETTINGS,
-                            "response_mime_type": "application/json",
-                            "thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
-                        }
-                    )
-                return response.text.strip()
-
-            raw = await loop.run_in_executor(None, ask_llm)
-            if raw.startswith("```json"): raw = raw[7:]
-            if raw.startswith("```"): raw = raw[3:]
-            if raw.endswith("```"): raw = raw[:-3]
-
-            themes = json.loads(raw.strip())
+            themes = json.loads(raw)
             if isinstance(themes, list):
                 return themes
         except Exception as e:

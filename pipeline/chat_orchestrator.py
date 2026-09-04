@@ -4,12 +4,12 @@ import time
 from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, START, END
 
-from google.genai import types
-from config.llm import get_client, DEFAULT_SAFETY_SETTINGS
+from config.llm import complete, is_llm_configured, strip_code_fence
 from config.settings import settings
 from config.logging_config import get_logger
+from config.usage import track_llm
 from data.database import Database
-from pipeline.embedder import GeminiEmbedder
+from pipeline.embedder import Embedder
 from pipeline.web_search import enrich_chat_context
 import numpy as np
 
@@ -86,17 +86,17 @@ class ChatState(TypedDict):
 
 # Module-level embedder cache — shared across all ChatOrchestrator instances
 # to avoid re-initializing the Gemini embedding client on every chat message.
-_shared_embedder: Optional[GeminiEmbedder] = None
+_shared_embedder: Optional[Embedder] = None
 _embedder_lock = asyncio.Lock()
 
 
 class ChatOrchestrator:
-    def __init__(self, db: Database, progress_callback=None, embedder: Optional[GeminiEmbedder] = None):
+    def __init__(self, db: Database, progress_callback=None, embedder: Optional[Embedder] = None):
         self.db = db
         self.progress_callback = progress_callback
         self._embedder = embedder  # Allow injection; falls back to shared singleton below
 
-    async def _get_embedder(self) -> GeminiEmbedder:
+    async def _get_embedder(self) -> Embedder:
         """Return a ready-to-use embedder, reusing a module-level singleton."""
         global _shared_embedder
         if self._embedder is not None:
@@ -105,7 +105,7 @@ class ChatOrchestrator:
             return _shared_embedder
         async with _embedder_lock:
             if _shared_embedder is None:
-                _shared_embedder = GeminiEmbedder()
+                _shared_embedder = Embedder()
             if not _shared_embedder._initialized:
                 await _shared_embedder.initialize()
             return _shared_embedder
@@ -116,9 +116,8 @@ class ChatOrchestrator:
 
     async def router_node(self, state: ChatState) -> dict:
         await self._update_progress("🧠 Classifying query complexity...")
-        client = get_client()
-        if not client:
-            log.error("Gemini client not configured for router.")
+        if not is_llm_configured():
+            log.error("chat.router_unconfigured")
             return {"routing_decision": "shallow"}
 
         prompt = (
@@ -143,39 +142,16 @@ class ChatOrchestrator:
         )
         
         try:
-            model_name = getattr(settings, "gemini_model_router", "gemini-2.5-flash-lite")
-            
-            loop = asyncio.get_running_loop()
-            def ask():
-                start_time = time.time()
-                resp = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config={
-                        'response_mime_type': 'application/json',
-                        'safety_settings': DEFAULT_SAFETY_SETTINGS
-                    }
+            model_name = settings.model_router
+
+            with track_llm(self.db, model_name, "chat_router",
+                           prompt_text=prompt, store_text=True) as u:
+                u.response = resp = await complete(
+                    model=model_name, prompt=prompt, json_mode=True,
                 )
-                latency = int((time.time() - start_time) * 1000)
-                if resp.usage_metadata:
-                    self.db.log_llm_usage(
-                        model_name=model_name,
-                        operation="chat_router",
-                        prompt_tokens=resp.usage_metadata.prompt_token_count,
-                        candidate_tokens=resp.usage_metadata.candidates_token_count,
-                        latency_ms=latency,
-                        is_error=False,
-                        prompt_text=prompt,
-                        response_text=resp.text
-                    )
-                return resp.text.strip()
-                
-            result_text = await loop.run_in_executor(None, ask)
+            result_text = resp.text.strip()
             try:
-                if result_text.startswith("```json"): result_text = result_text[7:]
-                if result_text.startswith("```"): result_text = result_text[3:]
-                if result_text.endswith("```"): result_text = result_text[:-3]
-                data = json.loads(result_text.strip())
+                data = json.loads(strip_code_fence(result_text))
                 decision = data.get("decision", "shallow").lower()
                 if decision not in ["shallow", "complex"]:
                     decision = "shallow"
@@ -261,8 +237,8 @@ class ChatOrchestrator:
         await self._update_progress("⚡ Answering via Shallow model...")
         return await self._generate_answer(
             state, 
-            model_name=getattr(settings, "gemini_model_chat_shallow", "gemini-3.1-flash-lite"),
-            thinking_level=None,  # No thinking
+            model_name=settings.model_chat_shallow,
+            reasoning=None,  # No thinking
             operation_name="chat_shallow"
         )
 
@@ -283,52 +259,30 @@ class ChatOrchestrator:
         enriched_state["context"] = enriched_context
         return await self._generate_answer(
             enriched_state,
-            model_name=getattr(settings, "gemini_model_chat_complex", "gemini-3-flash-preview"),
-            thinking_level=types.ThinkingLevel.MEDIUM,  # Medium thinking
+            model_name=settings.model_chat_complex,
+            reasoning="medium",
             operation_name="chat_complex"
         )
         
-    async def _generate_answer(self, state: ChatState, model_name: str, thinking_level: Optional[int], operation_name: str) -> dict:
-        client = get_client()
-        if not client:
+    async def _generate_answer(self, state: ChatState, model_name: str,
+                               reasoning: Optional[str], operation_name: str) -> dict:
+        """
+        The shallow/complex split is now one argument: `reasoning` is None for
+        the fast lane and "medium" for the thinking lane, where it used to be a
+        provider-specific ThinkingConfig object.
+        """
+        if not is_llm_configured():
             return {"final_answer": "❌ LLM not configured."}
-            
-        query = state['query']
-        context_str = state['context']
-        prompt = build_chat_prompt(query, context_str)
-            
-        config = {
-            'safety_settings': DEFAULT_SAFETY_SETTINGS
-        }
-        
-        if thinking_level is not None:
-            config['thinking_config'] = types.ThinkingConfig(thinking_level=thinking_level)
-            
-        loop = asyncio.get_running_loop()
-        def ask():
-            start_time = time.time()
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=config
-            )
-            latency = int((time.time() - start_time) * 1000)
-            if resp.usage_metadata:
-                self.db.log_llm_usage(
-                    model_name=model_name,
-                    operation=operation_name,
-                    prompt_tokens=resp.usage_metadata.prompt_token_count,
-                    candidate_tokens=resp.usage_metadata.candidates_token_count,
-                    latency_ms=latency,
-                    is_error=False,
-                    prompt_text=prompt,
-                    response_text=resp.text
-                )
-            return resp.text.strip()
-            
+
+        prompt = build_chat_prompt(state['query'], state['context'])
+
         try:
-            result = await loop.run_in_executor(None, ask)
-            return {"final_answer": result}
+            with track_llm(self.db, model_name, operation_name,
+                           prompt_text=prompt, store_text=True) as u:
+                u.response = resp = await complete(
+                    model=model_name, prompt=prompt, reasoning=reasoning,
+                )
+            return {"final_answer": resp.text.strip()}
         except Exception as e:
             log.error(f"{operation_name} failed: {e}")
             return {"final_answer": f"❌ Failed to generate answer: {str(e)}"}

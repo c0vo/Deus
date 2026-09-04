@@ -162,6 +162,8 @@ class TestDebateResponseSchema:
         if not path.exists():
             pytest.skip("Fixture file not found")
         data = json.loads(path.read_text())
+        assert "direction" in data
+        assert "conviction" in data
         assert "executive_summary" in data
         assert "full_advisory" in data
         assert len(data["executive_summary"]) > 0
@@ -187,7 +189,8 @@ class TestStructuredOutputParsing:
 
     def test_parses_unescaped_newlines_in_string_field(self):
         raw = (
-            '{"executive_summary": "TLDR: BUY - asymmetric setup.",'
+            '{"direction": "BUY", "conviction": "High",'
+            ' "executive_summary": "TLDR: BUY - asymmetric setup.",'
             ' "full_advisory": "\nTrade Action\nAction: BUY\n"}'
         )
         with pytest.raises(json.JSONDecodeError):
@@ -198,7 +201,8 @@ class TestStructuredOutputParsing:
         assert "Trade Action" in result.full_advisory
 
     def test_parses_fenced_json(self):
-        raw = '```json\n{"executive_summary": "TLDR: HOLD.", "full_advisory": "### Call\nHold."}\n```'
+        raw = ('```json\n{"direction": "HOLD", "conviction": "Low",'
+               ' "executive_summary": "TLDR: HOLD.", "full_advisory": "### Call\nHold."}\n```')
         result = parse_structured(raw, TraderAdvisory)
         assert result.executive_summary == "TLDR: HOLD."
 

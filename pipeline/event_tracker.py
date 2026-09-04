@@ -14,7 +14,7 @@ from typing import Optional
 import httpx
 
 from config.logging_config import get_logger
-from config.llm import get_deepseek_client
+from config.llm import complete, is_llm_configured
 from config.usage import track_llm
 from config.settings import settings
 from data.database import Database
@@ -193,8 +193,8 @@ class EventTracker:
         if not rows:
             return []
 
-        client = get_deepseek_client()
-        if not client:
+        if not is_llm_configured() or not settings.model_extract:
+            log.warning("event_tracker.skipped", reason="MODEL_EXTRACT not configured")
             return []
 
         detected = []
@@ -263,9 +263,8 @@ class EventTracker:
         return detected
 
     async def _classify_event_article(self, article: NewsArticle) -> Optional[dict]:
-        """Use DeepSeek to extract event details from an article."""
-        client = get_deepseek_client()
-        if not client:
+        """Extract event details from an article with MODEL_EXTRACT."""
+        if not is_llm_configured() or not settings.model_extract:
             return None
 
         prompt = (
@@ -288,20 +287,18 @@ class EventTracker:
         # Call and parse are separated so the caller can tell a transient API
         # failure (retry later) from unparseable output (deterministic at
         # temperature=0.0 — retrying just re-buys the same bytes).
-        with track_llm(self.db, settings.deepseek_model_classifier, "event_extract") as u:
-            u.response = response = await client.chat.completions.create(
-                model=settings.deepseek_model_classifier,
-                messages=[
-                    {"role": "system", "content": "You extract financial event details from news. Output JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
+        with track_llm(self.db, settings.model_extract, "event_extract") as u:
+            u.response = response = await complete(
+                model=settings.model_extract,
+                system="You extract financial event details from news. Output JSON only.",
+                prompt=prompt,
                 temperature=0.0,
-                response_format={"type": "json_object"},
+                json_mode=True,
                 max_tokens=settings.extraction_max_output_tokens,
             )
 
         try:
-            result = json.loads(response.choices[0].message.content.strip())
+            result = json.loads(response.text.strip())
 
             if result.get("event_type") and result.get("event_type") != "other":
                 return {

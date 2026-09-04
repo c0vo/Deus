@@ -52,7 +52,7 @@ export default function IPOWatchlist({ ipos, onRemove }: IPOWatchlistProps) {
         <span className="num text-[11px] text-terminal-muted-alt">{ipos.length}</span>
       </div>
 
-      <div className="flex flex-col max-h-80 overflow-y-auto">
+      <div className="flex flex-col max-h-80 overflow-y-auto overscroll-contain">
         {ipos.map((ipo) => (
           <div
             key={ipo.id}

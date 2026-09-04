@@ -175,7 +175,7 @@ export default function Reflections() {
   };
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-4 md:p-6 space-y-4 md:space-y-6">
 
       {/* Title */}
       <div className="border-b border-border-dim pb-4">
@@ -356,14 +356,14 @@ export default function Reflections() {
           <div className="border border-border-dim bg-bg-card p-4 space-y-3">
             {/* Scope + Success filters */}
             <div className="flex flex-wrap items-center gap-3">
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <Globe size={12} className="text-terminal-muted" />
                 <span className="text-[10px] text-terminal-muted uppercase font-bold">Scope:</span>
                 {(["ALL", "ticker", "sector", "market"] as const).map((s) => (
                   <button
                     key={s}
                     onClick={() => setScopeFilter(s)}
-                    className={`px-2 py-0.5 border text-[10px] uppercase ${
+                    className={`tap-halo px-2 py-0.5 border text-[10px] uppercase ${
                       scopeFilter === s
                         ? "border-terminal-text text-terminal-text"
                         : "border-transparent text-terminal-muted hover:text-terminal-text"
@@ -373,14 +373,14 @@ export default function Reflections() {
                   </button>
                 ))}
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <Filter size={12} className="text-terminal-muted" />
                 <span className="text-[10px] text-terminal-muted uppercase font-bold">Outcome:</span>
                 {(["ALL", "SUCCESS", "FAILURE"] as const).map((s) => (
                   <button
                     key={s}
                     onClick={() => setSuccessFilter(s)}
-                    className={`px-2 py-0.5 border text-[10px] uppercase ${
+                    className={`tap-halo px-2 py-0.5 border text-[10px] uppercase ${
                       successFilter === s
                         ? s === "SUCCESS" ? "border-terminal-green text-terminal-green"
                           : s === "FAILURE" ? "border-terminal-red text-terminal-red"
@@ -396,7 +396,7 @@ export default function Reflections() {
 
             {/* Sector + Ticker filters */}
             <div className="flex flex-wrap items-center gap-3">
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <Building2 size={12} className="text-terminal-muted" />
                 <select
                   value={sectorFilter}
@@ -409,7 +409,7 @@ export default function Reflections() {
                   ))}
                 </select>
               </div>
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <span className="text-[10px] text-terminal-muted uppercase font-bold">Ticker:</span>
                 <select
                   value={tickerFilter}
@@ -424,7 +424,7 @@ export default function Reflections() {
               </div>
               <button
                 onClick={applyFilters}
-                className="px-3 py-0.5 border border-terminal-text text-terminal-text text-[10px] uppercase font-bold hover:bg-bg-surface transition-colors"
+                className="tap-halo px-3 py-0.5 border border-terminal-text text-terminal-text text-[10px] uppercase font-bold hover:bg-bg-surface transition-colors"
               >
                 Apply
               </button>

@@ -1,15 +1,17 @@
 "use client";
 
 import { useState, useCallback, useEffect, Suspense } from "react";
-import { getApiUrl } from "./utils/api";
+import { getApiUrl, fetchJson } from "./utils/api";
 import { useSystemStatus } from "./hooks/useSystemStatus";
 import TickerTape from "./components/TickerTape";
 import StatStrip, { StatTile } from "./components/StatStrip";
 import SectorHeatmap from "./components/SectorHeatmap";
 import LiveNewsFeed from "./components/LiveNewsFeed";
 import SmartMoneyPanel from "./components/SmartMoneyPanel";
+import DarkPoolPanel from "./components/DarkPoolPanel";
 import EventsCalendar from "./components/EventsCalendar";
 import MacroThemesCard from "./components/MacroThemesCard";
+import ThesisPanel from "./components/ThesisPanel";
 import TrendForecaster from "./components/TrendForecaster";
 import IPOWatchlist from "./components/IPOWatchlist";
 import PipelineTelemetry from "./components/PipelineTelemetry";
@@ -27,6 +29,7 @@ function DashboardContent() {
   const [error, setError] = useState<string | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [sseConnected, setSseConnected] = useState(false);
+  const [thesisTransitions, setThesisTransitions] = useState<any[]>([]);
 
   const { status, getDbSizeStr } = useSystemStatus();
 
@@ -62,6 +65,9 @@ function DashboardContent() {
     // The event tracker publishes on its own 6-hourly schedule, so the card
     // refreshes on the push rather than waiting out the 5-minute poll.
     onEventsUpdated: () => fetchEvents(),
+    // The nightly re-score publishes any EARLY -> BUILDING -> CROWDED moves;
+    // that transition is the trade timing, so it lands without a poll.
+    onThesisUpdate: (data) => setThesisTransitions(data?.transitions || []),
     onError: (msg) => {
       setError(msg);
       setSseConnected(false);
@@ -76,11 +82,8 @@ function DashboardContent() {
   // Events
   const fetchEvents = useCallback(async () => {
     try {
-      const res = await fetch(getApiUrl("/api/brain/events"));
-      if (res.ok) {
-        const json = await res.json();
-        setEvents(json.data || []);
-      }
+      const json = await fetchJson<{ data?: any[] }>("/api/brain/events");
+      setEvents(json.data || []);
     } catch {}
   }, []);
 
@@ -93,11 +96,8 @@ function DashboardContent() {
   // IPOs
   const fetchIpos = useCallback(async () => {
     try {
-      const res = await fetch(getApiUrl("/api/brain/ipos"));
-      if (res.ok) {
-        const json = await res.json();
-        setIpos(json.data || []);
-      }
+      const json = await fetchJson<{ data?: any[] }>("/api/brain/ipos");
+      setIpos(json.data || []);
     } catch {}
   }, []);
 
@@ -132,13 +132,12 @@ function DashboardContent() {
     setThemesLoading(true);
     try {
       const url = forceRefresh
-        ? getApiUrl("/api/brain/macro-themes?refresh=true")
-        : getApiUrl("/api/brain/macro-themes");
-      const res = await fetch(url);
-      if (res.ok) {
-        const json = await res.json();
-        setThemes(json.data || []);
-      }
+        ? "/api/brain/macro-themes?refresh=true"
+        : "/api/brain/macro-themes";
+      // Generous: on a cold cache this endpoint generates themes with an LLM.
+      // It still needs a ceiling — without one the card span forever.
+      const json = await fetchJson<{ data?: any[] }>(url, { timeoutMs: 30000 });
+      setThemes(json.data || []);
     } catch {}
     setThemesLoading(false);
   }, []);
@@ -216,7 +215,7 @@ function DashboardContent() {
     <div className="flex flex-col">
       <TickerTape />
 
-      <div className="p-5 flex flex-col gap-4">
+      <div className="p-4 md:p-5 flex flex-col gap-4">
         {/* Title */}
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
@@ -225,7 +224,7 @@ function DashboardContent() {
               Live surveillance, sector intelligence, and real-time analytics
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className={`pill ${sseConnected ? "pill-ok" : "pill-bad"}`}>
               <span className="pill-dot" />
               {sseConnected ? "Streaming" : "Disconnected"}
@@ -258,9 +257,14 @@ function DashboardContent() {
             institutional conviction reads against news sentiment. */}
         <SmartMoneyPanel />
 
+        {/* The undisclosed counterpart to the panel above: where size actually
+            printed, rather than what insiders filed after the fact. */}
+        <DarkPoolPanel />
+
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           <EventsCalendar events={events} onRemove={handleRemoveEvent} />
           <IPOWatchlist ipos={ipos} onRemove={handleRemoveIpo} />
+          <ThesisPanel transitions={thesisTransitions} />
           <MacroThemesCard
             themes={themes}
             loading={themesLoading}

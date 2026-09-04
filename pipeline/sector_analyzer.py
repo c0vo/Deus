@@ -18,10 +18,9 @@ from datetime import datetime, timezone, timedelta
 from config.logging_config import get_logger
 from config.settings import settings
 from config.usage import track_llm
-from config.llm import get_client, DEFAULT_SAFETY_SETTINGS
+from config.llm import complete, is_llm_configured, strip_code_fence
 from data.database import Database
 from api.sse_manager import event_bus
-from google.genai import types
 
 log = get_logger(__name__)
 
@@ -351,8 +350,7 @@ class SectorAnalyzer:
         if not hot_tickers:
             return hot_tickers
 
-        client = get_client()
-        if not client:
+        if not is_llm_configured() or not settings.model_sector_analyzer:
             return hot_tickers
 
         ticker_list = ", ".join([h["ticker"] for h in hot_tickers])
@@ -367,27 +365,15 @@ class SectorAnalyzer:
         )
 
         try:
-            loop = asyncio.get_running_loop()
+            with track_llm(self.db, settings.model_sector_analyzer, "sector_rationales") as u:
+                u.response = response = await complete(
+                    model=settings.model_sector_analyzer,
+                    prompt=prompt,
+                    json_mode=True,
+                    reasoning="low",
+                )
 
-            def ask_llm():
-                with track_llm(self.db, settings.gemini_model_chat, "sector_rationales") as u:
-                    u.response = response = client.models.generate_content(
-                        model=settings.gemini_model_chat,
-                        contents=prompt,
-                        config={
-                            "safety_settings": DEFAULT_SAFETY_SETTINGS,
-                            "response_mime_type": "application/json",
-                            "thinking_config": types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
-                        }
-                    )
-                return response.text.strip()
-
-            raw = await loop.run_in_executor(None, ask_llm)
-            if raw.startswith("```json"): raw = raw[7:]
-            if raw.startswith("```"): raw = raw[3:]
-            if raw.endswith("```"): raw = raw[:-3]
-
-            rationales = json.loads(raw.strip())
+            rationales = json.loads(strip_code_fence(response.text))
             for ht in hot_tickers:
                 ht["rationale"] = rationales.get(ht["ticker"], "Surge in news mentions detected.")
         except Exception as e:

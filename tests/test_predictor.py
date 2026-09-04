@@ -1,7 +1,8 @@
 import pytest
 import numpy as np
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, AsyncMock, patch
-from pipeline.predictor import FEATURE_SCHEMA_VERSION, StockPredictor
+from pipeline.predictor import FEATURE_DEFAULTS, FEATURE_SCHEMA_VERSION, StockPredictor
 
 @pytest.fixture
 def mock_db():
@@ -17,7 +18,58 @@ def mock_db():
         "avg_importance": 6.5,
         "bullish_ratio": 0.8,
     }
+    # Every series loader must return a real (empty) list, not a bare MagicMock.
+    # _cached_series wraps the loader in `except Exception` and falls back to an
+    # empty series, so an unstubbed MagicMock raises on iteration and is
+    # swallowed — the test then passes while silently exercising the defaults
+    # path instead of the code it names.
+    db.get_insider_series.return_value = []
+    db.get_stakes_series.return_value = []
+    db.get_kr_flow_series.return_value = []
+    db.get_offexchange_series.return_value = []
+    db.get_market_regime_series.return_value = []
     return db
+
+
+def _offexch_rows(n, last_session="2026-08-07", short_ratio=0.40, spike=None):
+    """n consecutive daily off-exchange rows ending on last_session.
+
+    Alternating jitter keeps the trailing window's variance non-zero, since
+    _z_score returns None on a flat window rather than dividing by zero.
+    """
+    end = datetime.strptime(last_session, "%Y-%m-%d").date()
+    rows = []
+    for i in range(n):
+        day = end - timedelta(days=n - 1 - i)
+        ratio = short_ratio + (0.01 if i % 2 else -0.01)
+        if spike is not None and i == n - 1:
+            ratio = spike
+        total = 1_000_000.0
+        rows.append({
+            "session_date": day.isoformat(),
+            "published_at": f"{day.isoformat()}T22:00:00+00:00",
+            "short_volume": total * ratio,
+            "short_exempt_volume": 0.0,
+            "total_volume": total,
+            "market_codes": "B,Q,N",
+            "consolidated_volume": 2_500_000.0 + (50_000.0 if i % 2 else 0.0),
+        })
+    return rows
+
+
+def _regime_rows(n, metric, value=0.45, last_session="2026-08-07"):
+    end = datetime.strptime(last_session, "%Y-%m-%d").date()
+    rows = []
+    for i in range(n):
+        day = end - timedelta(days=n - 1 - i)
+        rows.append({
+            "metric": metric,
+            "session_date": day.isoformat(),
+            "value": value + (0.01 if i % 2 else -0.01),
+            "published_at": f"{(day + timedelta(days=1)).isoformat()}T00:00:00+00:00",
+            "source": "test",
+        })
+    return rows
 
 @pytest.fixture
 def predictor(mock_db):
@@ -58,6 +110,130 @@ async def test_build_feature_vector(predictor):
         assert "vix_level" in features
         assert features["vix_level"] == 16.0
         assert features["market_return_1d"] == 0.01  # 4040/4000 - 1
+        # Width is enforced at the source: a typo'd key in any feature method
+        # raises out of build_feature_vector, and nothing on the live path
+        # catches it — the API returns a 500 rather than a degraded prediction.
+        assert len(features) == len(FEATURE_DEFAULTS)
+        assert set(features) == set(FEATURE_DEFAULTS)
+
+
+# ── Off-exchange (dark pool) features ───────────────────────────────────────
+
+def test_darkpool_excludes_rows_published_after_the_as_of(predictor, mock_db):
+    """The lookahead guard: a session is invisible until FINRA has posted it.
+
+    Both calls see the identical series. The only difference is where the as-of
+    edge falls relative to the final session's 22:00 UTC publication, and that
+    session is a large spike — so if the boundary were off by a day the z-score
+    would jump, which is exactly the failure that flatters a backtest and dies
+    in production.
+    """
+    mock_db.get_offexchange_series.return_value = _offexch_rows(
+        25, last_session="2026-08-07", spike=0.95
+    )
+    now = datetime(2026, 8, 7, 23, 59, 59, tzinfo=timezone.utc)
+
+    with_spike = predictor._darkpool_features(
+        "AAPL", datetime(2026, 8, 7, 23, 59, 59, tzinfo=timezone.utc), now)
+    predictor._darkpool_cache.clear()
+    without_spike = predictor._darkpool_features(
+        "AAPL", datetime(2026, 8, 6, 23, 59, 59, tzinfo=timezone.utc), now)
+
+    assert with_spike["offexch_short_ratio_z20"] > 4.0
+    assert abs(without_spike["offexch_short_ratio_z20"]) < 2.0
+
+
+def test_darkpool_needs_enough_history(predictor, mock_db):
+    """A freshly tracked ticker has no distribution to score against."""
+    mock_db.get_offexchange_series.return_value = _offexch_rows(10)
+    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
+
+    assert predictor._darkpool_features("AAPL", None, now) == {}
+
+
+def test_darkpool_staleness_guard(predictor, mock_db):
+    """A stale window scored as if it were current looks confident and is not.
+
+    Returning {} hands the caller the neutral default, which is an honest "no
+    reading" — a number computed from three-week-old inputs is not.
+    """
+    mock_db.get_offexchange_series.return_value = _offexch_rows(
+        25, last_session="2026-07-10")
+    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
+
+    assert predictor._darkpool_features("AAPL", None, now) == {}
+
+
+def test_darkpool_survives_missing_price_history(predictor, mock_db):
+    """price_history is filled on demand, so the share leg is often absent.
+
+    The short-ratio leg does not depend on it and must still be produced;
+    defaulting both would discard half the signal for no reason.
+    """
+    rows = _offexch_rows(25)
+    for row in rows:
+        row["consolidated_volume"] = None
+    mock_db.get_offexchange_series.return_value = rows
+    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
+
+    features = predictor._darkpool_features("AAPL", None, now)
+    assert "offexch_short_ratio_z20" in features
+    assert "offexch_volume_share_z20" not in features
+
+
+def test_darkpool_is_us_gated(predictor, mock_db):
+    """A Korean ticker must never reach the US-only off-exchange table."""
+    mock_db.get_offexchange_series.return_value = _offexch_rows(25)
+
+    kr = predictor._get_smart_money_features("005930.KS", as_of_date="2026-08-07")
+    assert not any(k.startswith("offexch_") for k in kr)
+    mock_db.get_offexchange_series.assert_not_called()
+
+    us = predictor._get_smart_money_features("AAPL", as_of_date="2026-08-07")
+    assert "offexch_short_ratio_z20" in us
+
+
+# ── Market-wide regime features ─────────────────────────────────────────────
+
+def test_regime_series_is_loaded_once_for_all_tickers(predictor, mock_db):
+    """The series is market-wide, so it is cached under a sentinel key.
+
+    retrain_models builds one StockPredictor for every ticker and horizon, so a
+    per-ticker cache key would mean one identical full-table scan per symbol
+    across ~56,000 feature builds.
+    """
+    mock_db.get_market_regime_series.return_value = (
+        _regime_rows(65, "dix", 0.45) + _regime_rows(65, "gex", 8e9)
+    )
+    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
+
+    first = predictor._regime_series_features(None, now)
+    second = predictor._regime_series_features(None, now)
+
+    assert mock_db.get_market_regime_series.call_count == 1
+    assert first == second
+    assert "dix_z60" in first and "gex_z60" in first
+
+
+def test_regime_metrics_default_independently(predictor, mock_db):
+    """DIX has history, OCC does not — one absent feed must not blank the others."""
+    mock_db.get_market_regime_series.return_value = (
+        _regime_rows(65, "dix", 0.45) + _regime_rows(5, "occ_put_call_ratio", 0.7)
+    )
+    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
+
+    features = predictor._regime_series_features(None, now)
+    assert "dix_z60" in features
+    assert "occ_put_call_ratio_z60" not in features
+
+
+def test_regime_staleness_guard(predictor, mock_db):
+    mock_db.get_market_regime_series.return_value = _regime_rows(
+        65, "dix", 0.45, last_session="2026-06-01")
+    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
+
+    assert predictor._regime_series_features(None, now) == {}
+
 
 @pytest.mark.asyncio
 async def test_train_model(predictor):

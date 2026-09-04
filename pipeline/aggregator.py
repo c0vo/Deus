@@ -15,7 +15,7 @@ from config.logging_config import get_logger
 from config.settings import settings
 from data.database import Database
 from data.models import NewsArticle
-from data.filters import FINANCIAL_KEYWORDS, TICKER_PATTERN, EXCLUDED_WORDS
+from data.filters import CASHTAG_PATTERN, FINANCIAL_KEYWORDS, TICKER_PATTERN, EXCLUDED_WORDS
 from data.sources.alpha_vantage_source import AlphaVantageSource
 from data.sources.base import NewsSource
 from data.sources.finnhub_source import FinnhubSource
@@ -202,22 +202,45 @@ def _has_financial_content(article: NewsArticle) -> bool:
     """
     Quick pre-filter: check if an article has financial keywords or ticker patterns.
     Returns True if likely financial (should be LLM-classified), False if noise.
-    """
-    text = f"{article.headline} {article.summary or ''}".upper()
 
-    # Check for $TICKER pattern
-    if "$" in article.headline or "$" in (article.summary or ""):
+    Case matters here. An earlier version uppercased the text before matching
+    TICKER_PATTERN, which turned every 2-5 letter word into a ticker — "A steak
+    dinner tour in Ohio" matched STEAK, TOUR and OHIO — so almost nothing was
+    filtered and the classifier paid for it.
+    """
+    article_text = f"{article.headline} {article.summary or ''}"
+
+    # Reddit posts carry their signal in the comments: the headline may be
+    # "What are your thoughts on this?" with the ticker only in a reply. Source
+    # enrichment runs before this filter, so the comments are already available.
+    comments_text = " ".join(
+        str(c.get("body", ""))
+        for c in article.raw_data.get("comments", [])
+        if isinstance(c, dict)
+    )
+    full_text = f"{article_text} {comments_text}"
+
+    # Explicit cashtag ($AAPL). A bare "$" is not enough — it matches "$100".
+    # Safe to read from comments: nothing writes a cashtag by accident.
+    if CASHTAG_PATTERN.search(full_text):
         return True
 
-    # Check for ticker pattern with excluded words filter
-    for match in TICKER_PATTERN.findall(text):
-        if match not in EXCLUDED_WORDS:
-            return True
+    # Bare ticker symbols, judged on original casing. Deliberately scoped to the
+    # headline and summary: comment prose is full of capitalised abbreviations
+    # that are not tickers ("I like MX Browns"), and a commenter naming a stock
+    # writes $TSLA, which the cashtag branch above already caught.
+    #
+    # An all-caps headline is a shouty headline rather than a list of tickers,
+    # so skip the heuristic there and let the keyword check decide.
+    if not article.headline.isupper():
+        for match in TICKER_PATTERN.findall(article_text):
+            if match not in EXCLUDED_WORDS:
+                return True
 
-    # Check for financial keywords
-    text_lower = text.lower()
+    # Financial keywords.
+    lowered = full_text.lower()
     for kw in FINANCIAL_KEYWORDS:
-        if kw in text_lower:
+        if kw in lowered:
             return True
 
     return False

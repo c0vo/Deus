@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { getApiUrl } from "../utils/api";
+import { fetchJson, nonOverlapping } from "../utils/api";
 import { useReducedMotion } from "../hooks/useReducedMotion";
 
 /** Scroll rate in px/sec. Real brokerage tapes run roughly 60-100. */
@@ -21,26 +21,34 @@ export default function TickerTape() {
   const offsetRef = useRef(0);
 
   useEffect(() => {
-    const fetchPrices = async () => {
+    const fetchPrices = nonOverlapping(async () => {
+      // A backgrounded tab has nothing to show; polling from it is pure cost.
+      if (document.hidden) return;
       try {
-        const res = await fetch(getApiUrl("/api/markets"));
-        if (res.ok) {
-          const json = await res.json();
-          const data = (json.data || []).map((d: any) => ({
-            ticker: d.ticker,
-            price: d.current_price || d.price || 0,
-            daily_change_pct: d.daily_change_pct || 0,
-          }));
-          setItems(data);
-        }
+        const json = await fetchJson<{ data?: any[] }>("/api/markets", {
+          timeoutMs: 6000,
+        });
+        const data = (json.data || []).map((d: any) => ({
+          ticker: d.ticker,
+          price: d.current_price || d.price || 0,
+          daily_change_pct: d.daily_change_pct || 0,
+        }));
+        setItems(data);
       } catch {
         // silently fail — the tape is ambient, not critical
       }
-    };
+    });
 
     fetchPrices();
-    const interval = setInterval(fetchPrices, 10000);
-    return () => clearInterval(interval);
+    // 30s rather than 10s: quotes are refreshed server-side on a timer now, so
+    // polling faster than that only multiplies requests without adding data.
+    const interval = setInterval(fetchPrices, 30000);
+    // Catch up immediately when the tab comes back to the foreground.
+    document.addEventListener("visibilitychange", fetchPrices);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", fetchPrices);
+    };
   }, []);
 
   // The scroll is driven from JS rather than a CSS keyframe animation, so the
@@ -116,6 +124,9 @@ export default function TickerTape() {
     <div
       className="h-[34px] overflow-hidden border-b border-border-dim bg-bg-card"
       onMouseEnter={() => setIsPaused(true)}
+      onTouchStart={() => setIsPaused(true)}
+      onTouchEnd={() => setIsPaused(false)}
+      onTouchCancel={() => setIsPaused(false)}
       onMouseLeave={() => setIsPaused(false)}
       role="region"
       aria-label="Tracked tickers"

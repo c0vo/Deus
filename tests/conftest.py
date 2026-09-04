@@ -98,38 +98,49 @@ def mock_db():
     return db
 
 
-@pytest.fixture
-def mock_gemini_client():
-    """Patch config.llm.get_client with a mock Gemini client."""
-    with patch("config.llm.get_client") as mock_get:
-        client = MagicMock()
-        mock_resp = MagicMock()
-        mock_resp.text = '{"decision": "shallow"}'
-        mock_resp.usage_metadata = None
-        client.aio.models.generate_content.return_value = mock_resp
-        client.models.generate_content.return_value = mock_resp
-        mock_get.return_value = client
-        yield mock_get
+def make_llm_response(text: str = "", parsed=None, *, prompt_tokens: int = 100,
+                      completion_tokens: int = 50, cost: float = 0.0001,
+                      finish_reason: str = "stop"):
+    """
+    Build an `LLMResponse` the way `config.llm.complete` would.
+
+    Tests assert against this rather than against a provider SDK's response
+    object, which is the point of the facade: a model or provider swap must not
+    be able to break a test.
+    """
+    from config.llm import LLMResponse
+
+    usage = MagicMock(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                      cost=cost)
+    return LLMResponse(
+        text=text, parsed=parsed, usage=usage,
+        finish_reason=finish_reason, cost=cost,
+    )
 
 
-@pytest.fixture
-def mock_deepseek_client():
-    """Patch config.llm.get_deepseek_client with a mock DeepSeek client."""
-    with patch("config.llm.get_deepseek_client") as mock_get:
-        client = MagicMock()
-        mock_choice = MagicMock()
-        mock_choice.message.content = (
-            '{"event_type": "earnings", "sentiment_score": 0.5, '
-            '"urgency": "high", "suggested_direction": "bullish", '
-            '"affected_sectors": ["Technology"], "affected_tickers": ["AAPL"], '
-            '"classification_summary": "Test summary"}'
-        )
-        mock_response = MagicMock()
-        mock_response.choices = [mock_choice]
-        mock_response.usage = MagicMock(prompt_tokens=100, completion_tokens=50)
-        client.chat.completions.create.return_value = mock_response
-        mock_get.return_value = client
-        yield mock_get
+def make_stream(chunks, *, prompt_tokens: int = 100, completion_tokens: int = 50,
+                cost: float = 0.0001, finish_reason: str = "stop"):
+    """
+    An async iterator of `StreamChunk`s ending in a usage-only chunk, matching
+    what `config.llm.stream_complete` yields.
+
+    `chunks` may be plain strings (content deltas) or (text, reasoning) pairs.
+    """
+    from config.llm import StreamChunk
+
+    async def _gen():
+        last = len(chunks) - 1
+        for i, c in enumerate(chunks):
+            text, reasoning = (c, "") if isinstance(c, str) else c
+            yield StreamChunk(
+                text=text, reasoning=reasoning,
+                finish_reason=finish_reason if i == last else None,
+            )
+        yield StreamChunk(usage=MagicMock(
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, cost=cost,
+        ))
+
+    return _gen()
 
 
 @pytest.fixture

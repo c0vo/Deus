@@ -107,6 +107,14 @@ class TickerNote(BaseModel):
     summary: str = Field(description="Plain-text commentary. No markdown, no HTML, no emojis.")
 
 
+class ThemeNote(BaseModel):
+    """One article cluster, named and summarised."""
+
+    cluster_id: str = Field(description="The cluster id, exactly as given in the prompt.")
+    title: str = Field(description="Short theme name, under 60 characters. Plain text.")
+    summary: str = Field(description="Two sentences on what is developing. Plain text.")
+
+
 def notes_to_dict(notes: list) -> dict[str, str]:
     """
     Collapse a TickerNote list back into the {ticker: summary} shape callers use.

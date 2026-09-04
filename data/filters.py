@@ -28,6 +28,15 @@ FINANCIAL_KEYWORDS = {
     "semiconductor", "chip",
     "presidential", "legislation",
     "fed chair", "federal reserve", "rate decision",
+    # Armed-conflict vocabulary. "war"/"military"/"invasion" alone missed the
+    # highest-scoring geopolitical stories in the archive — a 9.2 on strikes
+    # against Iranian forces and an 8.2 on drone strikes in Russia both had
+    # zero keyword hits and were being dropped before classification.
+    "troops", "airstrike", "missile", "drone", "warfare", "retaliation",
+    "ceasefire", "armed forces", "nuclear",
+    # Retail investment products, likewise absent and likewise load-bearing.
+    "401(k)", "401k", "index fund", "mutual fund", "pension", "hedge fund",
+    "buyback", "shareholder", "insider", "etf",
 }
 
 REDDIT_KEYWORDS = {
@@ -37,7 +46,14 @@ REDDIT_KEYWORDS = {
     "gain porn", "pump and dump", "fomo", "btfd", "wendys", "wife's boyfriend"
 }
 
+# A bare run of 2-5 capitals. Only meaningful against ORIGINAL-case text: run it
+# over an uppercased string and every short word matches, which is exactly the
+# bug that let non-financial articles through the aggregator's noise gate.
 TICKER_PATTERN = re.compile(r'\b[A-Z]{2,5}\b')
+
+# An explicit cashtag ($AAPL). Unambiguous enough to stand alone as a financial
+# signal, unlike TICKER_PATTERN. A bare "$" is not — it matches "$100".
+CASHTAG_PATTERN = re.compile(r'\$[A-Z]{1,5}\b')
 
 EXCLUDED_WORDS = {
     "THE", "AND", "FOR", "OUT", "NEW", "NOW", "ALL", "BUT", "HAS", "ITS", 

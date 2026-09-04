@@ -11,15 +11,24 @@ from data.models import NewsArticle
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
 @pytest.fixture
-def classifier():
-    """Create ArticleClassifier with mocked clients (no real API calls)."""
+def classifier(monkeypatch):
+    """
+    ArticleClassifier wired to a stubbed `complete`, so no real API calls.
+
+    Tests patch the facade rather than a provider SDK — that is the point of
+    having one: swapping the model behind MODEL_CLASSIFIER must not be able to
+    break a test.
+    """
     from pipeline.classifier import ArticleClassifier
-    clf = ArticleClassifier(
-        client=MagicMock(),
-        deepseek_client=MagicMock(),
-        db=MagicMock(),
-    )
-    clf.model_name = "test-gemini-model"
+    clf = ArticleClassifier(db=MagicMock())
+    clf.model_name = "test/primary-model"
+    monkeypatch.setattr("pipeline.classifier.settings.model_classifier", "test/primary-model")
+    monkeypatch.setattr("pipeline.classifier.settings.model_classifier_fallback", "test/fallback-model")
+    monkeypatch.setattr("pipeline.classifier.settings.model_reddit_sentiment", "test/primary-model")
+    monkeypatch.setattr("pipeline.classifier.settings.model_reddit_sentiment_fallback", "")
+    monkeypatch.setattr("pipeline.classifier.is_llm_configured", lambda: True)
+    clf.complete = AsyncMock()
+    monkeypatch.setattr("pipeline.classifier.complete", clf.complete)
     return clf
 
 
@@ -69,22 +78,10 @@ def reddit_article():
     )
 
 
-def make_deepseek_response(json_str: str):
-    """Build a mock DeepSeek response object."""
-    choice = MagicMock()
-    choice.message.content = json_str
-    resp = MagicMock()
-    resp.choices = [choice]
-    resp.usage = MagicMock(prompt_tokens=100, completion_tokens=50)
-    return resp
-
-
-def make_gemini_response(json_str: str):
-    """Build a mock Gemini response object."""
-    resp = MagicMock()
-    resp.text = json_str
-    resp.usage_metadata = MagicMock(prompt_token_count=100, candidates_token_count=50)
-    return resp
+def make_response(json_str: str):
+    """Build what `config.llm.complete` returns, for any model."""
+    from tests.conftest import make_llm_response
+    return make_llm_response(text=json_str)
 
 
 # ── should_classify tests ───────────────────────────────────────────────────
@@ -153,7 +150,7 @@ class TestClassify:
             "affected_tickers": ["AAPL"],
             "classification_summary": "Apple beat Q3 estimates on both revenue and EPS.",
         })
-        classifier.deepseek_client.chat.completions.create.return_value = make_deepseek_response(valid_json)
+        classifier.complete.return_value = make_response(valid_json)
 
         result = await classifier.classify(earnings_article)
 
@@ -163,15 +160,13 @@ class TestClassify:
         assert result.suggested_direction == "bullish"
         assert "AAPL" in result.affected_tickers
         assert "Technology" in result.affected_sectors
-        assert classifier.deepseek_client.chat.completions.create.called
+        assert classifier.complete.called
         assert classifier.db.log_llm_usage.called
 
     @pytest.mark.asyncio
-    async def test_gemini_fallback_on_deepseek_failure(self, classifier, earnings_article):
-        """DeepSeek fails → Gemini fallback is used."""
-        classifier.deepseek_client.chat.completions.create.side_effect = Exception("DeepSeek API error")
-
-        gemini_json = json.dumps({
+    async def test_fallback_model_on_primary_failure(self, classifier, earnings_article):
+        """Primary model fails → the configured fallback slug is tried next."""
+        fallback_json = json.dumps({
             "event_type": "earnings",
             "sentiment_score": 0.50,
             "urgency": "high",
@@ -180,13 +175,18 @@ class TestClassify:
             "affected_tickers": ["AAPL"],
             "classification_summary": "Fallback classification.",
         })
-        classifier.client.aio.models.generate_content.return_value = make_gemini_response(gemini_json)
+        classifier.complete.side_effect = [
+            Exception("primary model error"),
+            make_response(fallback_json),
+        ]
 
         result = await classifier.classify(earnings_article)
 
         assert result.event_type == "earnings"
         assert result.sentiment_score == 0.50
-        assert classifier.client.aio.models.generate_content.called
+        assert classifier.complete.await_count == 2
+        # Second attempt must go to the fallback slug, not retry the primary.
+        assert classifier.complete.await_args_list[1].kwargs["model"] == "test/fallback-model"
 
     @pytest.mark.asyncio
     async def test_noise_article_skips_llm(self, classifier):
@@ -203,9 +203,8 @@ class TestClassify:
         assert result.event_type == "noise"
         assert result.sentiment_score == 0.0
         assert result.urgency == "low"
-        assert not classifier.deepseek_client.chat.completions.create.called
-        assert not classifier.client.aio.models.generate_content.called
-
+        assert not classifier.complete.called
+        
     @pytest.mark.asyncio
     async def test_reddit_article_uses_reddit_prompt(self, classifier, reddit_article):
         """Reddit social articles use the REDDIT_CLASSIFICATION_PROMPT."""
@@ -218,22 +217,20 @@ class TestClassify:
             "affected_tickers": ["GME"],
             "classification_summary": "Highly bullish WSB sentiment.",
         })
-        classifier.deepseek_client.chat.completions.create.return_value = make_deepseek_response(valid_json)
+        classifier.complete.return_value = make_response(valid_json)
 
         result = await classifier.classify(reddit_article)
 
         assert result.event_type == "meme_stock"
         assert "GME" in result.affected_tickers
         # Check that the prompt sent to DeepSeek contains WSB-specific content
-        call_args = classifier.deepseek_client.chat.completions.create.call_args
-        messages = call_args[1].get("messages", [])
-        user_prompt = messages[0]["content"] if messages else ""
+        user_prompt = classifier.complete.await_args.kwargs["prompt"]
         assert "WSB" in user_prompt or "meme_stock" in user_prompt
 
     @pytest.mark.asyncio
     async def test_invalid_json_from_llm(self, classifier, earnings_article):
         """LLM returns invalid JSON → article is returned unchanged (graceful failure)."""
-        classifier.deepseek_client.chat.completions.create.return_value = make_deepseek_response("not valid json at all {{{")
+        classifier.complete.return_value = make_response("not valid json at all {{{")
 
         result = await classifier.classify(earnings_article)
 
@@ -245,14 +242,11 @@ class TestClassify:
     @pytest.mark.asyncio
     async def test_no_llm_configured(self, classifier, earnings_article):
         """When no LLM is configured, article is returned unchanged."""
-        with patch("pipeline.classifier.is_configured", return_value=False), \
-             patch("pipeline.classifier.is_deepseek_configured", return_value=False):
-
+        with patch("pipeline.classifier.is_llm_configured", return_value=False):
             result = await classifier.classify(earnings_article)
 
-            assert not classifier.deepseek_client.chat.completions.create.called
-            assert not classifier.client.aio.models.generate_content.called
-
+            assert not classifier.complete.called
+            
     @pytest.mark.asyncio
     async def test_classify_set_article_tickers_includes_existing(self, classifier):
         """Existing article tickers are merged with LLM-extracted tickers."""
@@ -272,7 +266,7 @@ class TestClassify:
             "affected_tickers": ["MSFT"],
             "classification_summary": "Earnings season.",
         })
-        classifier.deepseek_client.chat.completions.create.return_value = make_deepseek_response(valid_json)
+        classifier.complete.return_value = make_response(valid_json)
 
         result = await classifier.classify(article)
 
@@ -280,18 +274,20 @@ class TestClassify:
         assert "MSFT" in result.affected_tickers   # New ticker added
 
     @pytest.mark.asyncio
-    async def test_deepseek_logs_usage_on_success(self, classifier, earnings_article):
-        """LLM usage is logged after a successful DeepSeek classification."""
+    async def test_logs_usage_on_success(self, classifier, earnings_article):
+        """LLM usage is logged after a successful classification."""
         valid_json = json.dumps({"event_type": "earnings", "sentiment_score": 0.5, "urgency": "high",
                                  "suggested_direction": "bullish", "classification_summary": "OK"})
-        classifier.deepseek_client.chat.completions.create.return_value = make_deepseek_response(valid_json)
+        classifier.complete.return_value = make_response(valid_json)
 
         await classifier.classify(earnings_article)
 
         classifier.db.log_llm_usage.assert_called_once()
         call_kwargs = classifier.db.log_llm_usage.call_args[1]
         assert call_kwargs["operation"] == "classify"
-        assert call_kwargs["model_name"] == "deepseek-v4-flash"
+        assert call_kwargs["model_name"] == "test/primary-model"
+        # Real reported cost, not an estimate from a price table.
+        assert call_kwargs["cost_usd"] == pytest.approx(0.0001)
 
 
 class TestClassifyBatch:
@@ -331,14 +327,21 @@ class TestClassifyBatch:
         }
 
     @pytest.mark.asyncio
-    async def test_results_map_by_id_not_position(self, classifier):
-        """A reordered response must still land on the right articles."""
+    async def test_results_map_by_label_not_position(self, classifier):
+        """A reordered response must still land on the right articles.
+
+        The batch goes out under short labels a1..aN rather than the article
+        ids, because models degenerate on echoing a 30-character hash. The
+        guarantee is unchanged: results are matched by the label that came
+        back, so a reordered response still lands correctly.
+        """
         articles = self._articles()
-        # Deliberately reversed relative to the input order.
+        # a1/a2/a3 correspond to batch_0/batch_1/batch_2, deliberately
+        # reversed relative to the input order.
         payload = [
-            self._result("batch_2", 0.2),
-            self._result("batch_0", 0.9),
-            self._result("batch_1", -0.5),
+            self._result("a3", 0.2),
+            self._result("a1", 0.9),
+            self._result("a2", -0.5),
         ]
         with patch.object(
             classifier, "_call_with_fallback",
@@ -350,15 +353,15 @@ class TestClassifyBatch:
         assert by_id["batch_0"].sentiment_score == 0.9
         assert by_id["batch_1"].sentiment_score == -0.5
         assert by_id["batch_2"].sentiment_score == 0.2
-        assert by_id["batch_0"].classification_summary == "Summary for batch_0"
+        assert by_id["batch_0"].classification_summary == "Summary for a1"
 
     @pytest.mark.asyncio
     async def test_one_malformed_item_does_not_lose_the_others(self, classifier):
         articles = self._articles()
         payload = [
-            self._result("batch_0", 0.4),
-            {"id": "batch_1", "sentiment_score": "not-a-number", "urgency": "nope"},
-            self._result("batch_2", -0.3),
+            self._result("a1", 0.4),
+            {"id": "a2", "sentiment_score": "not-a-number", "urgency": "nope"},
+            self._result("a3", -0.3),
         ]
         with patch.object(
             classifier, "_call_with_fallback",
@@ -375,7 +378,7 @@ class TestClassifyBatch:
     @pytest.mark.asyncio
     async def test_missing_result_leaves_article_untouched(self, classifier):
         articles = self._articles()
-        payload = [self._result("batch_0", 0.4)]
+        payload = [self._result("a1", 0.4)]
         with patch.object(
             classifier, "_call_with_fallback",
             AsyncMock(return_value=json.dumps(payload)),
@@ -386,6 +389,25 @@ class TestClassifyBatch:
         assert by_id["batch_0"].event_type == "earnings"
         assert by_id["batch_1"].event_type is None
         assert by_id["batch_2"].event_type is None
+
+    @pytest.mark.asyncio
+    async def test_batch_is_sent_under_short_labels_not_article_ids(self, classifier):
+        """The prompt must not ask the model to echo 30-character hash ids.
+
+        Doing so cost whole batches: a model that started repeating a run of
+        characters from an id ran the response into its token cap and
+        truncated the JSON.
+        """
+        articles = self._articles()
+        mock_call = AsyncMock(return_value="[]")
+        with patch.object(classifier, "_call_with_fallback", mock_call):
+            await classifier.classify_batch(articles)
+
+        prompt = mock_call.await_args.args[0]
+        assert '"id": "a1"' in prompt
+        assert '"id": "a3"' in prompt
+        for article in articles:
+            assert article.id not in prompt
 
     @pytest.mark.asyncio
     async def test_prefiltered_noise_is_never_sent_to_the_llm(self, classifier, noise_article):
@@ -415,5 +437,6 @@ class TestClassifyBatch:
             await classifier.classify_batch(articles)
 
         assert mock_call.await_count == 2
-        operations = {c[0][3] for c in mock_call.await_args_list}
+        # (prompt, models, operation, max_output_tokens)
+        operations = {c[0][2] for c in mock_call.await_args_list}
         assert operations == {"classify_batch", "classify_batch_reddit"}

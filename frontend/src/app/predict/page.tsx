@@ -30,14 +30,21 @@ interface FeatureDict {
 
 interface DebateVerdict {
   ticker: string;
+  // The GradientBoosting baseline. UNKNOWN / 0 whenever no model artifact
+  // exists for the horizon, which is not the same thing as the trade call.
   predicted_direction?: string;
   confidence?: number;
+  // The Head Trader's own call, synthesized from the debate. This is the
+  // headline; absent on advisories cached before the trader reported it.
+  advisory_direction?: string;
+  advisory_conviction?: string;
   final_advisory?: string;
   bull_report?: string;
   bear_report?: string;
   ml_prediction?: {
     predicted_direction?: string;
     confidence?: number;
+    model_type?: string;
     feature_snapshot?: string; // JSON string
   };
   debate_history?: string[];
@@ -48,6 +55,27 @@ interface ResearchSource {
   title: string;
   url: string;
   domain: string;
+}
+
+// The call colours key off the trade decision, not off "is it UP". The old
+// ternary treated everything that was not UP as red, so an absent baseline
+// rendered a red UNKNOWN that read like a bearish verdict.
+const CALL_COLORS: Record<string, string> = {
+  BUY: "text-terminal-green",
+  SELL: "text-terminal-red",
+  HOLD: "text-terminal-amber",
+};
+
+// The ML baseline is a separate, optional signal from the trade call. When no
+// model artifact exists for the horizon the predictor reports UNKNOWN at 0.0 —
+// say that plainly instead of printing it as if it were a prediction.
+function mlBaselineLabel(ml?: DebateVerdict["ml_prediction"]): string {
+  const dir = ml?.predicted_direction;
+  if (!dir || dir === "UNKNOWN" || ml?.model_type === "llm_only") {
+    return "no model trained — advisory is news + fundamentals only";
+  }
+  const conf = ml?.confidence !== undefined ? `${(ml.confidence * 100).toFixed(1)}%` : "n/a";
+  return `${dir} @ ${conf} confidence`;
 }
 
 function PredictContent() {
@@ -136,11 +164,16 @@ function PredictContent() {
         ticker: targetTicker,
         predicted_direction: stateObj.ml_prediction?.predicted_direction || "UNKNOWN",
         confidence: stateObj.ml_prediction?.confidence || 0.0,
+        // Raw graph state, so these are the AdvisoryState key names. Advisories
+        // cached before the trader reported its own call simply lack them.
+        advisory_direction: stateObj.trader_direction,
+        advisory_conviction: stateObj.trader_conviction,
         final_advisory: stateObj.final_advisory,
         bull_report: stateObj.bull_report,
         bear_report: stateObj.bear_report,
         ml_prediction: stateObj.ml_prediction,
         debate_history: debateHistory,
+        executive_summary: stateObj.executive_summary,
       };
 
       setVerdict(mappedVerdict);
@@ -427,7 +460,7 @@ function PredictContent() {
   const hasDebateContent = bullRounds[1] || bearRounds[1] || bullRounds[2] || bearRounds[2] || verdict || streamedTrader;
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-4 md:p-6 space-y-4 md:space-y-6">
       
       {/* Title */}
       <div className="border-b border-border-dim pb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
@@ -443,7 +476,7 @@ function PredictContent() {
 
         {/* Console toggle & view toggles */}
         {hasDebateContent && (
-          <div className="flex items-center gap-3 text-xs">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
             <div className="flex border border-border-dim">
               <button
                 onClick={() => setViewMode("arena")}
@@ -483,10 +516,10 @@ function PredictContent() {
       </div>
 
       {/* === TAB NAVIGATION === */}
-      <div className="flex border-b border-border-dim">
+      <div className="flex overflow-x-auto -mx-4 px-4 md:mx-0 md:px-0 border-b border-border-dim">
         <button
           onClick={() => setActiveTab("new")}
-          className={`px-4 py-2 text-xs font-bold uppercase tracking-wider transition-colors flex items-center gap-1.5 ${
+          className={`shrink-0 whitespace-nowrap px-4 py-3 text-xs font-bold uppercase tracking-wider transition-colors flex items-center gap-1.5 ${
             activeTab === "new"
               ? "border-b-2 border-terminal-signal text-terminal-signal bg-bg-surface"
               : "text-terminal-muted hover:text-terminal-text border-b-2 border-transparent"
@@ -502,7 +535,7 @@ function PredictContent() {
               fetchRecentDebates();
             }
           }}
-          className={`px-4 py-2 text-xs font-bold uppercase tracking-wider transition-colors flex items-center gap-1.5 ${
+          className={`shrink-0 whitespace-nowrap px-4 py-3 text-xs font-bold uppercase tracking-wider transition-colors flex items-center gap-1.5 ${
             activeTab === "recent"
               ? "border-b-2 border-terminal-signal text-terminal-signal bg-bg-surface"
               : "text-terminal-muted hover:text-terminal-text border-b-2 border-transparent"
@@ -516,9 +549,9 @@ function PredictContent() {
       {/* === TAB CONTENT === */}
       {activeTab === "new" ? (
         /* ── New Debate controls ── */
-        <div className="border border-border-dim bg-bg-card p-4 flex flex-col md:flex-row items-stretch md:items-center gap-4">
-          <div className="flex-1 flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
-            <div className="flex items-center gap-3">
+        <div className="border border-border-dim bg-bg-card p-3 md:p-4 flex flex-col md:flex-row items-stretch md:items-center gap-3 md:gap-4">
+          <div className="flex-1 min-w-0 flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+            <div className="flex items-center gap-2 min-w-0">
               <span className="text-xs text-terminal-text font-bold uppercase shrink-0">ENTER TICKER:</span>
               <input
                 type="text"
@@ -536,19 +569,19 @@ function PredictContent() {
                 onBlur={() => fetchHistoryDates(ticker.toUpperCase().trim())}
                 disabled={running}
                 placeholder="e.g. AAPL"
-                className="w-[120px] bg-bg-surface border border-border-dim text-sm text-terminal-text px-3 py-1.5 focus:border-terminal-text focus:outline-none uppercase"
+                className="flex-1 min-w-0 md:w-[120px] md:flex-none bg-bg-surface border border-border-dim text-sm text-terminal-text px-3 py-1.5 focus:border-terminal-text focus:outline-none uppercase"
               />
             </div>
 
             {historyDates.length > 0 && (
-              <div className="flex items-center gap-2 mt-2 sm:mt-0">
+              <div className="flex flex-wrap items-center gap-2 mt-2 sm:mt-0 min-w-0">
                 <Clock size={12} className="text-terminal-violet" />
                 <span className="text-[10px] text-terminal-muted uppercase tracking-wider shrink-0">PAST DEBATES:</span>
                 <select
                   value={selectedDate}
                   onChange={(e) => handleSelectHistoryDate(e.target.value)}
                   disabled={running}
-                  className="bg-bg-surface border border-border-dim text-xs text-terminal-text px-2 py-1.5 focus:border-terminal-text focus:outline-none font-mono"
+                  className="flex-1 min-w-0 md:flex-none bg-bg-surface border border-border-dim text-xs text-terminal-text px-2 py-1.5 focus:border-terminal-text focus:outline-none font-mono"
                 >
                   <option value="">-- select date --</option>
                   {historyDates.map((d) => (
@@ -559,7 +592,7 @@ function PredictContent() {
             )}
           </div>
 
-          <div className="flex items-center gap-4 mt-2 sm:mt-0">
+          <div className="flex flex-wrap items-center gap-3 mt-2 sm:mt-0">
             <label className="flex items-center gap-1.5 cursor-pointer select-none text-xs text-terminal-muted hover:text-terminal-text transition-colors">
               <input
                 type="checkbox"
@@ -574,7 +607,7 @@ function PredictContent() {
             <button
               onClick={runAnalysis}
               disabled={running || !ticker}
-              className="px-6 py-2 border border-terminal-signal text-terminal-signal hover:bg-terminal-signal/10 text-sm font-bold flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:pointer-events-none"
+              className="w-full sm:w-auto px-6 py-3 sm:py-2 border border-terminal-signal text-terminal-signal hover:bg-terminal-signal/10 text-sm font-bold flex items-center justify-center gap-2 transition-all disabled:opacity-50 disabled:pointer-events-none"
             >
               <Play size={16} />
               RUN DEBATE ANALYSIS
@@ -619,7 +652,7 @@ function PredictContent() {
           )}
 
           {!recentDebatesLoading && recentDebates.length > 0 && (
-            <div className="max-h-[420px] overflow-y-auto space-y-1 scrollbar-thin">
+            <div className="max-h-none md:max-h-[420px] md:overflow-y-auto space-y-1 scrollbar-thin">
               {recentDebates
                 .filter(
                   (d) =>
@@ -734,7 +767,7 @@ function PredictContent() {
           </div>
 
           {/* Source Cards */}
-          <div className="space-y-2 max-h-[340px] overflow-y-auto pr-1 scrollbar-thin">
+          <div className="space-y-2 max-h-none md:max-h-[340px] md:overflow-y-auto pr-1 scrollbar-thin">
             {researchSources.map((src, idx) => (
               <div
                 key={idx}
@@ -848,10 +881,7 @@ function PredictContent() {
         <div className="space-y-6">
           
           {/* Visual Face-Off Header Panel */}
-          <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr] items-center gap-4 border border-border-dim bg-bg-main p-6 overflow-hidden relative">
-            
-            {/* Background Grid Pattern */}
-            <div className="absolute inset-0 bg-grid-pattern opacity-5 pointer-events-none" />
+          <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr] items-center gap-3 md:gap-4 border border-border-dim bg-bg-main p-4 md:p-6 overflow-hidden relative">
 
             {/* Left Fighter: Bull Agent */}
             <div 
@@ -880,7 +910,7 @@ function PredictContent() {
             </div>
 
             {/* Center clash VS indicator */}
-            <div className="flex flex-col items-center justify-center min-w-[140px] py-2 md:py-0">
+            <div className="flex flex-col items-center justify-center min-w-0 md:min-w-[140px] py-2 md:py-0">
               <div className="w-12 h-12 rounded-full border-2 border-border-dim bg-bg-card flex items-center justify-center relative shadow-lg">
                 <Swords size={20} className={`text-terminal-violet ${running ? "animate-pulse" : ""}`} />
                 {running && (
@@ -922,13 +952,13 @@ function PredictContent() {
 
           {/* Collapsible log pane */}
           {showLogs && (
-            <div className="border border-border-dim bg-bg-surface p-4 flex flex-col h-[260px] animate-fadeIn">
+            <div className="border border-border-dim bg-bg-surface p-3 md:p-4 flex flex-col h-[200px] md:h-[260px] animate-fadeIn">
               <div className="flex items-center gap-2 text-xs text-terminal-muted border-b border-border-dim pb-2 mb-3 select-none">
                 <TerminalIcon size={14} />
                 <span>AGENT_WORKFLOW_STREAM.log</span>
                 {running && <span className="text-terminal-green animate-pulse ml-auto">Live</span>}
               </div>
-              <div className="flex-1 overflow-auto space-y-1 font-mono text-[10px] text-terminal-muted scrollbar-thin">
+              <div className="flex-1 overflow-auto overscroll-contain space-y-1 font-mono text-[10px] text-terminal-muted scrollbar-thin">
                 {logs.map((log, index) => (
                   <div key={index} className="leading-relaxed whitespace-pre-wrap break-words" dangerouslySetInnerHTML={{ __html: log }} />
                 ))}
@@ -945,7 +975,7 @@ function PredictContent() {
 
           {/* VIEW: Arena Thread Mode (Alternating speech bubbles) */}
           {viewMode === "arena" && (
-            <div className="space-y-4 max-h-[600px] overflow-y-auto pr-2 scrollbar-thin">
+            <div className="space-y-4 md:max-h-[600px] md:overflow-y-auto md:pr-2 scrollbar-thin">
               
               {/* Round 1 */}
               {(bullRounds[1] || bearRounds[1] || (currentRound === 1 && running)) && (
@@ -959,7 +989,7 @@ function PredictContent() {
                   {/* Bull Round 1 */}
                   {(bullRounds[1] || (currentSpeaker === "bull" && currentRound === 1)) && (
                     <div className="flex justify-start animate-slideUp">
-                      <div className="max-w-[85%] border border-terminal-green/30 bg-bg-card p-4 rounded-sm relative">
+                      <div className="max-w-[92%] md:max-w-[85%] border border-terminal-green/30 bg-bg-card p-4 rounded-sm relative">
                         <div className="text-[10px] text-terminal-green font-bold uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
                           <TrendingUp size={12} />
                           Bullish Case (Opening)
@@ -978,7 +1008,7 @@ function PredictContent() {
                   {/* Bear Round 1 */}
                   {(bearRounds[1] || (currentSpeaker === "bear" && currentRound === 1)) && (
                     <div className="flex justify-end animate-slideUp">
-                      <div className="max-w-[85%] border border-terminal-red/30 bg-bg-card p-4 rounded-sm relative text-right">
+                      <div className="max-w-[92%] md:max-w-[85%] border border-terminal-red/30 bg-bg-card p-4 rounded-sm relative text-right">
                         <div className="text-[10px] text-terminal-red font-bold uppercase tracking-wider mb-1.5 flex items-center justify-end gap-1.5">
                           Bearish Attack (Opening Rebuttal)
                           <TrendingDown size={12} />
@@ -1008,7 +1038,7 @@ function PredictContent() {
                   {/* Bull Round 2 */}
                   {(bullRounds[2] || (currentSpeaker === "bull" && currentRound === 2)) && (
                     <div className="flex justify-start animate-slideUp">
-                      <div className="max-w-[85%] border border-terminal-green/30 bg-bg-card p-4 rounded-sm relative">
+                      <div className="max-w-[92%] md:max-w-[85%] border border-terminal-green/30 bg-bg-card p-4 rounded-sm relative">
                         <div className="text-[10px] text-terminal-green font-bold uppercase tracking-wider mb-1.5 flex items-center gap-1.5">
                           <TrendingUp size={12} />
                           Bullish Case (Rebuttal & News Catalyst Analysis)
@@ -1027,7 +1057,7 @@ function PredictContent() {
                   {/* Bear Round 2 */}
                   {(bearRounds[2] || (currentSpeaker === "bear" && currentRound === 2)) && (
                     <div className="flex justify-end animate-slideUp">
-                      <div className="max-w-[85%] border border-terminal-red/30 bg-bg-card p-4 rounded-sm relative text-right">
+                      <div className="max-w-[92%] md:max-w-[85%] border border-terminal-red/30 bg-bg-card p-4 rounded-sm relative text-right">
                         <div className="text-[10px] text-terminal-red font-bold uppercase tracking-wider mb-1.5 flex items-center justify-end gap-1.5">
                           Bearish Attack (Final Defense Counter-Attack)
                           <TrendingDown size={12} />
@@ -1152,15 +1182,21 @@ function PredictContent() {
               <div className="space-y-4">
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-bg-surface/30 p-3 border border-border-dim/40">
                   <div>
-                    <span className="text-[10px] text-terminal-muted uppercase block">Recommended direction</span>
-                    <span className={`text-2xl font-black uppercase tracking-wide ${(verdict?.predicted_direction || verdict?.ml_prediction?.predicted_direction || "HOLD") === "UP" ? "text-terminal-green" : "text-terminal-red"}`}>
-                      {verdict?.predicted_direction || verdict?.ml_prediction?.predicted_direction || "HOLD"}
+                    <span className="text-[10px] text-terminal-muted uppercase block">Trader call</span>
+                    <span className={`text-2xl font-black uppercase tracking-wide ${CALL_COLORS[verdict?.advisory_direction || ""] || "text-terminal-muted"}`}>
+                      {verdict ? verdict.advisory_direction || "N/A" : "…"}
                     </span>
                   </div>
                   <div>
-                    <span className="text-[10px] text-terminal-muted uppercase block">Advisory confidence</span>
-                    <span className="text-2xl font-black text-terminal-text tracking-wide">
-                      {verdict?.confidence !== undefined ? `${(verdict.confidence * 100).toFixed(1)}%` : (verdict?.ml_prediction?.confidence ? `${(verdict.ml_prediction.confidence * 100).toFixed(1)}%` : "N/A")}
+                    <span className="text-[10px] text-terminal-muted uppercase block">Conviction</span>
+                    <span className="text-2xl font-black text-terminal-text uppercase tracking-wide">
+                      {verdict ? verdict.advisory_conviction || "N/A" : "…"}
+                    </span>
+                  </div>
+                  <div className="sm:col-span-2 border-t border-border-dim/30 pt-2">
+                    <span className="text-[10px] text-terminal-muted uppercase block">ML baseline (5d)</span>
+                    <span className="text-[11px] text-terminal-muted">
+                      {mlBaselineLabel(verdict?.ml_prediction)}
                     </span>
                   </div>
                 </div>
@@ -1187,12 +1223,14 @@ function PredictContent() {
                 {featuresExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
               </button>
               {featuresExpanded && (
-                <div className="p-4 border-t border-border-dim grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 text-[10px] bg-bg-surface/30">
+                <div className="p-3 md:p-4 border-t border-border-dim grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 text-[10px] bg-bg-surface/30">
                   {Object.keys(features).sort().map((key) => {
                     const val = features[key];
                     return (
-                      <div key={key} className="border border-border-dim/50 p-2 flex flex-col justify-between">
-                        <span className="text-terminal-muted truncate uppercase">{key}</span>
+                      <div key={key} className="border border-border-dim/50 p-2 flex flex-col justify-between min-w-0">
+                        {/* Long keys truncate in a 2-col phone grid; title makes
+                            them recoverable via long-press / hover. */}
+                        <span title={key} className="text-terminal-muted truncate uppercase">{key}</span>
                         <span className="text-terminal-text font-bold text-right mt-1">
                           {typeof val === "number" ? val.toFixed(4) : String(val)}
                         </span>

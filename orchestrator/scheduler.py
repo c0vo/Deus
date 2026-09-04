@@ -21,27 +21,63 @@ from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from google.genai import types
 from config.logging_config import get_logger
 from config.settings import settings
-from config.llm import is_transient, parse_structured
+from config.llm import complete, is_llm_configured, is_transient, parse_structured
+from config.usage import track_llm
 from data.database import Database
 from pipeline.aggregator import NewsAggregator
 from pipeline.classifier import ArticleClassifier
 from pipeline.ranker import ArticleRanker
-from pipeline.embedder import GeminiEmbedder
+from pipeline.embedder import Embedder
 from pipeline.market_scanner import MarketScanner
+from pipeline.predictor import HORIZON_LABELS, StockPredictor
+from pipeline.price_feed import PriceFeed
 from pipeline.sector_analyzer import SectorAnalyzer
 from pipeline.ipo_detector import IPODetector
 from pipeline.geo_tagger import GeoTagger
 from pipeline.event_tracker import EventTracker
 from pipeline.trend_forecaster import TrendForecaster
+from pipeline.thesis_engine import ThesisEngine
 from pipeline.insider_tracker import InsiderTracker
 from pipeline.kr_flows import KrFlowTracker
+from pipeline.darkpool import DarkPoolTracker
+from pipeline.market_regime import MarketRegimeTracker
+from pipeline.options_flow import OptionsSnapshotTracker
+from pipeline.analyst_ratings import AnalystRatingsTracker
+from pipeline.technical_rating import TechnicalRatingTracker
 from bot.alerts import AlertManager
 from api.sse_manager import event_bus
 
 log = get_logger(__name__)
+
+# Reflection job bounds. The job scans every resolved multi-agent prediction that
+# has no lesson yet, so without these the whole historical backlog is processed in
+# a single tick.
+REFLECTION_LOOKBACK_DAYS = 14
+REFLECTION_BATCH_LIMIT = 25
+
+# How many wrong predictions get a fresh multi-agent debate per run. Reflection
+# itself is one cheap call per prediction, but each correction is a full debate,
+# so an uncapped batch could spend ~150 calls on the priciest models in one
+# nightly job. Corrections are ranked by confidence — the misses we were most
+# certain about are the ones worth re-running.
+REFLECTION_REPREDICT_LIMIT = 3
+
+# APScheduler's default misfire_grace_time is ONE SECOND: a cron job whose fire
+# time passes while the event loop is busy is dropped for the day, not run late.
+# On the Termux deployment that is the normal case, not an edge case — Android
+# Doze suspends timers whenever the phone is idle, so a 06:30 job typically
+# wakes minutes late and was silently skipped every morning. Daily thesis jobs
+# are "sometime this morning" work, so a wide window costs nothing; coalesce
+# (on by default) still collapses a backlog into a single run.
+DAILY_MISFIRE_GRACE_SECONDS = 6 * 3600
+
+# When the morning thesis is due, in Asia/Seoul. Shared by the cron trigger and
+# the start-up catch-up, which must not fire before the scheduled time or a
+# worker booted at 03:00 would generate one thesis then and a second at 06:30.
+THESIS_GENERATION_HOUR = 6
+THESIS_GENERATION_MINUTE = 30
 
 
 class ReflectionLesson(BaseModel):
@@ -64,8 +100,9 @@ class PipelineOrchestrator:
         self.aggregator = NewsAggregator(db=self.db)
         self.classifier = ArticleClassifier(db=self.db)
         self.ranker = ArticleRanker(db=self.db)
-        self.embedder = GeminiEmbedder(db=self.db)
+        self.embedder = Embedder(db=self.db)
         self.market_scanner = MarketScanner(db=self.db, alert_manager=self.alert_manager)
+        self.price_feed = PriceFeed(db=self.db)
         self.sector_analyzer = SectorAnalyzer(db=self.db, alert_manager=self.alert_manager)
         self.ipo_detector = IPODetector(db=self.db)
         self.geo_tagger = GeoTagger(db=self.db)
@@ -73,6 +110,13 @@ class PipelineOrchestrator:
         self.trend_forecaster = TrendForecaster(db=self.db)
         self.insider_tracker = InsiderTracker(db=self.db)
         self.kr_flow_tracker = KrFlowTracker(db=self.db)
+        self.darkpool_tracker = DarkPoolTracker(db=self.db)
+        self.market_regime_tracker = MarketRegimeTracker(db=self.db)
+        self.options_tracker = OptionsSnapshotTracker(db=self.db)
+        self.analyst_tracker = AnalystRatingsTracker(db=self.db)
+        self.technical_rating_tracker = TechnicalRatingTracker(db=self.db)
+
+        self.thesis_engine = ThesisEngine(db=self.db)
 
         self.scheduler = AsyncIOScheduler()
         self.is_running = False
@@ -452,30 +496,27 @@ class PipelineOrchestrator:
         """Sends the daily briefing at the scheduled time."""
         if not self.alert_manager:
             return
-            
+
         try:
-            from bot.formatters import escape_html
-            
-            briefing = self.db.get_briefing_by_sector(hours=24, limit=10)
-            if not briefing:
-                return
-                
-            text = "<b>📰 Daily Market Briefing</b>\n\n"
-            for sector, articles in briefing.items():
-                text += f"<b>--- {escape_html(sector)} ---</b>\n"
-                for r in articles:
-                    score = r["importance_score"]
-                    text += f"🔹 <b>{escape_html(r['headline'])}</b> (Score: {score})\n"
-                    text += f"<i>{escape_html(r['classification_summary'])}</i>\n"
-                    text += f"<a href='{escape_html(r['url'])}'>Read more</a>\n\n"
-                    
-            await self.alert_manager.bot.send_message(
-                chat_id=self.alert_manager.chat_id,
-                text=text,
-                parse_mode="HTML",
-                disable_web_page_preview=True
+            from bot.formatters import EMPTY_BRIEFING_TEXT, chunk_html, render_briefing
+            from data.taxonomy import BRIEFING_MIN_IMPORTANCE, select_briefing_lanes
+
+            rows = self.db.get_briefing_candidates(
+                hours=24, min_importance=BRIEFING_MIN_IMPORTANCE, limit=40
             )
-            log.info("orchestrator.daily_briefing_sent")
+            lanes = select_briefing_lanes(rows)
+            # Always send, even when nothing clears the floor. A quiet news day
+            # and a job that silently died look identical from the chat.
+            text = render_briefing(lanes) if lanes else EMPTY_BRIEFING_TEXT
+
+            for chunk in chunk_html(text):
+                await self.alert_manager.bot.send_message(
+                    chat_id=self.alert_manager.chat_id,
+                    text=chunk,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            log.info("orchestrator.daily_briefing_sent", articles=sum(len(a) for _, a in lanes))
         except Exception as e:
             log.error("orchestrator.daily_briefing_failed", error=str(e))
 
@@ -486,7 +527,6 @@ class PipelineOrchestrator:
             
         try:
             from bot.formatters import escape_html
-            from config.llm import get_client, parse_structured, DEFAULT_SAFETY_SETTINGS
             from data.models import TickerNote, notes_to_dict
 
             tracked = self.db.get_tracked_tickers()
@@ -500,8 +540,7 @@ class PipelineOrchestrator:
                     all_ticker_contexts[t] = summaries
             
             ai_summaries = {}
-            client = get_client()
-            if client and all_ticker_contexts:
+            if is_llm_configured() and settings.model_daily_advisor and all_ticker_contexts:
                 prompt = (
                     "You are a professional Wall Street advisor reviewing your client's portfolio.\n"
                     "Below are the client's tracked tickers with their recent news from the past 24 hours.\n"
@@ -516,52 +555,16 @@ class PipelineOrchestrator:
                 for tk, sums in all_ticker_contexts.items():
                     prompt += f"Ticker: {tk}\nContext:\n" + "\n".join(f"- {s}" for s in sums) + "\n\n"
 
-                start_time = time.time()
-                is_error = False
-                error_msg = None
-                response_text = None
-                try:
-                    response = client.models.generate_content(
-                        model=settings.gemini_model_chat,
-                        contents=prompt,
-                        config={
-                            'safety_settings': DEFAULT_SAFETY_SETTINGS,
-                            'response_mime_type': 'application/json',
-                            'response_schema': list[TickerNote],
-                            'thinking_config': types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
-                        }
+                with track_llm(self.db, settings.model_daily_advisor,
+                               "daily_advisor_batch",
+                               prompt_text=prompt, store_text=True) as u:
+                    u.response = response = await complete(
+                        model=settings.model_daily_advisor,
+                        prompt=prompt,
+                        schema=list[TickerNote],
+                        reasoning="low",
                     )
-                    response_text = response.text
-                except Exception as e:
-                    is_error = True
-                    error_msg = str(e)
-                    raise
-                finally:
-                    latency_ms = int((time.time() - start_time) * 1000)
-                    if not is_error and response and response.usage_metadata:
-                        self.db.log_llm_usage(
-                            model_name=settings.gemini_model_chat,
-                            operation="daily_advisor_batch",
-                            prompt_tokens=response.usage_metadata.prompt_token_count,
-                            candidate_tokens=response.usage_metadata.candidates_token_count,
-                            latency_ms=latency_ms,
-                            is_error=False,
-                            error_message=None,
-                            prompt_text=prompt,
-                            response_text=response_text
-                        )
-                    elif is_error:
-                        self.db.log_llm_usage(
-                            model_name=settings.gemini_model_chat,
-                            operation="daily_advisor_batch",
-                            prompt_tokens=0,
-                            candidate_tokens=0,
-                            latency_ms=latency_ms,
-                            is_error=True,
-                            error_message=error_msg,
-                            prompt_text=prompt,
-                            response_text=None
-                        )
+
                 if isinstance(response.parsed, list):
                     ai_summaries = notes_to_dict(response.parsed)
                 else:
@@ -743,13 +746,117 @@ class PipelineOrchestrator:
         except Exception as e:
             log.error("orchestrator.ipo_retire_failed", error=str(e))
 
+    async def train_missing_models(self) -> None:
+        """
+        Fill in one missing (ticker, horizon) prediction per run.
+
+        /api/markets renders a TRAINING badge for any horizon with no live
+        prediction and, as of the process split, never trains anything itself.
+        This is the other half of that contract — without it those badges would
+        stay TRAINING forever.
+
+        Deliberately one pair per run. A newly watchlisted ticker needs four
+        models, and training them back to back would monopolise this process
+        for as long as it took; spread out, the grid fills in over a few hours
+        while everything else keeps running.
+        """
+        try:
+            tracked = await asyncio.to_thread(self.db.get_tracked_tickers)
+            if not tracked:
+                return
+
+            predictor = StockPredictor(self.db)
+            for ticker in tracked:
+                active = await asyncio.to_thread(
+                    self.db.get_recent_predictions, ticker, 20, True
+                )
+                covered = {p.get("horizon_days") for p in active}
+
+                for horizon_days in HORIZON_LABELS:
+                    if horizon_days in covered:
+                        continue
+
+                    model, _scope = await asyncio.to_thread(
+                        predictor._load_model, ticker, horizon_days
+                    )
+                    if model is None:
+                        log.info("orchestrator.training_missing_model",
+                                 ticker=ticker, horizon_days=horizon_days)
+                        await predictor.train_model(
+                            ticker, scope="per_ticker", horizon_days=horizon_days
+                        )
+                        model, _scope = await asyncio.to_thread(
+                            predictor._load_model, ticker, horizon_days
+                        )
+
+                    if model is None:
+                        # Training did not produce a loadable model — usually
+                        # too little price history. Stop rather than fall
+                        # through to predict(), whose llm_only path would spend
+                        # a live LLM call on every cycle for a ticker that
+                        # cannot be modelled.
+                        log.warning("orchestrator.missing_model_unfilled",
+                                    ticker=ticker, horizon_days=horizon_days)
+                        return
+
+                    await predictor.predict(
+                        ticker, horizon_days=horizon_days, fast_fallback=False
+                    )
+                    log.info("orchestrator.missing_model_filled",
+                             ticker=ticker, horizon_days=horizon_days)
+                    return  # one pair per run, by design
+
+        except Exception as e:
+            log.error("orchestrator.train_missing_models_failed", error=str(e))
+
+    async def refresh_prices(self) -> None:
+        """Refresh last-known quotes so /api/markets never calls Yahoo inline."""
+        try:
+            await self.price_feed.refresh()
+        except Exception as e:
+            log.error("orchestrator.price_refresh_failed", error=str(e))
+
+    async def sync_price_history(self) -> None:
+        """Keep price_history current for the whole watchlist.
+
+        Paired with darkpool_scan rather than with the quote refresh above.
+        The dark-pool card divides FINRA off-exchange volume by the consolidated
+        volume this writes, joined on the session date, so the two sides have to
+        advance on the same cadence — otherwise the FINRA half keeps arriving
+        for tickers whose price rows stopped, and the ratio silently goes NULL.
+        """
+        try:
+            await self.price_feed.refresh_history()
+        except Exception as e:
+            log.error("orchestrator.price_history_sync_failed", error=str(e))
+
+    async def trim_sse_outbox(self) -> None:
+        """
+        Drop delivered rows from the sse_events relay table.
+
+        The API process tails this table roughly once a second, so anything
+        older than a few minutes has already been read or was missed while no
+        dashboard was open. Left alone it would grow unbounded.
+        """
+        try:
+            removed = await asyncio.to_thread(self.db.trim_sse_events, 10)
+            if removed:
+                log.info("orchestrator.sse_outbox_trimmed", count=removed)
+        except Exception as e:
+            log.error("orchestrator.sse_outbox_trim_failed", error=str(e))
+
     def start(self, interval_minutes: int = 5) -> None:
         """Starts the periodic scheduler."""
-        # Run immediately on startup
+        # First cycle is delayed rather than immediate. A full
+        # fetch → classify → embed → rank cycle fired at t=0 competes with the
+        # dashboard's very first page load, which on a phone is the difference
+        # between a responsive app and one that appears not to load at all.
         self.scheduler.add_job(
             self.run_pipeline_cycle,
             'date',
-            run_date=datetime.datetime.now()
+            run_date=datetime.datetime.now() + datetime.timedelta(
+                seconds=settings.pipeline_startup_delay_seconds
+            )
         )
         # Then run periodically
         self.scheduler.add_job(
@@ -764,6 +871,23 @@ class PipelineOrchestrator:
             'interval',
             minutes=10,
             id='market_scanner',
+            replace_existing=True
+        )
+        # Quotes for /api/markets. Cheap (one HTTP GET per ticker, no LLM), so
+        # unlike the pipeline cycle this warms up almost immediately — the
+        # dashboard needs prices to be useful at all.
+        self.scheduler.add_job(
+            self.refresh_prices,
+            'date',
+            run_date=datetime.datetime.now() + datetime.timedelta(seconds=5),
+            id='price_feed_warmup',
+            replace_existing=True
+        )
+        self.scheduler.add_job(
+            self.refresh_prices,
+            'interval',
+            seconds=settings.price_refresh_seconds,
+            id='price_feed',
             replace_existing=True
         )
         self.scheduler.add_job(
@@ -789,19 +913,42 @@ class PipelineOrchestrator:
             id='geo_backfill',
             replace_existing=True
         )
+        # The SSE outbox is a relay to the API process, not a log. Anything
+        # older than a few minutes has already been delivered or missed.
+        self.scheduler.add_job(
+            self.trim_sse_outbox,
+            'interval',
+            minutes=10,
+            id='sse_outbox_trim',
+            replace_existing=True
+        )
+        # Closes the loop on the TRAINING badges /api/markets renders. One
+        # (ticker, horizon) pair per run — see train_missing_models.
+        self.scheduler.add_job(
+            self.train_missing_models,
+            'interval',
+            minutes=20,
+            id='train_missing_models',
+            replace_existing=True
+        )
         
-        # 5:00 AM KST
         seoul_tz = ZoneInfo("Asia/Seoul")
-        
-        # 5:00 AM KST Daily Briefing
+
+        # Daily Briefing — 5:00 AM KST by default, configurable via .env
         self.scheduler.add_job(
             self.send_daily_briefing,
-            CronTrigger(hour=5, minute=0, timezone=seoul_tz),
+            CronTrigger(
+                hour=settings.briefing_hour,
+                minute=settings.briefing_minute,
+                timezone=seoul_tz
+            ),
             id='daily_briefing',
             replace_existing=True
         )
 
-        # 4:30 AM KST — retire IPOs that have already listed, before the briefing
+        # 4:30 AM KST — retire IPOs that have already listed. Placed ahead of the
+        # default 5:00 briefing so the brief never cites a stale listing; moving
+        # BRIEFING_HOUR earlier than 4:30 breaks that ordering.
         self.scheduler.add_job(
             self.retire_stale_ipos,
             CronTrigger(hour=4, minute=30, timezone=seoul_tz),
@@ -908,9 +1055,13 @@ class PipelineOrchestrator:
             if tickers:
                 await self.insider_tracker.sync_all(tickers)
 
+        # Passes timezone= explicitly, like every other cron job here. The
+        # scheduler itself is constructed without a default timezone, so the
+        # bare 'cron' form this used to use fired at whatever the host's local
+        # time was — correct on the Termux target only by coincidence.
         self.scheduler.add_job(
             run_insider_scan,
-            'cron', hour=7, minute=0,
+            CronTrigger(hour=7, minute=0, timezone=seoul_tz),
             id='insider_scan',
             replace_existing=True
         )
@@ -924,10 +1075,125 @@ class PipelineOrchestrator:
 
         self.scheduler.add_job(
             run_kr_flow_scan,
-            'cron', hour=18, minute=0,
+            CronTrigger(hour=18, minute=0, timezone=seoul_tz),
             id='kr_flow_scan',
             replace_existing=True
         )
+
+        # 07:15 KST daily: daily OHLCV bars for the whole watchlist.
+        #
+        # Fifteen minutes ahead of darkpool_scan, and largely for its benefit:
+        # off-exchange share is the FINRA figure over the consolidated volume
+        # this stores, joined on session_date, so the price side goes first and
+        # the day's FINRA rows land on a price row that already exists. Also
+        # puts fresh technicals under daily_predictions at 08:30, which until
+        # now relied on the predictor fetching them inline per ticker.
+        #
+        # Quotes still refresh on their own few-minute timer; this is the daily
+        # history table, which is a different row per session and only changes
+        # once a day.
+        self.scheduler.add_job(
+            self.sync_price_history,
+            CronTrigger(hour=7, minute=15, timezone=seoul_tz),
+            id='price_history_sync',
+            replace_existing=True
+        )
+
+        # 07:30 and 08:15 KST: FINRA off-exchange (dark pool) volume.
+        #
+        # FINRA posts the session's file at ~18:00 ET, which is 07:00 KST next
+        # morning under EDT but 08:00 under EST — and daily_predictions runs at
+        # 08:30. Rather than encode a DST rule in the trigger, this runs twice
+        # and leans on the upsert being idempotent: in summer the second pass is
+        # a no-op, in winter the first is, and neither races the 08:30 job.
+        #
+        # An ET-pinned trigger would be tidier and APScheduler handles DST
+        # natively, but 18:15 ET lands at 08:15 KST in winter — 15 minutes of
+        # margin against a job that has to finish first.
+        async def run_darkpool_scan():
+            tickers = self.db.get_tracked_tickers()
+            if tickers:
+                await self.darkpool_tracker.sync_recent(tickers)
+
+        for hour, minute, suffix in ((7, 30, ''), (8, 15, '_retry')):
+            self.scheduler.add_job(
+                run_darkpool_scan,
+                CronTrigger(hour=hour, minute=minute, timezone=seoul_tz),
+                id=f'darkpool_scan{suffix}',
+                replace_existing=True
+            )
+
+        # 07:45 KST daily: market-wide regime series (DIX/GEX, OCC put/call).
+        # Both derive from the same US session close as the FINRA file, so they
+        # follow it and still land before daily_predictions at 08:30.
+        self.scheduler.add_job(
+            self.market_regime_tracker.sync,
+            CronTrigger(hour=7, minute=45, timezone=seoul_tz),
+            id='market_regime_scan',
+            replace_existing=True
+        )
+
+        # 06:00 KST daily: option-chain snapshot, ~2h after the US close
+        # (16:00 ET = 05:00/06:00 KST) so the session's volume and open interest
+        # have settled.
+        #
+        # Deliberately parked away from the 08:30 prediction run rather than
+        # beside the other pre-prediction jobs. Nothing reads this table yet, so
+        # it has no deadline — and yfinance blocks IPs on bursts, which would
+        # take down the predictor's price fetching too. It gets its own quiet
+        # window and is skipped entirely when the feature is disabled.
+        if settings.options_snapshot_enabled:
+            async def run_options_snapshot():
+                tickers = self.db.get_tracked_tickers()
+                if tickers:
+                    await self.options_tracker.snapshot_all(tickers)
+
+            self.scheduler.add_job(
+                run_options_snapshot,
+                CronTrigger(hour=6, minute=0, timezone=seoul_tz),
+                id='options_snapshot',
+                replace_existing=True
+            )
+
+        # 06:45 KST daily: analyst consensus and price targets.
+        #
+        # Slotted between the option snapshot at 06:00 and the price chain at
+        # 07:15 on purpose. All three read Yahoo through yfinance, and the whole
+        # point of the serial-with-delay design inside each collector is undone
+        # if two of them overlap and present the burst pattern anyway.
+        if settings.analyst_ratings_enabled:
+            async def run_analyst_snapshot():
+                tickers = self.db.get_tracked_tickers()
+                if tickers:
+                    await self.analyst_tracker.snapshot_all(tickers)
+
+            self.scheduler.add_job(
+                run_analyst_snapshot,
+                CronTrigger(hour=6, minute=45, timezone=seoul_tz),
+                id='analyst_snapshot',
+                replace_existing=True
+            )
+
+        # 08:05 KST daily: technical ratings.
+        #
+        # Must run after price_history_sync at 07:15 — it reads that table and
+        # nothing else, so running first would rate every ticker one session
+        # stale. Before daily_predictions at 08:30 so the panel and the debate
+        # context are current when predictions are generated. No network, so it
+        # can sit inside the busy pre-prediction window that the yfinance jobs
+        # above have to avoid.
+        if settings.technical_rating_enabled:
+            async def run_technical_rating():
+                tickers = self.db.get_tracked_tickers()
+                if tickers:
+                    await self.technical_rating_tracker.compute_all(tickers)
+
+            self.scheduler.add_job(
+                run_technical_rating,
+                CronTrigger(hour=8, minute=5, timezone=seoul_tz),
+                id='technical_rating',
+                replace_existing=True
+            )
 
         # Every 4 hours: Trend forecasting + Macro themes
         async def run_trend_forecasting():
@@ -949,11 +1215,73 @@ class PipelineOrchestrator:
             replace_existing=True
         )
 
-        # Startup catch-up: run missed daily jobs once after a short delay
+        if settings.thesis_enabled:
+            # 06:30 KST: build one thesis from the most accelerated theme.
+            # Ahead of daily_predictions at 08:30 so a name promoted this
+            # morning is already tracked when the rest of the stack runs.
+            async def run_thesis_generation():
+                try:
+                    ids = await self.thesis_engine.generate()
+                    log.info("orchestrator.thesis_generated", count=len(ids))
+                except Exception as e:
+                    log.error("orchestrator.thesis_generation_failed", error=str(e))
+
+            self.scheduler.add_job(
+                run_thesis_generation,
+                CronTrigger(hour=THESIS_GENERATION_HOUR,
+                            minute=THESIS_GENERATION_MINUTE,
+                            timezone=seoul_tz),
+                id='thesis_generation',
+                misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
+                replace_existing=True
+            )
+
+            # 09:10 KST: re-score every live candidate. Costs no LLM calls —
+            # prices and SQL only — and is what makes the EARLY -> CROWDED
+            # transition visible, which is the actual sell signal. Runs after
+            # price_history_sync (07:15), the dark-pool scans (07:30/08:15) and
+            # daily_predictions (08:30) so it reads the day's data without
+            # racing them for Yahoo.
+            async def run_thesis_rescore():
+                try:
+                    await self.thesis_engine.rescore_all()
+                except Exception as e:
+                    log.error("orchestrator.thesis_rescore_failed", error=str(e))
+
+            self.scheduler.add_job(
+                run_thesis_rescore,
+                CronTrigger(hour=9, minute=10, timezone=seoul_tz),
+                id='thesis_rescore',
+                misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
+                replace_existing=True
+            )
+
+            # 09:40 KST: grade calls old enough to judge. Must run after the
+            # re-score so the snapshot it reads as "latest" is today's rather
+            # than yesterday's.
+            async def run_thesis_reflection():
+                try:
+                    await run_thesis_reflection_job(self.db)
+                except Exception as e:
+                    log.error("orchestrator.thesis_reflection_failed", error=str(e))
+
+            self.scheduler.add_job(
+                run_thesis_reflection,
+                CronTrigger(hour=9, minute=40, timezone=seoul_tz),
+                id='thesis_reflection',
+                misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
+                replace_existing=True
+            )
+
+        # Startup catch-up: run missed daily jobs once, well after boot. This
+        # can trigger multi-agent LLM debates and a Yahoo call per unresolved
+        # prediction, so it must not land while the app is still starting up.
         self.scheduler.add_job(
             self._startup_catchup,
             'date',
-            run_date=datetime.datetime.now() + datetime.timedelta(seconds=10),
+            run_date=datetime.datetime.now() + datetime.timedelta(
+                seconds=settings.startup_catchup_delay_seconds
+            ),
             id='startup_catchup',
             replace_existing=True
         )
@@ -972,6 +1300,15 @@ class PipelineOrchestrator:
         import datetime as dt
         seoul_tz = ZoneInfo("Asia/Seoul")
         today_str = dt.datetime.now(seoul_tz).strftime("%Y-%m-%d")
+
+        # Ahead of the watchlist check below: theme detection reads the article
+        # corpus, not tracked tickers, so an empty watchlist must not skip it.
+        # Wrapped separately so a thesis failure cannot cost the prediction and
+        # resolution catch-ups that follow it.
+        try:
+            await self._catchup_thesis(seoul_tz)
+        except Exception as e:
+            log.error("orchestrator.startup_catchup.thesis_error", error=str(e))
 
         try:
             tracked = self.db.get_tracked_tickers()
@@ -1012,6 +1349,55 @@ class PipelineOrchestrator:
 
         except Exception as e:
             log.error("orchestrator.startup_catchup_error", error=str(e))
+
+    async def _catchup_thesis(self, seoul_tz) -> None:
+        """Run the morning thesis if the worker was down when it was due.
+
+        misfire_grace_time covers a process that was alive but late. It cannot
+        cover one that was not running at 06:30 at all: on start-up APScheduler
+        computes the next fire time from now, so a restart at 09:00 — a deploy,
+        a reboot, Termux being killed — skips straight to tomorrow. That is the
+        common case here, and it is why the morning thesis went missing on days
+        the phone had been restarted.
+        """
+        if not settings.thesis_enabled:
+            return
+
+        now_seoul = datetime.datetime.now(seoul_tz)
+        due_today = now_seoul.replace(
+            hour=THESIS_GENERATION_HOUR, minute=THESIS_GENERATION_MINUTE,
+            second=0, microsecond=0,
+        )
+        if now_seoul < due_today:
+            # Booted before it was due; the cron job will handle it normally.
+            log.info("orchestrator.startup_catchup.thesis_not_due_yet")
+            return
+
+        midnight_utc = (
+            now_seoul.replace(hour=0, minute=0, second=0, microsecond=0)
+            .astimezone(datetime.timezone.utc)
+            # SQLite CURRENT_TIMESTAMP format, not isoformat() — see
+            # Database.count_theses_since.
+            .strftime("%Y-%m-%d %H:%M:%S")
+        )
+        try:
+            generated_today = await asyncio.to_thread(
+                self.db.count_theses_since, midnight_utc
+            )
+        except Exception as e:
+            log.error("orchestrator.startup_catchup.thesis_query_failed", error=str(e))
+            return
+
+        if generated_today:
+            log.info("orchestrator.startup_catchup.thesis_ok", count=generated_today)
+            return
+
+        log.info("orchestrator.startup_catchup.missed_thesis")
+        try:
+            ids = await self.thesis_engine.generate()
+            log.info("orchestrator.startup_catchup.thesis_generated", count=len(ids))
+        except Exception as e:
+            log.error("orchestrator.startup_catchup.thesis_failed", error=str(e))
 
     @staticmethod
     def _horizon_to_yahoo_range(horizon_days: int) -> str:
@@ -1089,7 +1475,6 @@ class PipelineOrchestrator:
             # train_model with its default horizon_days=1, producing *_1d models
             # that nothing loads while the 5/21/63/252d models the dashboard
             # needs were never refreshed here at all.
-            from api.server import HORIZON_LABELS
 
             for t in tracked:
                 for horizon_days in HORIZON_LABELS:
@@ -1160,11 +1545,13 @@ async def run_daily_predictions(db, alert_manager=None):
 
 async def run_reflection_job(db, alert_manager=None):
     """Analyzes newly resolved multi-agent predictions and extracts lessons learned."""
-    from config.llm import get_deepseek_client
+    from pipeline.predictor import StockPredictor
     log.info("Starting reflection job...")
     
     with db.connection() as conn:
-        # Get predictions that are resolved, are multi-agent, and not yet in reflection_log
+        # Get predictions that are resolved, are multi-agent, and not yet in reflection_log.
+        # Bounded by recency and batch size: skipped rows never get a reflection_log row, so
+        # without a cutoff they would be re-selected every night forever.
         predictions_to_reflect = conn.execute('''
             SELECT p.id, p.ticker, p.predicted_direction, p.confidence, p.llm_narrative, p.actual_direction, p.actual_change_pct, p.is_correct
             FROM predictions p
@@ -1172,18 +1559,36 @@ async def run_reflection_job(db, alert_manager=None):
             WHERE p.is_correct IS NOT NULL 
               AND p.model_type = 'multi_agent'
               AND r.id IS NULL
-        ''').fetchall()
+              AND COALESCE(p.resolved_at, p.resolve_after) >= date('now', 'localtime', ?)
+            ORDER BY COALESCE(p.resolved_at, p.resolve_after) DESC
+            LIMIT ?
+        ''', (f'-{REFLECTION_LOOKBACK_DAYS} days', REFLECTION_BATCH_LIMIT)).fetchall()
         
     if not predictions_to_reflect:
         return
-        
-    client = get_deepseek_client()
-    if not client:
-        log.warning("DeepSeek API key not configured for Reflection Job.")
+
+    # Only reflect on tickers the user actually follows. Ad-hoc debates from the Debate
+    # Arena and /predict accept any symbol and write multi_agent rows, so without this
+    # filter the job spends tokens on tickers nobody is tracking. Compare upper-cased:
+    # the watchlist is normalized on write, predictions.ticker is not.
+    tracked = {t.upper() for t in db.get_tracked_tickers()}
+    skipped = [p for p in predictions_to_reflect if p["ticker"].upper() not in tracked]
+    predictions_to_reflect = [p for p in predictions_to_reflect if p["ticker"].upper() in tracked]
+    if skipped:
+        log.info("reflection.skipped_untracked", count=len(skipped),
+                 tickers=sorted({p["ticker"] for p in skipped}))
+    if not predictions_to_reflect:
+        return
+
+    if not is_llm_configured() or not settings.model_reflection:
+        log.warning("MODEL_REFLECTION is not configured; skipping Reflection Job.")
         return
         
     today_str = datetime.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
-        
+
+    # Wrong predictions worth a fresh debate, ranked and capped after the loop.
+    pending_corrections: list[dict] = []
+
     for p in predictions_to_reflect:
         ticker = p["ticker"]
         pred_id = p["id"]
@@ -1234,23 +1639,19 @@ async def run_reflection_job(db, alert_manager=None):
         """
 
         try:
-            # Use flash model for reflection — this is a simple summarization task,
-            # not a reasoning-heavy analysis. Saves ~90% vs deepseek-v4-pro.
-            model_name = settings.deepseek_model_classifier  # deepseek-v4-flash
-            response = await client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": "You analyze past stock predictions and extract structured, actionable lessons. Output JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.0,
-                response_format={"type": "json_object"}
-            )
-            prompt_tokens = response.usage.prompt_tokens if response.usage else 0
-            completion_tokens = response.usage.completion_tokens if response.usage else 0
-            db.log_llm_usage(model_name=model_name, operation="reflection", prompt_tokens=prompt_tokens, candidate_tokens=completion_tokens)
+            # Point MODEL_REFLECTION at a cheap model — this is a
+            # summarization task, not reasoning-heavy analysis.
+            model_name = settings.model_reflection
+            with track_llm(db, model_name, "reflection") as u:
+                u.response = response = await complete(
+                    model=model_name,
+                    system="You analyze past stock predictions and extract structured, actionable lessons. Output JSON only.",
+                    prompt=prompt,
+                    temperature=0.0,
+                    json_mode=True,
+                )
 
-            raw = response.choices[0].message.content
+            raw = response.text
 
             try:
                 parsed = parse_structured(raw, ReflectionLesson)
@@ -1277,22 +1678,140 @@ async def run_reflection_job(db, alert_manager=None):
                 log.info(f"Reflection logged for {ticker} (Pred ID {pred_id}, mode={failure_mode})")
                 
             if not is_correct:
-                log.info(f"Prediction for {ticker} was incorrect. Triggering new prediction...")
-                from pipeline.predictor import StockPredictor
-                predictor = StockPredictor(db)
-                new_advisory = await predictor.predict_with_agents(ticker)
-                
-                if alert_manager:
-                    verdict = new_advisory.get('final_advisory', 'No plan found')
-                    message = (
-                        f"⚠️ *Correction for {ticker}*\n\n"
-                        f"*Why we were wrong:*\n{lesson}\n\n"
-                        f"*Updated Plan:*\n{verdict}"
-                    )
-                    await alert_manager.bot.send_message(
-                        chat_id=alert_manager.chat_id,
-                        text=message,
-                        parse_mode="Markdown"
-                    )
+                # Same 5-day gate run_daily_predictions uses: the 08:30 job already
+                # refreshed every tracked ticker, so re-debating here would pay for an
+                # advisory we generated hours ago.
+                if db.get_cached_advisory(ticker, days=5):
+                    log.info("reflection.correction_skipped_cached", ticker=ticker)
+                    continue
+
+                # Collected rather than re-debated inline. Each correction is a
+                # full multi-agent run, and the batch admits up to
+                # REFLECTION_BATCH_LIMIT predictions — re-debating every miss
+                # here made one nightly job worth ~150 calls on the priciest
+                # models. The ranking and cap happen after the loop.
+                pending_corrections.append({
+                    "ticker": ticker,
+                    "confidence": confidence if isinstance(confidence, (int, float)) else 0.0,
+                    "lesson": lesson,
+                })
         except Exception as e:
             log.error(f"Failed to generate reflection for {ticker}: {e}")
+
+    # ── Corrections ──────────────────────────────────────────────────────
+    # Deduped by ticker because two horizons on the same name produce two
+    # misses but only one useful re-debate, then ranked by confidence: the
+    # predictions we were most sure about are the ones worth re-running.
+    by_ticker: dict[str, dict] = {}
+    for item in pending_corrections:
+        existing = by_ticker.get(item["ticker"])
+        if existing is None or item["confidence"] > existing["confidence"]:
+            by_ticker[item["ticker"]] = item
+
+    ranked = sorted(by_ticker.values(), key=lambda c: c["confidence"], reverse=True)
+    selected = ranked[:REFLECTION_REPREDICT_LIMIT]
+
+    if len(ranked) > len(selected):
+        log.info("reflection.corrections_capped",
+                 eligible=len(ranked), running=len(selected),
+                 skipped=[c["ticker"] for c in ranked[len(selected):]])
+
+    for correction in selected:
+        ticker = correction["ticker"]
+        try:
+            log.info(f"Prediction for {ticker} was incorrect. Triggering new prediction...")
+            predictor = StockPredictor(db)
+            new_advisory = await predictor.predict_with_agents(ticker)
+
+            if alert_manager:
+                verdict = new_advisory.get('final_advisory', 'No plan found')
+                message = (
+                    f"⚠️ *Correction for {ticker}*\n\n"
+                    f"*Why we were wrong:*\n{correction['lesson']}\n\n"
+                    f"*Updated Plan:*\n{verdict}"
+                )
+                await alert_manager.bot.send_message(
+                    chat_id=alert_manager.chat_id,
+                    text=message,
+                    parse_mode="Markdown"
+                )
+        except Exception as e:
+            log.error(f"Failed to generate correction for {ticker}: {e}")
+
+
+async def run_thesis_reflection_job(db):
+    """Grade matured EARLY thesis calls and write what they taught to reflection_log.
+
+    Deterministic and LLM-free by design: the prices already say whether the
+    call worked and the node's falsifier already says what would have broken
+    it, so a model call here would restate what the row contains and bill for
+    it. Lessons land at scope='ticker' so get_relevant_reflections feeds them
+    straight back into that ticker's next Bull/Bear debate -- the loop that
+    makes the engine sharpen instead of just accumulating calls.
+    """
+    log.info("Starting thesis reflection job...")
+    try:
+        rows = await asyncio.to_thread(
+            db.get_thesis_calls_due_review,
+            settings.thesis_review_min_age_days,
+            settings.thesis_review_benchmark,
+            settings.thesis_review_batch,
+        )
+    except Exception as e:
+        log.error("thesis_reflection.query_failed", error=str(e))
+        return
+
+    if not rows:
+        log.info("thesis_reflection.nothing_due")
+        return
+
+    today_str = datetime.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+    written = 0
+
+    for r in rows:
+        ret = (r["latest_price"] - r["flagged_price"]) / r["flagged_price"]
+        bench_start, bench_end = r.get("bench_start"), r.get("bench_end")
+
+        if bench_start and bench_end and bench_start > 0:
+            bench_ret = (bench_end - bench_start) / bench_start
+            excess = ret - bench_ret
+            was_successful = excess > 0
+            verdict = (f"{ret:+.1%} against {settings.thesis_review_benchmark}'s "
+                       f"{bench_ret:+.1%} ({excess:+.1%} excess)")
+        else:
+            # No benchmark bars cover this window. Grade on the absolute move
+            # but say so -- silently calling a rising tide "outperformance" is
+            # the one failure mode that would make these lessons misleading.
+            excess = None
+            was_successful = ret > 0
+            verdict = f"{ret:+.1%} absolute (no benchmark coverage for this window)"
+
+        lesson = (
+            f"Thesis '{r['thesis_title']}' flagged {r['ticker']} EARLY on "
+            f"{r['flagged_date']} at {r['flagged_price']:.2f} as "
+            f"{r['role_in_chain'] or 'a chain participant'}. By {r['latest_date']} "
+            f"it returned {verdict}; stage is now {r['latest_stage'] or 'UNKNOWN'}. "
+            f"Chain claim: {r['claim'] or 'n/a'} "
+            f"The link was said to fail if: {r['falsifier'] or 'n/a'}"
+        )
+
+        tags_json = json.dumps({
+            "thesis_review": r["candidate_id"],
+            "thesis_id": r["thesis_id"],
+            "return": round(ret, 4),
+            "excess_return": round(excess, 4) if excess is not None else None,
+            "benchmark": settings.thesis_review_benchmark if excess is not None else None,
+            "flagged_edge": r["flagged_edge"],
+        })
+
+        try:
+            await asyncio.to_thread(
+                db.insert_reflection, r["ticker"], None, today_str,
+                lesson, was_successful, "ticker", None, tags_json,
+            )
+            written += 1
+        except Exception as e:
+            log.warning("thesis_reflection.insert_failed",
+                        candidate=r["candidate_id"], error=str(e))
+
+    log.info("thesis_reflection.completed", reviewed=len(rows), written=written)

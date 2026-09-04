@@ -72,7 +72,7 @@ function GlobeContent() {
   const maxCount = Math.max(1, ...countries.map((c) => c.count));
 
   return (
-    <div className="p-5 flex flex-col gap-4">
+    <div className="p-4 md:p-5 flex flex-col gap-4">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Globe</h1>
@@ -81,7 +81,7 @@ function GlobeContent() {
             sentiment
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <div className="seg" role="tablist">
             {WINDOWS.map((w) => (
               <button
@@ -125,11 +125,11 @@ function GlobeContent() {
           </div>
           <div className="card-body">
             {loading && !data ? (
-              <div className="h-[380px] grid place-items-center text-xs text-terminal-muted">
+              <div className="h-[300px] md:h-[380px] grid place-items-center text-xs text-terminal-muted">
                 Loading globe…
               </div>
             ) : countries.length === 0 ? (
-              <div className="h-[380px] grid place-items-center text-xs text-terminal-muted">
+              <div className="h-[300px] md:h-[380px] grid place-items-center text-xs text-terminal-muted">
                 No geo-tagged stories in this window yet.
               </div>
             ) : (

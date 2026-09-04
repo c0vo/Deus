@@ -2,7 +2,7 @@
 
 import json
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone
 
 from data.models import NewsArticle
@@ -11,11 +11,14 @@ from data.models import NewsArticle
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
 @pytest.fixture
-def ranker():
-    """Create ArticleRanker with mocked Gemini client (no real API calls)."""
+def ranker(monkeypatch):
+    """ArticleRanker wired to a stubbed `complete` — no real API calls."""
     from pipeline.ranker import ArticleRanker
-    r = ArticleRanker(client=MagicMock(), db=MagicMock())
-    r.model_name = "test-ranker-model"
+    r = ArticleRanker(db=MagicMock())
+    r.model_name = "test/ranker-model"
+    monkeypatch.setattr("pipeline.ranker.is_llm_configured", lambda: True)
+    r.complete = AsyncMock()
+    monkeypatch.setattr("pipeline.ranker.complete", r.complete)
     return r
 
 
@@ -37,12 +40,10 @@ def articles():
     ]
 
 
-def make_gemini_response(json_str: str):
-    """Build a mock Gemini response object."""
-    resp = MagicMock()
-    resp.text = json_str
-    resp.usage_metadata = MagicMock(prompt_token_count=200, candidates_token_count=50)
-    return resp
+def make_response(json_str: str):
+    """Build what `config.llm.complete` returns."""
+    from tests.conftest import make_llm_response
+    return make_llm_response(text=json_str, prompt_tokens=200)
 
 
 # ── Tests ───────────────────────────────────────────────────────────────────
@@ -60,7 +61,7 @@ class TestRankBatch:
             {"id": "a4", "importance_score": 4.1},
             {"id": "a5", "importance_score": 7.0},
         ]
-        ranker.client.aio.models.generate_content.return_value = make_gemini_response(json.dumps(scores))
+        ranker.complete.return_value = make_response(json.dumps(scores))
 
         result = await ranker.rank_batch(articles)
 
@@ -76,23 +77,23 @@ class TestRankBatch:
         """Empty article list returns empty list, no API calls."""
         result = await ranker.rank_batch([])
         assert result == []
-        assert not ranker.client.aio.models.generate_content.called
+        assert not ranker.complete.called
 
     @pytest.mark.asyncio
     async def test_rank_batch_no_llm_configured(self, ranker, articles):
         """When LLM is not configured, articles returned unchanged."""
-        with patch("pipeline.ranker.is_configured", return_value=False):
+        with patch("pipeline.ranker.is_llm_configured", return_value=False):
             result = await ranker.rank_batch(articles)
 
             assert len(result) == len(articles)
             for a in result:
                 assert a.importance_score is None
-            assert not ranker.client.aio.models.generate_content.called
+            assert not ranker.complete.called
 
     @pytest.mark.asyncio
     async def test_rank_batch_invalid_json_response(self, ranker, articles):
         """Invalid JSON from Gemini should be handled gracefully (articles unchanged)."""
-        ranker.client.aio.models.generate_content.return_value = make_gemini_response("not valid json {{{")
+        ranker.complete.return_value = make_response("not valid json {{{")
 
         result = await ranker.rank_batch(articles)
 
@@ -109,7 +110,7 @@ class TestRankBatch:
             # a2 is missing
             {"id": "a3", "importance_score": 5.0},
         ]
-        ranker.client.aio.models.generate_content.return_value = make_gemini_response(json.dumps(scores))
+        ranker.complete.return_value = make_response(json.dumps(scores))
 
         result = await ranker.rank_batch(articles)
         article_map = {a.id: a for a in result}
@@ -128,7 +129,7 @@ class TestRankBatch:
             {"id": "a2", "importance_score": 0.0},
             {"id": "a3", "importance_score": 5.5},
         ]
-        ranker.client.aio.models.generate_content.return_value = make_gemini_response(json.dumps(scores))
+        ranker.complete.return_value = make_response(json.dumps(scores))
 
         result = await ranker.rank_batch(articles[:3])
 
@@ -139,22 +140,23 @@ class TestRankBatch:
     async def test_rank_batch_logs_usage(self, ranker, articles):
         """LLM usage should be logged after a successful ranking."""
         scores = [{"id": a.id, "importance_score": 5.0} for a in articles]
-        ranker.client.aio.models.generate_content.return_value = make_gemini_response(json.dumps(scores))
+        ranker.complete.return_value = make_response(json.dumps(scores))
 
         await ranker.rank_batch(articles)
 
         ranker.db.log_llm_usage.assert_called_once()
+        # Real reported cost, not an estimate from a price table.
+        assert ranker.db.log_llm_usage.call_args.kwargs["cost_usd"] == pytest.approx(0.0001)
 
     @pytest.mark.asyncio
     async def test_rank_batch_prompt_includes_article_data(self, ranker, articles):
         """The prompt sent to Gemini should include article metadata."""
         scores = [{"id": a.id, "importance_score": 5.0} for a in articles]
-        ranker.client.aio.models.generate_content.return_value = make_gemini_response(json.dumps(scores))
+        ranker.complete.return_value = make_response(json.dumps(scores))
 
         await ranker.rank_batch(articles)
 
-        call_args = ranker.client.aio.models.generate_content.call_args
-        contents = call_args[1].get("contents", "")
+        contents = ranker.complete.await_args.kwargs["prompt"]
         # The prompt should contain article identifiers
         assert "a1" in contents
         assert articles[0].headline in contents
@@ -169,7 +171,7 @@ class TestRankBatch:
             event_type="macro", sentiment_score=0.0, urgency="high",
         )
         scores = [{"id": "single", "importance_score": 9.5}]
-        ranker.client.aio.models.generate_content.return_value = make_gemini_response(json.dumps(scores))
+        ranker.complete.return_value = make_response(json.dumps(scores))
 
         result = await ranker.rank_batch([article])
 

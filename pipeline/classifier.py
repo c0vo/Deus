@@ -9,18 +9,17 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Optional
+from typing import Any, Optional
 
-from google import genai
-from google.genai import types
 from pydantic import BaseModel, Field
 
 from config.logging_config import get_logger
-from config.llm import get_client, is_configured, is_transient, DEFAULT_SAFETY_SETTINGS, get_deepseek_client, is_deepseek_configured
+from config.llm import complete, is_llm_configured, is_transient, parse_json_list
 from config.settings import settings
+from config.usage import track_llm
 from data.models import NewsArticle
 from data.database import Database
-from data.filters import FINANCIAL_KEYWORDS, REDDIT_KEYWORDS
+from data.filters import CASHTAG_PATTERN, FINANCIAL_KEYWORDS, REDDIT_KEYWORDS
 
 log = get_logger(__name__)
 
@@ -33,6 +32,17 @@ class ClassifierResult(BaseModel):
     affected_tickers: list[str] = Field(default_factory=list)
     countries: list[str] = Field(default_factory=list)
     classification_summary: str = ""
+
+
+class BatchClassifierResult(ClassifierResult):
+    """`ClassifierResult` plus the id it belongs to.
+
+    Sent as `list[BatchClassifierResult]` so that "one result per article" is
+    carried by the request schema. Asked in prose alone, against a json_mode
+    root that must be an object, models answer a whole batch with a single
+    flat classification.
+    """
+    id: str = ""
 
 # Taxonomy, calibration anchors, few-shot examples and country rules are
 # identical whether one article or twenty are being classified, so they live in
@@ -113,7 +123,8 @@ Now classify the actual article using the same JSON schema:
 
 BATCH_CLASSIFICATION_PROMPT = """
 You are a professional financial analyst AI. Analyze EVERY news article in the list below and extract structured information for each one independently.
-Respond ONLY with a valid JSON array. No markdown formatting, no backticks.
+Return one result per input article — never a single result standing for the
+whole batch. No markdown formatting, no backticks.
 
 """ + _CLASSIFICATION_GUIDANCE + """
 Articles to classify:
@@ -124,20 +135,27 @@ verbatim — results are matched by id, not by position, and an object with a
 missing or invented id is discarded. Judge each article on its own; do not let
 one article's sentiment influence another's.
 
-Schema:
-[
-  {{
-    "id": "string",
-    "event_type": "string",
-    "sentiment_score": 0.0,
-    "urgency": "string",
-    "suggested_direction": "string",
-    "affected_sectors": ["string"],
-    "affected_tickers": ["string"],
-    "countries": ["string"],
-    "classification_summary": "string"
-  }}
-]
+"urgency" must be one of low, medium, high, critical, and
+"suggested_direction" one of bullish, bearish, neutral — a value outside those
+vocabularies discards that article's result.
+
+Reply with a single object holding one "items" array, and one entry in it per
+input article — not one object per line, and not one result for the batch:
+{{
+  "items": [
+    {{
+      "id": "a1",
+      "event_type": "string",
+      "sentiment_score": 0.0,
+      "urgency": "string",
+      "suggested_direction": "string",
+      "affected_sectors": ["string"],
+      "affected_tickers": ["string"],
+      "countries": ["string"],
+      "classification_summary": "string"
+    }}
+  ]
+}}
 """
 
 REDDIT_CLASSIFICATION_PROMPT = """
@@ -200,13 +218,11 @@ JSON Schema:
 """
 
 class ArticleClassifier:
-    """Classifies NewsArticles using Gemini."""
+    """Classifies NewsArticles with MODEL_CLASSIFIER, falling back to its pair."""
 
-    def __init__(self, client: Optional[genai.Client] = None, deepseek_client=None, db: Optional[Database] = None):
-        self.client = client or get_client()
-        self.deepseek_client = deepseek_client or get_deepseek_client()
+    def __init__(self, db: Optional[Database] = None):
         self.db = db or Database()
-        self.model_name = settings.gemini_model_classifier
+        self.model_name = settings.model_classifier
 
     def should_classify(self, article: NewsArticle) -> bool:
         """Determines if the article has enough financial relevance to warrant classification."""
@@ -219,7 +235,7 @@ class ArticleClassifier:
         combined_text = f"{article.headline} {article.summary} {comments_text}"
 
         # 1. Look for explicit ticker symbols (e.g. $AAPL)
-        if re.search(r'\$[A-Z]{1,5}\b', combined_text):
+        if CASHTAG_PATTERN.search(combined_text):
             return True
 
         # 2. Look for financial keywords and specific terms
@@ -312,7 +328,7 @@ class ArticleClassifier:
         if not articles:
             return []
 
-        if not is_configured() and not is_deepseek_configured():
+        if not is_llm_configured():
             log.warning("classifier.skipped", reason="No LLM configured", count=len(articles))
             return articles
 
@@ -335,9 +351,19 @@ class ArticleClassifier:
 
     async def _classify_group(self, articles: list[NewsArticle], is_reddit: bool) -> None:
         """One LLM call for a homogeneous group. Modifies articles in place."""
+        # Batch-local labels rather than article ids. An article id is a
+        # 30-plus character hash the model has to echo verbatim for every
+        # result, and models degenerate on them: an id ending c34c came back
+        # as "...c34cc34cc34cc34" repeated until the batch hit its token cap
+        # and truncated into unparseable JSON, costing every article in it.
+        # Short labels stay explicit — results are still matched by the label
+        # the model echoes, never by position.
+        keys = [f"a{i}" for i in range(1, len(articles) + 1)]
+        by_key_article = dict(zip(keys, articles))
+
         payload = []
-        for a in articles:
-            item = {"id": a.id, "headline": a.headline, "summary": a.summary or ""}
+        for key, a in zip(keys, articles):
+            item = {"id": key, "headline": a.headline, "summary": a.summary or ""}
             if is_reddit:
                 item["top_comments"] = self._reddit_comments_text(a)
             payload.append(item)
@@ -349,21 +375,24 @@ class ArticleClassifier:
             prompt = (
                 base.split("Post Title:")[0]
                 + "\nClassify EVERY post in the list below independently.\n"
-                  "Respond ONLY with a valid JSON array, one object per input id.\n\n"
+                  "Return one result per input post — never one result for "
+                  "the whole batch.\n\n"
                   f"Posts:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
-                  'Echo each "id" back verbatim. Schema per object: '
-                  '{"id": "string", "event_type": "string", "sentiment_score": 0.0, '
-                  '"urgency": "string", "suggested_direction": "string", '
-                  '"affected_sectors": ["string"], "affected_tickers": ["string"], '
-                  '"countries": ["string"], "classification_summary": "string"}'
+                  'Echo each "id" back verbatim. Reply with a single object '
+                  'holding one "items" array, one entry per input post — not '
+                  'one object per line:\n'
+                  '{"items": [{"id": "a1", "event_type": "string", '
+                  '"sentiment_score": 0.0, "urgency": "string", '
+                  '"suggested_direction": "string", "affected_sectors": ["string"], '
+                  '"affected_tickers": ["string"], "countries": ["string"], '
+                  '"classification_summary": "string"}]}'
             )
-            ds_model = settings.deepseek_model_reddit_sentiment
-            gemini_model = settings.gemini_model_reddit_sentiment
+            models = [settings.model_reddit_sentiment,
+                      settings.model_reddit_sentiment_fallback]
         else:
             # No indent= — pretty-printing a batch payload is pure token waste.
             prompt = base.format(articles_json=json.dumps(payload, ensure_ascii=False))
-            ds_model = settings.deepseek_model_classifier
-            gemini_model = self.model_name
+            models = [self.model_name, settings.model_classifier_fallback]
 
         operation = "classify_batch_reddit" if is_reddit else "classify_batch"
         # The cap has to scale with the batch: with response_format=json_object,
@@ -371,32 +400,39 @@ class ArticleClassifier:
         # short answer, which would cost the whole batch.
         max_output = settings.classify_max_output_tokens_per_article * len(articles)
         text = await self._call_with_fallback(
-            prompt, ds_model, gemini_model, operation, max_output
+            prompt, models, operation, max_output,
+            schema=list[BatchClassifierResult],
         )
         if not text:
             log.error("classifier.batch_no_response", count=len(articles), operation=operation)
             return
 
         try:
-            results = json.loads(self._strip_code_fence(text))
-            if not isinstance(results, list):
-                raise ValueError(f"Expected a JSON array, got {type(results).__name__}")
+            results = parse_json_list(text)
         except Exception as e:
-            log.error("classifier.batch_parse_failed", error=str(e), count=len(articles))
+            # The response head is the whole diagnosis for this failure — the
+            # shape a model returns under json_mode is the thing that varies,
+            # and without it a parse failure is indistinguishable from an
+            # outage in the logs.
+            log.error(
+                "classifier.batch_parse_failed",
+                error=str(e), count=len(articles), operation=operation,
+                response_head=text[:400],
+            )
             return
 
-        # Match by id, never by position — a model that drops or reorders an
+        # Match by label, never by position — a model that drops or reorders an
         # item would otherwise silently attach the wrong classification to the
         # wrong article, which is far worse than not classifying it at all.
-        by_id = {
+        by_key = {
             str(item["id"]): item
             for item in results
             if isinstance(item, dict) and item.get("id")
         }
 
         applied = 0
-        for article in articles:
-            item = by_id.get(str(article.id))
+        for key, article in by_key_article.items():
+            item = by_key.get(key)
             if item is None:
                 log.warning("classifier.batch_missing_result", article_id=article.id)
                 continue
@@ -419,85 +455,65 @@ class ArticleClassifier:
             operation=operation, sent=len(articles), applied=applied,
         )
 
+    async def _call_one(
+        self, model: str, prompt: str, operation: str, max_output_tokens: int,
+        schema: Any = None,
+    ) -> str:
+        """One attempt at one model. Logs it, returns the text, or raises.
+
+        `schema` constrains the response shape on the request itself. The text
+        is still what comes back: the batch path validates per item, so one
+        model drifting outside the urgency vocabulary costs that article rather
+        than the whole batch, which is what `parsed` would do.
+        """
+        with track_llm(self.db, model, operation,
+                       prompt_text=prompt, store_text=True) as u:
+            u.response = response = await complete(
+                model=model,
+                prompt=prompt,
+                temperature=0.0,
+                schema=schema,
+                json_mode=schema is None,
+                max_tokens=max_output_tokens,
+                # Classification needs fast JSON, not deep reasoning. This was
+                # the provider-specific thinking:{"type":"disabled"}.
+                reasoning="none",
+            )
+        return response.text.strip()
+
     async def _call_with_fallback(
-        self, prompt: str, ds_model: str, gemini_model: str, operation: str,
-        max_output_tokens: int,
+        self, prompt: str, models: list[str], operation: str,
+        max_output_tokens: int, schema: Any = None,
     ) -> Optional[str]:
         """
-        DeepSeek first, Gemini on failure. Returns raw response text.
+        Try each configured model in turn. Returns raw response text.
 
-        Raises if every configured provider failed transiently, so the caller
-        can leave the batch unclassified for a later pass instead of writing a
-        permanent 'error' verdict over an outage.
+        This used to be a *provider* fallback — DeepSeek, then Gemini — written
+        out as two near-identical blocks. With one gateway it is a *model*
+        fallback, and still worth having: OpenRouter surfaces a failing
+        upstream as an error on that slug, and the second slug is a different
+        upstream. What it can no longer survive is OpenRouter itself being down.
+
+        Raises if every attempt failed transiently, so the caller can leave the
+        batch unclassified for a later pass instead of writing a permanent
+        'error' verdict over an outage.
         """
-        import time
-
         last_transient: Optional[BaseException] = None
 
-        if is_deepseek_configured() and self.deepseek_client:
-            start = time.time()
+        for model in [m for m in models if m]:
             try:
-                response = await self.deepseek_client.chat.completions.create(
-                    model=ds_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
-                    temperature=0.0,
-                    max_tokens=max_output_tokens,
-                    extra_body={"thinking": {"type": "disabled"}},
+                return await self._call_one(
+                    model, prompt, operation, max_output_tokens, schema
                 )
-                text = response.choices[0].message.content.strip()
-                if response.usage:
-                    self.db.log_llm_usage(
-                        model_name=ds_model, operation=operation,
-                        prompt_tokens=response.usage.prompt_tokens,
-                        candidate_tokens=response.usage.completion_tokens,
-                        latency_ms=int((time.time() - start) * 1000),
-                        prompt_text=prompt, response_text=text,
-                    )
-                return text
             except Exception as e:
-                self.db.log_llm_usage(
-                    model_name=ds_model, operation=operation,
-                    prompt_tokens=0, candidate_tokens=0,
-                    latency_ms=int((time.time() - start) * 1000),
-                    is_error=True, error_message=str(e), prompt_text=prompt,
+                # track_llm has already written the error row and re-raised.
+                transient = is_transient(e)
+                log.warning(
+                    "classifier.model_failed",
+                    model=model, operation=operation,
+                    error=str(e), transient=transient,
                 )
-                log.warning("classifier.deepseek_batch_failed", error=str(e), fallback="gemini")
-                if is_transient(e):
-                    last_transient = e
-
-        if is_configured() and self.client:
-            start = time.time()
-            try:
-                response = await self.client.aio.models.generate_content(
-                    model=gemini_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.0,
-                        safety_settings=DEFAULT_SAFETY_SETTINGS,
-                        response_mime_type="application/json",
-                        max_output_tokens=max_output_tokens,
-                    ),
-                )
-                text = response.text.strip()
-                if response.usage_metadata:
-                    self.db.log_llm_usage(
-                        model_name=gemini_model, operation=operation,
-                        prompt_tokens=response.usage_metadata.prompt_token_count,
-                        candidate_tokens=response.usage_metadata.candidates_token_count,
-                        latency_ms=int((time.time() - start) * 1000),
-                        prompt_text=prompt, response_text=text,
-                    )
-                return text
-            except Exception as e:
-                self.db.log_llm_usage(
-                    model_name=gemini_model, operation=operation,
-                    prompt_tokens=0, candidate_tokens=0,
-                    latency_ms=int((time.time() - start) * 1000),
-                    is_error=True, error_message=str(e), prompt_text=prompt,
-                )
-                log.error("classifier.gemini_batch_failed", error=str(e))
-                if is_transient(e):
+                if transient:
                     last_transient = e
 
         if last_transient is not None:
@@ -509,8 +525,11 @@ class ArticleClassifier:
         """
         Classifies the given article and populates its classification fields.
         Returns the modified article.
+
+        Prefer `classify_batch` — the ~1.1k-token guidance preamble is sent
+        once per call either way, so a per-article call pays it in full.
         """
-        if not is_configured() and not is_deepseek_configured():
+        if not is_llm_configured():
             log.warning("classifier.skipped", reason="No LLM configured", article_id=article.id)
             return article
 
@@ -518,126 +537,31 @@ class ArticleClassifier:
         if not self.should_classify(article):
             return self._mark_noise(article)
 
-        is_reddit = self._is_reddit(article)
-
-        if is_reddit:
-            comments_text = self._reddit_comments_text(article)
-
+        if self._is_reddit(article):
             prompt = REDDIT_CLASSIFICATION_PROMPT.format(
                 headline=article.headline,
                 summary=article.summary,
-                comments=comments_text
+                comments=self._reddit_comments_text(article),
             )
-            ds_model_name = settings.deepseek_model_reddit_sentiment
-            gemini_model_name = settings.gemini_model_reddit_sentiment
+            models = [settings.model_reddit_sentiment,
+                      settings.model_reddit_sentiment_fallback]
         else:
             prompt = CLASSIFICATION_PROMPT.format(
                 headline=article.headline,
-                summary=article.summary
+                summary=article.summary,
             )
-            ds_model_name = settings.deepseek_model_classifier
-            gemini_model_name = self.model_name
+            models = [self.model_name, settings.model_classifier_fallback]
 
-        text = None
-        import time
-
-        # DeepSeek attempt
-        if is_deepseek_configured() and self.deepseek_client:
-            start_time = time.time()
-            is_error = False
-            error_msg = None
-            try:
-                # Explicitly disable reasoning/thinking for classification tasks
-                # to save tokens — classification needs fast JSON, not deep reasoning
-                response = await self.deepseek_client.chat.completions.create(
-                    model=ds_model_name,
-                    messages=[{"role": "user", "content": prompt}],
-                    response_format={"type": "json_object"},
-                    temperature=0.0,
-                    max_tokens=settings.classify_max_output_tokens_per_article,
-                    extra_body={"thinking": {"type": "disabled"}}
-                )
-                text = response.choices[0].message.content.strip()
-                
-                latency_ms = int((time.time() - start_time) * 1000)
-                if response.usage:
-                    self.db.log_llm_usage(
-                        model_name=ds_model_name,
-                        operation="classify",
-                        prompt_tokens=response.usage.prompt_tokens,
-                        candidate_tokens=response.usage.completion_tokens,
-                        latency_ms=latency_ms,
-                        is_error=False,
-                        error_message=None,
-                        prompt_text=prompt,
-                        response_text=text
-                    )
-            except Exception as e:
-                is_error = True
-                error_msg = str(e)
-                latency_ms = int((time.time() - start_time) * 1000)
-                self.db.log_llm_usage(
-                    model_name=ds_model_name,
-                    operation="classify",
-                    prompt_tokens=0,
-                    candidate_tokens=0,
-                    latency_ms=latency_ms,
-                    is_error=True,
-                    error_message=error_msg,
-                    prompt_text=prompt,
-                    response_text=None
-                )
-                log.warning("classifier.deepseek_failed", article_id=article.id, error=error_msg, fallback="gemini")
-                text = None
-
-        # Gemini fallback attempt
-        if text is None and is_configured() and self.client:
-            start_time = time.time()
-            is_error = False
-            error_msg = None
-            try:
-                response = await self.client.aio.models.generate_content(
-                    model=gemini_model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.0,
-                        safety_settings=DEFAULT_SAFETY_SETTINGS,
-                        response_mime_type="application/json",
-                        max_output_tokens=settings.classify_max_output_tokens_per_article
-                    )
-                )
-                text = response.text.strip()
-                
-                latency_ms = int((time.time() - start_time) * 1000)
-                if response.usage_metadata:
-                    self.db.log_llm_usage(
-                        model_name=gemini_model_name,
-                        operation="classify",
-                        prompt_tokens=response.usage_metadata.prompt_token_count,
-                        candidate_tokens=response.usage_metadata.candidates_token_count,
-                        latency_ms=latency_ms,
-                        is_error=False,
-                        error_message=None,
-                        prompt_text=prompt,
-                        response_text=text
-                    )
-            except Exception as e:
-                is_error = True
-                error_msg = str(e)
-                latency_ms = int((time.time() - start_time) * 1000)
-                self.db.log_llm_usage(
-                    model_name=gemini_model_name,
-                    operation="classify",
-                    prompt_tokens=0,
-                    candidate_tokens=0,
-                    latency_ms=latency_ms,
-                    is_error=True,
-                    error_message=error_msg,
-                    prompt_text=prompt,
-                    response_text=None
-                )
-                log.error("classifier.gemini_failed", article_id=article.id, error=error_msg)
-                text = None
+        try:
+            text = await self._call_with_fallback(
+                prompt, models, "classify",
+                settings.classify_max_output_tokens_per_article,
+            )
+        except Exception as e:
+            # Every model failed transiently. Leave the article unclassified so
+            # a later pass retries it, rather than stamping a verdict.
+            log.warning("classifier.failed", article_id=article.id, error=str(e))
+            return article
 
         if not text:
             return article

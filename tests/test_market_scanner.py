@@ -1,5 +1,8 @@
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import patch
+
+from tests.conftest import make_llm_response
 
 import pytest
 
@@ -50,17 +53,14 @@ async def test_market_scanner_exact_ticker_match(db):
     mock_alert_manager.bot.send_message = AsyncMock()
 
     scanner = MarketScanner(db=db, alert_manager=mock_alert_manager)
-    scanner.client = MagicMock()
-    mock_response = MagicMock()
-    mock_response.text = "This is a reason."
-    mock_response.usage_metadata = None
-    scanner.client.models.generate_content.return_value = mock_response
+    mock_complete = AsyncMock(return_value=make_llm_response("This is a reason."))
 
-    # Call _generate_and_send_alert for 'MS' (Morgan Stanley)
-    await scanner._generate_and_send_alert("MS", 100.0, 5.5)
+    with patch("pipeline.market_scanner.is_llm_configured", return_value=True),          patch("pipeline.market_scanner.settings.model_market_scanner", "test/scanner"),          patch("pipeline.market_scanner.complete", mock_complete):
+        # Call _generate_and_send_alert for 'MS' (Morgan Stanley)
+        await scanner._generate_and_send_alert("MS", 100.0, 5.5)
 
     # Check that LLM prompt included the Morgan Stanley summary, NOT MSFT
-    prompt_used = scanner.client.models.generate_content.call_args[1]["contents"]
+    prompt_used = mock_complete.await_args.kwargs["prompt"]
     assert "Morgan Stanley beats earnings" in prompt_used
     assert "Microsoft beats earnings" not in prompt_used
     assert "Microsoft beats earnings" not in prompt_used

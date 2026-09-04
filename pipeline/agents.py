@@ -1,21 +1,28 @@
 import json
 import asyncio
-from typing import TypedDict, Optional, Dict, Callable, Awaitable
+from typing import TypedDict, Optional, Dict, Callable, Awaitable, Literal
 import yfinance as yf
 from langgraph.graph import StateGraph, START, END
 from pydantic import BaseModel, Field
 
 from config.llm import (
-    get_client,
-    get_deepseek_client,
+    complete,
+    response_cost,
+    is_llm_configured,
     parse_structured,
     salvage_json_field,
+    stream_complete,
 )
 from config.settings import settings
 from config.logging_config import get_logger
+from config.usage import track_llm
 from data.tickers import KR, US, classify_market
 from pipeline.insider_tracker import InsiderTracker
 from pipeline.kr_flows import KrFlowTracker
+from pipeline.darkpool import DarkPoolTracker
+from pipeline.market_regime import MarketRegimeTracker
+from pipeline.analyst_ratings import AnalystRatingsTracker
+from pipeline.technical_rating import TechnicalRatingTracker
 
 log = get_logger(__name__)
 
@@ -28,8 +35,18 @@ log = get_logger(__name__)
 #
 # The docstring is sent to the model as the schema `description`, so it stays short.
 class TraderAdvisory(BaseModel):
-    """The trade advisory, split into a headline verdict and the full write-up."""
+    """The trade advisory: the call itself, then the reasoning behind it."""
 
+    # Declared before the prose so a response that runs out of tokens loses the
+    # tail of the write-up rather than the decision. The panel headline reads
+    # these two directly — before they existed the UI had nothing but the ML
+    # baseline to show, and printed UNKNOWN whenever no model was trained.
+    direction: Literal["BUY", "SELL", "HOLD"] = Field(
+        description="The trade call for the stated horizon."
+    )
+    conviction: Literal["Low", "Medium", "High"] = Field(
+        description="Conviction in the call. Pick the nearest of the three."
+    )
     executive_summary: str = Field(
         description="TLDR: [BUY/SELL/HOLD] — 1-2 sentence actionable reason, no markdown."
     )
@@ -105,11 +122,19 @@ class AdvisoryState(TypedDict):
     fundamentals_report: str
     technical_report: str
     smart_money_report: str
+    thesis_context: str
 
     debate_history: list[str]
     debate_round_count: int
 
     final_advisory: str
+    # Every key a node returns has to be declared here or LangGraph drops the
+    # write silently. `executive_summary` was returned but undeclared for
+    # weeks, so the watchlist card and the Telegram summary rendered blank
+    # with nothing failing anywhere.
+    executive_summary: str
+    trader_direction: str
+    trader_conviction: str
 
 class AdvisoryGraph:
     def __init__(self, db, progress_callback=None, debate_chunk_callback: Optional[Callable[[str, int, str], Awaitable[None]]] = None):
@@ -199,106 +224,223 @@ class AdvisoryGraph:
         # Both read from local tables, so this stays a zero-token, zero-network step.
         smart_money = self._build_smart_money_report(ticker)
 
+        # Causal chain. If the Thesis Engine already placed this ticker inside a
+        # bottleneck chain, the debate should argue that mechanism rather than
+        # rediscover it from the news. Returns '' when the ticker is in no active
+        # chain, so the prompt builder splices it in unconditionally.
+        try:
+            thesis_context = self.db.get_active_thesis_context(ticker)
+        except Exception as e:
+            log.warning("agents.thesis_context_failed", ticker=ticker, error=str(e))
+            thesis_context = ""
+
         return {
             "fundamentals_report": fundamentals,
             "technical_report": technicals,
             "smart_money_report": smart_money,
+            "thesis_context": thesis_context,
             "debate_round_count": 0,
             "debate_history": []
         }
 
     def _build_smart_money_report(self, ticker: str) -> str:
-        """Insider / stake / flow context for the debate, by market."""
-        market = classify_market(ticker)
-        try:
-            if market == US:
-                return InsiderTracker(self.db).get_report(ticker, days=90)
-            if market == KR:
-                return KrFlowTracker(self.db).get_report(ticker, days=20)
-        except Exception as e:
-            log.warning("agents.smart_money_report_failed", ticker=ticker, error=str(e))
-            return "Smart money data unavailable."
-        return "No insider or institutional flow data applies to this instrument."
+        """Insider / stake / flow / off-exchange context for the debate, by market.
 
-    async def _call_deepseek(self, prompt: str, speaker: Optional[str] = None, round_num: Optional[int] = None, system_message: Optional[str] = None) -> str:
-        client = get_deepseek_client()
-        if not client:
-            return "DeepSeek API key not configured."
+        Sections are gathered independently so one empty or failing source
+        degrades to its own "no data" line instead of blanking the others —
+        a ticker with no Form 4 filings still has an off-exchange print record,
+        and the market-wide regime applies to every instrument.
+        """
+        market = classify_market(ticker)
+        sections: list[str] = []
+
+        def add(label: str, build):
+            try:
+                text = build()
+            except Exception as e:
+                log.warning("agents.smart_money_section_failed", ticker=ticker,
+                            section=label, error=str(e) or repr(e))
+                return
+            if text:
+                sections.append(text)
+
+        if market == US:
+            add("insider", lambda: InsiderTracker(self.db).get_report(ticker, days=90))
+            add("darkpool", lambda: DarkPoolTracker(self.db).get_report(ticker, days=20))
+            # US-only: Yahoo's analyst coverage of Korean listings is too thin to
+            # be worth showing the debate, and an unreliable consensus is worse
+            # than none when the model will argue from it either way.
+            add("analyst", lambda: AnalystRatingsTracker(self.db).get_report(ticker))
+        elif market == KR:
+            add("kr_flows", lambda: KrFlowTracker(self.db).get_report(ticker, days=20))
+
+        # Market-wide, so they apply regardless of listing venue. The technical
+        # rating is a pure function of price, so unlike everything above it works
+        # for indices and crypto too.
+        add("technical_rating",
+            lambda: TechnicalRatingTracker(self.db).get_report(ticker))
+        add("regime", lambda: MarketRegimeTracker(self.db).get_report(days=60))
+
+        if not sections:
+            return "No insider or institutional flow data applies to this instrument."
+        return "\n\n".join(sections)
+
+    def _build_debate_context(self, state: AdvisoryState) -> str:
+        """The shared evidence block both researchers argue from.
+
+        Bull and Bear read the same string by construction. While these were two
+        copies, adding evidence to one side and not the other was a one-line
+        mistake that would have quietly made the debate unfair rather than
+        raising an error.
+        """
+        parts = [
+            f"Ticker: {state['ticker']}",
+            f"Fundamentals: {state.get('fundamentals_report')}",
+            f"Technicals (ML Base): {state.get('technical_report')}",
+            f"News Context (Sentiment/Urgency): {state.get('news_context')}",
+            f"SMART MONEY (disclosed insider & institutional positioning):\n"
+            f"{state.get('smart_money_report') or 'Not available.'}",
+        ]
+
+        thesis = state.get("thesis_context")
+        if thesis:
+            parts.append(
+                "CAUSAL CHAIN (the Thesis Engine placed this ticker inside an "
+                "active chain - how the theme reaches it, and what breaks the "
+                f"link):\n{thesis}\n"
+                "Read the crowding stage as timing, not conviction: EARLY means "
+                "the move is not yet priced in, CROWDED means it largely is. "
+                "Argue the mechanism and the stated falsifier - the theme being "
+                "popular is not itself evidence."
+            )
+
+        parts.append(
+            f"Past Lessons (relevance-ranked):\n"
+            f"{self._format_lessons(state.get('past_lessons', {}))}"
+        )
+        return "\n".join(parts)
+
+    # Appended to a turn the provider cut off mid-sentence. Reasoning tokens
+    # share the completion budget, so this is reachable whenever the thinking
+    # block crowds out the answer — see settings.debate_max_output_tokens.
+    _TRUNCATION_MARKER = "\n\n_[turn truncated — output budget reached]_"
+
+    async def _finalize_turn(
+        self,
+        content: Optional[str],
+        finish_reason: Optional[str],
+        completion_tokens: int,
+        speaker: Optional[str] = None,
+        round_num: Optional[int] = None,
+    ) -> str:
+        """Make a cut-off or empty debate turn visible instead of silent.
+
+        A turn that hit the token ceiling used to be appended to
+        `debate_history` and cached as though it had concluded, and an empty
+        one appended a bare "Bull: " that the arena renders as a card which
+        simply is not there. Both now say so, in the transcript and the log.
+        """
+        text = (content or "").strip()
+        if not text:
+            log.warning("agents.debate_turn_empty", speaker=speaker,
+                        round_num=round_num, finish_reason=finish_reason,
+                        completion_tokens=completion_tokens)
+            addition = ("[No argument returned — the model spent its entire "
+                        "completion budget on reasoning without emitting an "
+                        "answer.]")
+            text = addition
+        elif finish_reason == "length":
+            log.warning("agents.debate_turn_truncated", speaker=speaker,
+                        round_num=round_num, completion_tokens=completion_tokens,
+                        chars=len(text))
+            addition = self._TRUNCATION_MARKER
+            text = text + addition
+        else:
+            return text
+
+        # Live viewers watched the stream stop mid-thought; say why on the same
+        # channel, or the marker only surfaces once the verdict event lands.
+        if self.debate_chunk_callback and speaker and round_num is not None:
+            await self.debate_chunk_callback(speaker, round_num, addition)
+        return text
+
+    async def _call_researcher(
+        self, prompt: str, speaker: Optional[str] = None,
+        round_num: Optional[int] = None, system_message: Optional[str] = None,
+    ) -> str:
+        """
+        One debate turn, streamed when somebody is watching the arena.
+
+        Runs at xhigh reasoning effort, which is why `debate_max_output_tokens`
+        is set so high: the thinking block is billed against the same
+        completion budget as the answer, so a round-2 turn carrying the full
+        history can exhaust it and come back empty. `_finalize_turn` is what
+        turns that into a visible marker rather than a silent blank.
+        """
+        if not is_llm_configured() or not settings.model_debate:
+            return "No model configured for the debate — set MODEL_DEBATE."
+
+        model_name = settings.model_debate
+        sys_msg = system_message or (
+            "You are a top-tier financial researcher. "
+            "Reason through the facts before answering."
+        )
+        common = dict(
+            system=sys_msg,
+            max_tokens=settings.debate_max_output_tokens,
+            reasoning="xhigh",
+        )
+
         try:
-            model_name = getattr(settings, "deepseek_model_reasoner", "deepseek-v4-pro")
-            sys_msg = system_message or "You are a top-tier financial researcher. Reason through the facts before answering."
             if self.debate_chunk_callback and speaker and round_num is not None:
-                response = await client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": sys_msg},
-                        {"role": "user", "content": prompt}
-                    ],
-                    reasoning_effort="high",
-                    max_tokens=settings.debate_max_output_tokens,
-                    extra_body={"thinking": {"type": "enabled"}},
-                    # Without this the SDK reports no usage at all on a stream,
-                    # which is why this call used to log a hardcoded zero — the
-                    # most expensive operation in the system, costed at $0.00.
-                    stream_options={"include_usage": True},
-                    stream=True
-                )
-                collected_chunks = []
+                collected: list[str] = []
+                finish_reason = None
                 usage = None
-                async for chunk in response:
-                    if chunk.choices and len(chunk.choices) > 0:
-                        delta = chunk.choices[0].delta.content or ""
-                        if delta:
-                            collected_chunks.append(delta)
-                            await self.debate_chunk_callback(speaker, round_num, delta)
-                    # The usage chunk arrives last and carries an empty choices
-                    # list, so it has to be read outside the branch above.
-                    elif getattr(chunk, "usage", None):
-                        usage = chunk.usage
-                full_content = "".join(collected_chunks)
-                self.db.log_llm_usage(
-                    model_name=model_name,
-                    operation="debate_research",
-                    prompt_tokens=usage.prompt_tokens if usage else 0,
-                    candidate_tokens=usage.completion_tokens if usage else 0,
-                    prompt_text=prompt,
-                    response_text=full_content,
+                with track_llm(self.db, model_name, "debate_research",
+                               prompt_text=prompt, store_text=True) as u:
+                    async for chunk in stream_complete(
+                        model=model_name, prompt=prompt, **common
+                    ):
+                        if chunk.text:
+                            collected.append(chunk.text)
+                            await self.debate_chunk_callback(speaker, round_num, chunk.text)
+                        if chunk.finish_reason:
+                            finish_reason = chunk.finish_reason
+                        if chunk.usage is not None:
+                            usage = chunk.usage
+                    # Usage rides the trailing chunk, so it is assigned onto the
+                    # record rather than derived from a response object.
+                    if usage is not None:
+                        u.prompt_tokens = getattr(usage, "prompt_tokens", None)
+                        u.candidate_tokens = getattr(usage, "completion_tokens", None)
+                        u.cost = response_cost(usage)
+                    u.response_text = "".join(collected)
+
+                return await self._finalize_turn(
+                    "".join(collected), finish_reason,
+                    getattr(usage, "completion_tokens", 0) or 0,
+                    speaker, round_num,
                 )
-                return full_content
-            else:
-                response = await client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": sys_msg},
-                        {"role": "user", "content": prompt}
-                    ],
-                    reasoning_effort="high",
-                    max_tokens=settings.debate_max_output_tokens,
-                    extra_body={"thinking": {"type": "enabled"}}
+
+            with track_llm(self.db, model_name, "debate_research") as u:
+                u.response = response = await complete(
+                    model=model_name, prompt=prompt, **common
                 )
-                prompt_tokens = response.usage.prompt_tokens if response.usage else 0
-                completion_tokens = response.usage.completion_tokens if response.usage else 0
-                self.db.log_llm_usage(model_name=model_name, operation="debate_research", prompt_tokens=prompt_tokens, candidate_tokens=completion_tokens)
-                return response.choices[0].message.content
+            return await self._finalize_turn(
+                response.text, response.finish_reason,
+                getattr(response.usage, "completion_tokens", 0) or 0,
+                speaker, round_num,
+            )
         except Exception as e:
-            log.error(f"DeepSeek call failed: {e}")
-            return f"Error calling DeepSeek: {e}"
+            log.error(f"Debate call failed: {e}")
+            return f"Error calling model: {e}"
 
     async def bull_researcher_node(self, state: AdvisoryState) -> dict:
         round_num = state["debate_round_count"] + 1
         await self._update_progress(f"🔄 Round {round_num}: Bullish Researcher speaking...")
 
         ticker = state['ticker']
-        context = (
-            f"Ticker: {ticker}\n"
-            f"Fundamentals: {state.get('fundamentals_report')}\n"
-            f"Technicals (ML Base): {state.get('technical_report')}\n"
-            f"News Context (Sentiment/Urgency): {state.get('news_context')}\n"
-            f"SMART MONEY (disclosed insider & institutional positioning):\n"
-            f"{state.get('smart_money_report') or 'Not available.'}\n"
-            f"Past Lessons (relevance-ranked):\n"
-            f"{self._format_lessons(state.get('past_lessons', {}))}"
-        )
+        context = self._build_debate_context(state)
 
         history = state.get("debate_history", [])
 
@@ -320,7 +462,7 @@ class AdvisoryGraph:
                 f"you cannot refute, concede it and explain why your thesis still holds despite it."
             )
 
-        result = await self._call_deepseek(prompt, speaker="bull", round_num=round_num, system_message=_BULL_SYSTEM)
+        result = await self._call_researcher(prompt, speaker="bull", round_num=round_num, system_message=_BULL_SYSTEM)
         history.append(f"Bull: {result}")
 
         return {"debate_history": history}
@@ -330,16 +472,7 @@ class AdvisoryGraph:
         await self._update_progress(f"🔄 Round {round_num}: Bearish Researcher attacking...")
 
         ticker = state['ticker']
-        context = (
-            f"Ticker: {ticker}\n"
-            f"Fundamentals: {state.get('fundamentals_report')}\n"
-            f"Technicals (ML Base): {state.get('technical_report')}\n"
-            f"News Context (Sentiment/Urgency): {state.get('news_context')}\n"
-            f"SMART MONEY (disclosed insider & institutional positioning):\n"
-            f"{state.get('smart_money_report') or 'Not available.'}\n"
-            f"Past Lessons (relevance-ranked):\n"
-            f"{self._format_lessons(state.get('past_lessons', {}))}"
-        )
+        context = self._build_debate_context(state)
 
         history = state.get("debate_history", [])
         debate_log = "\n\n".join(history)
@@ -354,7 +487,7 @@ class AdvisoryGraph:
             f"(d) One part of the Bull case you concede is genuinely strong."
         )
 
-        result = await self._call_deepseek(prompt, speaker="bear", round_num=round_num, system_message=_BEAR_SYSTEM)
+        result = await self._call_researcher(prompt, speaker="bear", round_num=round_num, system_message=_BEAR_SYSTEM)
         history.append(f"Bear: {result}")
 
         return {
@@ -379,7 +512,7 @@ class AdvisoryGraph:
         """
         Lightweight heuristic: check if Bull and Bear agree on directional sentiment.
         If both are bullish or both are bearish, there's no real debate — skip round 2.
-        Saves one full DeepSeek v4-pro reasoning call (~$0.03-0.06 per ticker).
+        Saves one full DeepSeek reasoning call per ticker.
         """
         history = state.get("debate_history", [])
         if len(history) < 2:
@@ -430,12 +563,16 @@ class AdvisoryGraph:
 
     async def trader_risk_manager_node(self, state: AdvisoryState) -> dict:
         await self._update_progress("✅ Trader/Risk Manager finalizing trade plan...")
-        client = get_client()
-        if not client:
-            msg = "Gemini API key not configured."
+        if not is_llm_configured() or not settings.model_trader:
+            msg = "No model configured for the trader — set MODEL_TRADER."
             if self.debate_chunk_callback:
                 await self.debate_chunk_callback("trader", 3, msg)
-            return {"final_advisory": msg}
+            return {
+                "final_advisory": msg,
+                "executive_summary": msg,
+                "trader_direction": "",
+                "trader_conviction": "",
+            }
 
         ticker = state['ticker']
         debate_log = "\n\n".join(state.get("debate_history", []))
@@ -453,31 +590,24 @@ class AdvisoryGraph:
             f"5. State your time horizon (days/weeks/months) and the #1 risk that would invalidate your call.\n"
             f"6. If relevant, cite historical precedent for similar setups.\n"
             f"7. Format the full advisory in clean Markdown with ### section headers. No emojis.\n\n"
-            f"Return the executive summary and the full markdown advisory in the "
-            f"two fields of the required response schema."
+            f"Return your answer in the four fields of the required response "
+            f"schema: `direction` (BUY/SELL/HOLD) and `conviction` "
+            f"(Low/Medium/High) carry the call itself and are rendered as the "
+            f"headline, so they must agree with the prose in `executive_summary` "
+            f"and `full_advisory`."
         )
 
         try:
-            model_name = settings.gemini_model_chat or "gemini-3-flash-preview"
-            from google.genai import types
-            loop = asyncio.get_running_loop()
+            model_name = settings.model_trader
 
-            def ask():
-                return client.models.generate_content(
+            with track_llm(self.db, model_name, "trader_advisory") as u:
+                u.response = response = await complete(
                     model=model_name,
-                    contents=prompt,
-                    config={
-                        'system_instruction': _TRADER_SYSTEM_MESSAGE,
-                        'thinking_config': types.ThinkingConfig(thinking_level=types.ThinkingLevel.HIGH),
-                        'response_mime_type': 'application/json',
-                        'response_schema': TraderAdvisory,
-                    }
+                    prompt=prompt,
+                    system=_TRADER_SYSTEM_MESSAGE,
+                    schema=TraderAdvisory,
+                    reasoning="high",
                 )
-
-            response = await loop.run_in_executor(None, ask)
-            prompt_tokens = response.usage_metadata.prompt_token_count if response.usage_metadata else 0
-            completion_tokens = response.usage_metadata.candidates_token_count if response.usage_metadata else 0
-            self.db.log_llm_usage(model_name=model_name, operation="trader_advisory", prompt_tokens=prompt_tokens, candidate_tokens=completion_tokens)
 
             advisory: Optional[TraderAdvisory] = None
             if isinstance(response.parsed, TraderAdvisory):
@@ -493,6 +623,8 @@ class AdvisoryGraph:
             if advisory is not None:
                 final_advisory = advisory.full_advisory
                 executive_summary = advisory.executive_summary
+                direction = advisory.direction
+                conviction = advisory.conviction
             else:
                 # Never surface a raw JSON blob to the UI: pull the prose out if
                 # we can, and only fall back to the raw text if it is not JSON.
@@ -506,18 +638,29 @@ class AdvisoryGraph:
                     salvage_json_field(response.text, "executive_summary")
                     or "No executive summary available."
                 )
+                # Declared ahead of the prose in the schema, so these are the
+                # fields most likely to have survived a truncated response.
+                direction = salvage_json_field(response.text, "direction") or ""
+                conviction = salvage_json_field(response.text, "conviction") or ""
 
             await self._stream_trader(final_advisory)
             return {
                 "final_advisory": final_advisory,
                 "executive_summary": executive_summary,
+                "trader_direction": direction,
+                "trader_conviction": conviction,
             }
 
         except Exception as e:
             log.error(f"Trader/Risk Manager Gemini call failed: {e}")
             final_advisory = f"Error generating final advisory: {e}"
             await self._stream_trader(final_advisory)
-            return {"final_advisory": final_advisory, "executive_summary": "Error generating advisory."}
+            return {
+                "final_advisory": final_advisory,
+                "executive_summary": "Error generating advisory.",
+                "trader_direction": "",
+                "trader_conviction": "",
+            }
 
     async def _stream_trader(self, text: str) -> None:
         """Replay the finished advisory to the SSE client word by word."""

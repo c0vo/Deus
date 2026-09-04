@@ -85,7 +85,7 @@ export default function LiveNewsFeed({ initialArticles = [] }: LiveNewsFeedProps
         </div>
       </div>
 
-      <div ref={feedRef} className="flex-1 overflow-y-auto max-h-96">
+      <div ref={feedRef} className="flex-1 overflow-y-auto overscroll-contain max-h-[70dvh] md:max-h-96">
         {articles.length === 0 ? (
           <div className="p-4 text-center text-xs text-terminal-muted">
             Waiting for news ingestion…

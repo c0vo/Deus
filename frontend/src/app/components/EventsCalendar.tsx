@@ -46,7 +46,7 @@ export default function EventsCalendar({ events, onRemove }: EventsCalendarProps
         </span>
       </div>
 
-      <div className="flex flex-col max-h-80 overflow-y-auto">
+      <div className="flex flex-col max-h-80 overflow-y-auto overscroll-contain">
         {sorted.slice(0, 12).map((ev) => {
           const days = daysUntil(ev.event_date);
 

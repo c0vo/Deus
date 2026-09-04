@@ -1,9 +1,13 @@
 # === LLM ===
-google-genai>=0.1.1
-openai
+# Everything goes through OpenRouter over its OpenAI-compatible API, so this is
+# the only SDK. google-genai is deliberately absent: nothing imports it now.
+# The floor is set because config/llm.py relies on extra_body passthrough and
+# on `cost` surviving on the usage object.
+openai>=1.60.0
 
 # === Embeddings ===
-# Using Gemini embeddings (google-generativeai)
+# Also OpenRouter — google/gemini-embedding-001, pinned by MODEL_EMBEDDING to
+# keep the stored 3072-dim corpus valid.
 numpy
 sqlite-vec
 

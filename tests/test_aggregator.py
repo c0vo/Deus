@@ -10,6 +10,101 @@ from pipeline.aggregator import NewsAggregator, _has_financial_content
 
 # ── _has_financial_content tests ────────────────────────────────────────────
 
+def _article(headline, summary="", comments=None, source="test_source"):
+    return NewsArticle(
+        id="fixture",
+        headline=headline,
+        summary=summary,
+        source_name=source,
+        source_type="social" if comments else "rss",
+        url="https://example.com/fixture",
+        published_at=datetime.now(timezone.utc),
+        raw_data={"comments": [{"body": c} for c in comments]} if comments else {},
+    )
+
+
+# (headline, summary, should_reach_the_classifier)
+#
+# The must-keep half guards against over-correction: this filter is the last
+# thing standing between a real story and being dropped at ingestion, where
+# nothing downstream will notice. Entries marked with a score are drawn from
+# articles the ranker actually scored that highly in the production database.
+PREFILTER_FIXTURES = [
+    # ── must keep ───────────────────────────────────────────────────────
+    ("U.S. says it targeted Iranian forces after attacks that killed two American troops",
+     "The U.S. military struck Iranian coastal surveillance facilities.", True),      # scored 9.2
+    ("Putin details Russia's fuel shortages after Ukrainian drone strikes",
+     "Drone attacks have disrupted refining capacity.", True),                        # scored 8.2
+    ("SpaceX landed in millions of 401(k)s through index funds", "", True),           # scored 7.5
+    ("Fed holds interest rates steady", "The Federal Reserve decision.", True),
+    ("CPI comes in hotter than expected", "Inflation accelerated last month.", True),
+    ("AAPL earnings preview", "", True),
+    ("Why I'm loading up on $GME", "", True),
+    ("Nvidia beats on revenue, raises guidance", "", True),
+    ("Trump announces new tariffs on imported steel", "", True),
+    ("Shareholder approval clears the merger", "", True),
+
+    # ── must drop ───────────────────────────────────────────────────────
+    ("A steak dinner tour in Ohio", "", False),
+    ("Taylor Swift announces new album", "", False),
+    ("Celebrity wedding photos leaked online", "", False),
+    ("Best mechanical keyboards under $100", "Looking for suggestions.", False),
+    ("Crowded Airport Lounges Are Rolling Out Grab-and-Go Options", "", False),
+    ("How to cook the perfect steak every time", "", False),
+]
+
+
+@pytest.mark.parametrize("headline,summary,expected", PREFILTER_FIXTURES)
+def test_prefilter_fixtures(headline, summary, expected):
+    assert _has_financial_content(_article(headline, summary)) is expected
+
+
+class TestPrefilterRegressions:
+    """The specific defects this filter has had, pinned so they cannot return."""
+
+    def test_ordinary_words_are_not_read_as_tickers(self):
+        """
+        Uppercasing before matching [A-Z]{2,5} turned STEAK, TOUR and OHIO into
+        tickers, so nearly every article passed as financial.
+        """
+        assert _has_financial_content(_article("A steak dinner tour in Ohio")) is False
+
+    def test_a_bare_dollar_amount_is_not_a_cashtag(self):
+        assert _has_financial_content(_article("Best keyboards under $100")) is False
+
+    def test_a_real_cashtag_still_passes(self):
+        assert _has_financial_content(_article("Thoughts on $TSLA today?")) is True
+
+    def test_shouty_headline_is_not_a_list_of_tickers(self):
+        assert _has_financial_content(_article("THE NEW BEST THING")) is False
+
+    def test_shouty_headline_with_real_content_still_passes(self):
+        assert _has_financial_content(_article("FED HOLDS RATES STEADY")) is True
+
+    def test_reddit_ticker_only_in_comments_is_kept(self):
+        """
+        Enrichment runs before this filter, so comments are available. A post
+        whose signal lives only in the replies previously survived by accident,
+        on a false positive from the uppercase bug.
+        """
+        article = _article(
+            "What are your thoughts on this one?",
+            "Is it still a buy or is it drilling?",
+            comments=["I have $SPCE calls at 10!"],
+            source="reddit_wallstreetbets",
+        )
+        assert _has_financial_content(article) is True
+
+    def test_reddit_noise_with_noise_comments_is_dropped(self):
+        article = _article(
+            "What is the best mechanical keyboard?",
+            "Looking for suggestions.",
+            comments=["I like MX Browns."],
+            source="reddit_investing",
+        )
+        assert _has_financial_content(article) is False
+
+
 class TestHasFinancialContent:
     """Pre-filter: should this article be sent to the LLM for classification?"""
 

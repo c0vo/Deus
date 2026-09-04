@@ -13,7 +13,7 @@ export default function MotionToggle() {
       title={reduced ? "Enable animation" : "Reduce animation"}
       aria-label={reduced ? "Enable animation" : "Reduce animation"}
       aria-pressed={reduced}
-      className="grid place-items-center w-7 h-7 rounded border border-border-dim text-terminal-muted hover:bg-bg-surface hover:text-terminal-text transition-colors"
+      className="tap-halo grid place-items-center w-7 h-7 rounded border border-border-dim text-terminal-muted hover:bg-bg-surface hover:text-terminal-text transition-colors"
     >
       {reduced ? <ZapOff size={14} strokeWidth={1.7} /> : <Zap size={14} strokeWidth={1.7} />}
     </button>

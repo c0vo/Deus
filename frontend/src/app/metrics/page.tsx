@@ -20,6 +20,9 @@ interface UsageInfo {
   total_cost_usd: number;
   all_time_tokens: number;
   all_time_cost_usd: number;
+  // Successful calls the provider reported no cost for. They are stored at
+  // $0.00, so this is the one way the figures above can understate spend.
+  unpriced_calls?: number;
   by_model?: Record<string, { tokens: number; cost: number }>;
 }
 
@@ -100,7 +103,7 @@ export default function Metrics() {
   };
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-4 md:p-6 space-y-4 md:space-y-6">
       
       {/* Title */}
       <div className="border-b border-border-dim pb-4">
@@ -135,15 +138,15 @@ export default function Metrics() {
                 Database storage
               </h3>
               <div className="space-y-3 text-xs">
-                <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
+                <div className="flex flex-wrap justify-between gap-x-3 border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">DATABASE SIZE:</span>
                   <span className="num text-terminal-text font-medium">{getDbSizeStr(status?.db_size_bytes)}</span>
                 </div>
-                <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
+                <div className="flex flex-wrap justify-between gap-x-3 border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">ARCHIVED ARTICLES:</span>
                   <span className="num text-terminal-text font-medium">{status?.total_articles.toLocaleString() || 0}</span>
                 </div>
-                <div className="flex justify-between">
+                <div className="flex flex-wrap justify-between gap-x-3">
                   <span className="text-terminal-muted">WATCHLIST COUNT:</span>
                   <span className="num text-terminal-text font-medium">{status?.watchlist_size || 0} Tickers</span>
                 </div>
@@ -157,25 +160,31 @@ export default function Metrics() {
                 API token accounting
               </h3>
               <div className="space-y-3 text-xs">
-                <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
+                <div className="flex flex-wrap justify-between gap-x-3 border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">7-DAY TOKENS:</span>
                   <span className="num text-terminal-text font-medium">{(usage?.total_tokens ?? 0).toLocaleString()}</span>
                 </div>
-                <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
+                <div className="flex flex-wrap justify-between gap-x-3 border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">7-DAY COST:</span>
                   <span className="num text-terminal-text font-medium">${(usage?.total_cost_usd ?? 0).toFixed(4)}</span>
                 </div>
-                <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
+                <div className="flex flex-wrap justify-between gap-x-3 border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">CUMULATIVE TOKENS:</span>
                   <span className="num text-terminal-text font-medium">{(usage?.all_time_tokens ?? 0).toLocaleString()}</span>
                 </div>
-                <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
+                <div className="flex flex-wrap justify-between gap-x-3 border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">CUMULATIVE COST:</span>
                   <span className="num text-terminal-text font-medium">${(usage?.all_time_cost_usd ?? 0).toFixed(4)}</span>
                 </div>
-                <div className="flex justify-between">
+                <div className="flex flex-wrap justify-between gap-x-3 border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">BILLING STATE:</span>
                   <span className="tag tag-up">OK / prepaid</span>
+                </div>
+                <div className="flex flex-wrap justify-between gap-x-3">
+                  <span className="text-terminal-muted">UNPRICED CALLS:</span>
+                  <span className={`num font-medium ${(usage?.unpriced_calls ?? 0) > 0 ? "text-terminal-down" : "text-terminal-text"}`}>
+                    {(usage?.unpriced_calls ?? 0).toLocaleString()}
+                  </span>
                 </div>
               </div>
             </div>
@@ -187,15 +196,15 @@ export default function Metrics() {
                 Subsystem liveness
               </h3>
               <div className="space-y-3 text-xs">
-                <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
+                <div className="flex flex-wrap justify-between gap-x-3 border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">APScheduler daemon:</span>
                   <span className="tag tag-up">Active · 30m</span>
                 </div>
-                <div className="flex justify-between border-b border-border-dim/30 pb-1.5">
+                <div className="flex flex-wrap justify-between gap-x-3 border-b border-border-dim/30 pb-1.5">
                   <span className="text-terminal-muted">DeepSeek Debate Model:</span>
                   <span className="tag tag-up">Online</span>
                 </div>
-                <div className="flex justify-between">
+                <div className="flex flex-wrap justify-between gap-x-3">
                   <span className="text-terminal-muted">Gemini Verdict Model:</span>
                   <span className="tag tag-up">Online</span>
                 </div>
@@ -229,8 +238,12 @@ export default function Metrics() {
               {accuracy ? (
                 <div className="space-y-4 w-full">
                   {/* Gauge Circle */}
-                  <div className="relative w-36 h-36 mx-auto flex items-center justify-center">
-                    <svg className="w-full h-full transform -rotate-90">
+                  <div className="relative w-36 max-w-full aspect-square mx-auto flex items-center justify-center">
+                    <svg
+                      viewBox="0 0 144 144"
+                      preserveAspectRatio="xMidYMid meet"
+                      className="w-full h-full transform -rotate-90"
+                    >
                       <circle
                         cx="72"
                         cy="72"
@@ -298,11 +311,11 @@ export default function Metrics() {
                       const data = usage.by_model![model];
                       return (
                         <div key={model} className="border border-border-dim/40 p-3 bg-bg-surface/30 space-y-1.5">
-                          <div className="flex justify-between font-bold text-terminal-text">
+                          <div className="flex flex-wrap justify-between gap-x-3 font-bold text-terminal-text">
                             <span className="uppercase">{model}</span>
                             <span className="num text-terminal-text">${data.cost.toFixed(4)}</span>
                           </div>
-                          <div className="flex justify-between text-[10px] text-terminal-muted">
+                          <div className="flex flex-wrap justify-between gap-x-3 text-[10px] text-terminal-muted">
                             <span>TOKENS INGESTED: {data.tokens.toLocaleString()}</span>
                             <span>LAST 7 DAYS</span>
                           </div>

@@ -15,7 +15,7 @@ from typing import Optional
 import httpx
 from config.logging_config import get_logger
 from config.settings import settings
-from config.llm import get_deepseek_client
+from config.llm import complete, is_llm_configured
 from config.usage import track_llm
 from data.database import Database
 from data.models import NewsArticle
@@ -86,8 +86,8 @@ class IPODetector:
         # Bail before the loop rather than letting _classify_ipo_article return
         # None per article — an unconfigured key would otherwise look like "the
         # model found no IPO" and stamp the whole window as scanned.
-        if not get_deepseek_client():
-            log.warning("ipo_detector.skipped", reason="DeepSeek not configured")
+        if not is_llm_configured() or not settings.model_extract:
+            log.warning("ipo_detector.skipped", reason="MODEL_EXTRACT not configured")
             return []
 
         detected = []
@@ -297,9 +297,8 @@ class IPODetector:
         return True
 
     async def _classify_ipo_article(self, article: NewsArticle) -> Optional[dict]:
-        """Use DeepSeek v4-flash to extract IPO details from an article."""
-        client = get_deepseek_client()
-        if not client:
+        """Extract IPO details from an article with MODEL_EXTRACT."""
+        if not is_llm_configured() or not settings.model_extract:
             return None
 
         headline = article.headline
@@ -337,20 +336,18 @@ class IPODetector:
         # relies on that distinction to decide whether to mark the article
         # scanned — collapsing both into `return None` is what let an article be
         # re-extracted on every scan for its whole window.
-        with track_llm(self.db, settings.deepseek_model_classifier, "ipo_extract") as u:
-            u.response = response = await client.chat.completions.create(
-                model=settings.deepseek_model_classifier,
-                messages=[
-                    {"role": "system", "content": "You extract IPO information from news articles. Output JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
+        with track_llm(self.db, settings.model_extract, "ipo_extract") as u:
+            u.response = response = await complete(
+                model=settings.model_extract,
+                system="You extract IPO information from news articles. Output JSON only.",
+                prompt=prompt,
                 temperature=0.0,
-                response_format={"type": "json_object"},
+                json_mode=True,
                 max_tokens=settings.extraction_max_output_tokens,
             )
 
         try:
-            result = json.loads(response.choices[0].message.content.strip())
+            result = json.loads(response.text.strip())
 
             if result.get("company_name") and result.get("company_name") != "null":
                 extracted = {

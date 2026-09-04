@@ -49,7 +49,7 @@ export default function MacroThemesCard({
           No macro themes available yet.
         </div>
       ) : (
-        <div className="flex flex-col max-h-80 overflow-y-auto">
+        <div className="flex flex-col max-h-80 overflow-y-auto overscroll-contain">
           {themes.map((theme, idx) => {
             const isExpanded = expandedIdx === idx;
             return (

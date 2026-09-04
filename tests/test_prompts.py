@@ -86,8 +86,14 @@ class TestRankerPrompts:
     def test_ranker_prompt_does_not_penalize_sectors(self):
         assert "Do NOT automatically penalize any sector" in RANKING_PROMPT
 
-    def test_ranker_prompt_requires_json_array(self):
-        assert "JSON array" in RANKING_PROMPT
+    def test_ranker_prompt_requires_one_result_per_article(self):
+        """The root shape now travels as a json_schema, not as prose. What the
+        prompt still has to carry is the per-article contract: asking for a
+        bare array while response_format demanded an object is what got a whole
+        batch answered with one flat result."""
+        assert "one result per input article" in RANKING_PROMPT
+        assert "matched by id, not by position" in RANKING_PROMPT
+        assert "JSON array" not in RANKING_PROMPT
 
 
 class TestDebateSystemMessages:

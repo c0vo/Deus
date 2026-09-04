@@ -38,6 +38,7 @@ export interface SSEOptions {
   onMarketTicker?: (data: any) => void;
   onSentimentDistribution?: (data: any) => void;
   onEmbeddingStatus?: (data: any) => void;
+  onThesisUpdate?: (data: any) => void;
   onError?: (error: string) => void;
   onReconnect?: () => void;
 }
@@ -110,7 +111,7 @@ export function useBrainSSE(options: SSEOptions) {
               continue;
             }
 
-            const { onSnapshot, onPipelineStatus, onNewArticles, onSectorHeatmap, onRotationSignal, onIpoAlert, onEventsUpdated, onTrendForecast, onHotTickers, onMarketTicker, onSentimentDistribution, onEmbeddingStatus, onReconnect } = optionsRef.current;
+            const { onSnapshot, onPipelineStatus, onNewArticles, onSectorHeatmap, onRotationSignal, onIpoAlert, onEventsUpdated, onTrendForecast, onHotTickers, onMarketTicker, onSentimentDistribution, onEmbeddingStatus, onThesisUpdate, onReconnect } = optionsRef.current;
 
             switch (currentEvent) {
               case "snapshot":
@@ -149,6 +150,9 @@ export function useBrainSSE(options: SSEOptions) {
                 break;
               case "embedding_status":
                 onEmbeddingStatus?.(data);
+                break;
+              case "thesis_update":
+                onThesisUpdate?.(data);
                 break;
               case "heartbeat":
                 // keep-alive, no action needed

@@ -3,7 +3,16 @@ import asyncio
 import numpy as np
 from unittest.mock import MagicMock, patch, AsyncMock
 from pipeline.chat_orchestrator import ChatOrchestrator, ChatState
-from google.genai import types
+from tests.conftest import make_llm_response
+
+
+@pytest.fixture(autouse=True)
+def _models_configured(monkeypatch):
+    """Every test here assumes the chat lane has models assigned."""
+    monkeypatch.setattr("pipeline.chat_orchestrator.is_llm_configured", lambda: True)
+    monkeypatch.setattr("pipeline.chat_orchestrator.settings.model_router", "test/router")
+    monkeypatch.setattr("pipeline.chat_orchestrator.settings.model_chat_shallow", "test/shallow")
+    monkeypatch.setattr("pipeline.chat_orchestrator.settings.model_chat_complex", "test/complex")
 
 @pytest.fixture
 def mock_db():
@@ -36,14 +45,8 @@ async def test_router_node_shallow():
     
     state: ChatState = {"query": "What is AAPL?", "context": "", "routing_decision": "", "final_answer": ""}
     
-    with patch("pipeline.chat_orchestrator.get_client") as mock_get_client:
-        mock_client = MagicMock()
-        mock_resp = MagicMock()
-        mock_resp.text = '{"decision": "shallow"}'
-        mock_resp.usage_metadata = None
-        mock_client.models.generate_content.return_value = mock_resp
-        mock_get_client.return_value = mock_client
-        
+    with patch("pipeline.chat_orchestrator.complete",
+               AsyncMock(return_value=make_llm_response('{"decision": "shallow"}'))):
         result = await orchestrator.router_node(state)
         assert result["routing_decision"] == "shallow"
 
@@ -54,14 +57,8 @@ async def test_router_node_complex():
     
     state: ChatState = {"query": "Deep fundamental analysis of TSLA", "context": "", "routing_decision": "", "final_answer": ""}
     
-    with patch("pipeline.chat_orchestrator.get_client") as mock_get_client:
-        mock_client = MagicMock()
-        mock_resp = MagicMock()
-        mock_resp.text = '{"decision": "complex"}'
-        mock_resp.usage_metadata = None
-        mock_client.models.generate_content.return_value = mock_resp
-        mock_get_client.return_value = mock_client
-        
+    with patch("pipeline.chat_orchestrator.complete",
+               AsyncMock(return_value=make_llm_response('{"decision": "complex"}'))):
         result = await orchestrator.router_node(state)
         assert result["routing_decision"] == "complex"
 
@@ -87,31 +84,24 @@ async def test_agent_nodes(mock_db):
     
     state: ChatState = {"query": "Test", "context": "Context", "routing_decision": "shallow", "final_answer": ""}
     
-    with patch("pipeline.chat_orchestrator.get_client") as mock_get_client:
-        mock_client = MagicMock()
-        mock_resp = MagicMock()
-        mock_resp.text = 'Shallow Answer'
-        mock_resp.usage_metadata = None
-        mock_client.models.generate_content.return_value = mock_resp
-        mock_get_client.return_value = mock_client
-        
+    mock_complete = AsyncMock(return_value=make_llm_response("Shallow Answer"))
+    with patch("pipeline.chat_orchestrator.complete", mock_complete):
         # Test shallow agent
         result = await orchestrator.shallow_agent_node(state)
         assert result["final_answer"] == "Shallow Answer"
-        
-        # Ensure thinking_config is NOT passed for shallow
-        call_kwargs = mock_client.models.generate_content.call_args[1]
-        assert 'thinking_config' not in call_kwargs['config']
-        
+
+        # The shallow lane must not ask for reasoning — that is the whole
+        # point of routing to it.
+        assert mock_complete.await_args.kwargs["reasoning"] is None
+        assert mock_complete.await_args.kwargs["model"] == "test/shallow"
+
         # Test complex agent
-        mock_resp.text = 'Complex Answer'
+        mock_complete.return_value = make_llm_response("Complex Answer")
         result = await orchestrator.complex_agent_node(state)
         assert result["final_answer"] == "Complex Answer"
-        
-        # Ensure thinking_config IS passed for complex
-        call_kwargs = mock_client.models.generate_content.call_args[1]
-        assert 'thinking_config' in call_kwargs['config']
-        assert call_kwargs['config']['thinking_config'].thinking_level == types.ThinkingLevel.MEDIUM
+
+        assert mock_complete.await_args.kwargs["reasoning"] == "medium"
+        assert mock_complete.await_args.kwargs["model"] == "test/complex"
 
 @pytest.mark.asyncio
 async def test_end_to_end_graph(mock_db):
@@ -120,21 +110,12 @@ async def test_end_to_end_graph(mock_db):
     mock_embedder._initialized = True
     orchestrator = ChatOrchestrator(mock_db, embedder=mock_embedder)
     
-    with patch("pipeline.chat_orchestrator.get_client") as mock_get_client:
-        mock_client = MagicMock()
-        
-        def mock_generate_content(*args, **kwargs):
-            mock_resp = MagicMock()
-            mock_resp.usage_metadata = None
-            prompt_content = kwargs.get('contents', '')
-            if isinstance(prompt_content, str) and 'decision' in prompt_content:
-                mock_resp.text = '{"decision": "complex"}'
-            else:
-                mock_resp.text = "Final Complex Answer"
-            return mock_resp
-            
-        mock_client.models.generate_content.side_effect = mock_generate_content
-        mock_get_client.return_value = mock_client
-        
+    async def fake_complete(**kwargs):
+        prompt = kwargs.get("prompt") or ""
+        if "decision" in prompt:
+            return make_llm_response('{"decision": "complex"}')
+        return make_llm_response("Final Complex Answer")
+
+    with patch("pipeline.chat_orchestrator.complete", side_effect=fake_complete):
         answer = await orchestrator.run("Test full graph execution")
         assert answer == "Final Complex Answer"

@@ -1,0 +1,417 @@
+{
+  "statusType": "OK",
+  "entity": {
+    "total_volume": [
+      {
+        "exchange": "AMEX ",
+        "calls": 4189172,
+        "puts": 3097007,
+        "ratio": 0.74,
+        "volume": 7286179,
+        "market_share": 9.24
+      },
+      {
+        "exchange": "ARCA ",
+        "calls": 4791333,
+        "puts": 3062088,
+        "ratio": 0.64,
+        "volume": 7853421,
+        "market_share": 9.96
+      },
+      {
+        "exchange": "BATS ",
+        "calls": 1946611,
+        "puts": 1092707,
+        "ratio": 0.56,
+        "volume": 3039318,
+        "market_share": 3.85
+      },
+      {
+        "exchange": "BOX  ",
+        "calls": 2248096,
+        "puts": 1418141,
+        "ratio": 0.63,
+        "volume": 3666237,
+        "market_share": 4.65
+      },
+      {
+        "exchange": "C2   ",
+        "calls": 911616,
+        "puts": 726597,
+        "ratio": 0.8,
+        "volume": 1638213,
+        "market_share": 2.08
+      },
+      {
+        "exchange": "CBOE ",
+        "calls": 7991068,
+        "puts": 6075839,
+        "ratio": 0.76,
+        "volume": 14066907,
+        "market_share": 17.83
+      },
+      {
+        "exchange": "EDGX ",
+        "calls": 2990692,
+        "puts": 1464953,
+        "ratio": 0.49,
+        "volume": 4455645,
+        "market_share": 5.65
+      },
+      {
+        "exchange": "EMLD ",
+        "calls": 1304212,
+        "puts": 823979,
+        "ratio": 0.63,
+        "volume": 2128191,
+        "market_share": 2.7
+      },
+      {
+        "exchange": "GEM  ",
+        "calls": 1434607,
+        "puts": 938044,
+        "ratio": 0.65,
+        "volume": 2372651,
+        "market_share": 3.01
+      },
+      {
+        "exchange": "ISE  ",
+        "calls": 3266949,
+        "puts": 2132995,
+        "ratio": 0.65,
+        "volume": 5399944,
+        "market_share": 6.85
+      },
+      {
+        "exchange": "MCRY ",
+        "calls": 1483827,
+        "puts": 1005942,
+        "ratio": 0.68,
+        "volume": 2489769,
+        "market_share": 3.16
+      },
+      {
+        "exchange": "MEMX ",
+        "calls": 1546850,
+        "puts": 1015058,
+        "ratio": 0.66,
+        "volume": 2561908,
+        "market_share": 3.25
+      },
+      {
+        "exchange": "MIAX ",
+        "calls": 4481495,
+        "puts": 3017856,
+        "ratio": 0.67,
+        "volume": 7499351,
+        "market_share": 9.51
+      },
+      {
+        "exchange": "MPRL ",
+        "calls": 857201,
+        "puts": 559536,
+        "ratio": 0.65,
+        "volume": 1416737,
+        "market_share": 1.8
+      },
+      {
+        "exchange": "NOBO ",
+        "calls": 480321,
+        "puts": 364327,
+        "ratio": 0.76,
+        "volume": 844648,
+        "market_share": 1.07
+      },
+      {
+        "exchange": "NSDQ ",
+        "calls": 855224,
+        "puts": 591966,
+        "ratio": 0.69,
+        "volume": 1447190,
+        "market_share": 1.83
+      },
+      {
+        "exchange": "PHLX ",
+        "calls": 4974328,
+        "puts": 3035396,
+        "ratio": 0.61,
+        "volume": 8009724,
+        "market_share": 10.15
+      },
+      {
+        "exchange": "SPHR ",
+        "calls": 1785930,
+        "puts": 917074,
+        "ratio": 0.51,
+        "volume": 2703004,
+        "market_share": 3.43
+      },
+      {
+        "exchange": "Total",
+        "calls": 47539532,
+        "puts": 31339505,
+        "ratio": 0.66,
+        "volume": 78879037,
+        "market_share": 100.0
+      }
+    ],
+    "equity_volume": [
+      {
+        "exchange": "AMEX ",
+        "calls": 4188898,
+        "puts": 3096456,
+        "ratio": 0.74,
+        "volume": 7285354,
+        "market_share": 9.96
+      },
+      {
+        "exchange": "ARCA ",
+        "calls": 4790070,
+        "puts": 3056992,
+        "ratio": 0.64,
+        "volume": 7847062,
+        "market_share": 10.73
+      },
+      {
+        "exchange": "BATS ",
+        "calls": 1946349,
+        "puts": 1091563,
+        "ratio": 0.56,
+        "volume": 3037912,
+        "market_share": 4.15
+      },
+      {
+        "exchange": "BOX  ",
+        "calls": 2248096,
+        "puts": 1418141,
+        "ratio": 0.63,
+        "volume": 3666237,
+        "market_share": 5.01
+      },
+      {
+        "exchange": "C2   ",
+        "calls": 908770,
+        "puts": 718457,
+        "ratio": 0.79,
+        "volume": 1627227,
+        "market_share": 2.22
+      },
+      {
+        "exchange": "CBOE ",
+        "calls": 5150560,
+        "puts": 3293329,
+        "ratio": 0.64,
+        "volume": 8443889,
+        "market_share": 11.54
+      },
+      {
+        "exchange": "EDGX ",
+        "calls": 2990692,
+        "puts": 1464953,
+        "ratio": 0.49,
+        "volume": 4455645,
+        "market_share": 6.09
+      },
+      {
+        "exchange": "EMLD ",
+        "calls": 1304212,
+        "puts": 823979,
+        "ratio": 0.63,
+        "volume": 2128191,
+        "market_share": 2.91
+      },
+      {
+        "exchange": "GEM  ",
+        "calls": 1434521,
+        "puts": 937957,
+        "ratio": 0.65,
+        "volume": 2372478,
+        "market_share": 3.24
+      },
+      {
+        "exchange": "ISE  ",
+        "calls": 3247587,
+        "puts": 2110741,
+        "ratio": 0.65,
+        "volume": 5358328,
+        "market_share": 7.32
+      },
+      {
+        "exchange": "MCRY ",
+        "calls": 1483827,
+        "puts": 1005942,
+        "ratio": 0.68,
+        "volume": 2489769,
+        "market_share": 3.4
+      },
+      {
+        "exchange": "MEMX ",
+        "calls": 1546850,
+        "puts": 1015058,
+        "ratio": 0.66,
+        "volume": 2561908,
+        "market_share": 3.5
+      },
+      {
+        "exchange": "MIAX ",
+        "calls": 4481495,
+        "puts": 3017856,
+        "ratio": 0.67,
+        "volume": 7499351,
+        "market_share": 10.25
+      },
+      {
+        "exchange": "MPRL ",
+        "calls": 857201,
+        "puts": 559536,
+        "ratio": 0.65,
+        "volume": 1416737,
+        "market_share": 1.94
+      },
+      {
+        "exchange": "NOBO ",
+        "calls": 480321,
+        "puts": 364327,
+        "ratio": 0.76,
+        "volume": 844648,
+        "market_share": 1.15
+      },
+      {
+        "exchange": "NSDQ ",
+        "calls": 855224,
+        "puts": 591966,
+        "ratio": 0.69,
+        "volume": 1447190,
+        "market_share": 1.98
+      },
+      {
+        "exchange": "PHLX ",
+        "calls": 4954568,
+        "puts": 3013274,
+        "ratio": 0.61,
+        "volume": 7967842,
+        "market_share": 10.89
+      },
+      {
+        "exchange": "SPHR ",
+        "calls": 1785930,
+        "puts": 917074,
+        "ratio": 0.51,
+        "volume": 2703004,
+        "market_share": 3.69
+      },
+      {
+        "exchange": "Total",
+        "calls": 44655171,
+        "puts": 28497601,
+        "ratio": 0.64,
+        "volume": 73152772,
+        "market_share": 100.0
+      }
+    ],
+    "index_volume": [
+      {
+        "exchange": "AMEX ",
+        "calls": 274,
+        "puts": 551,
+        "ratio": 2.01,
+        "volume": 825,
+        "market_share": 0.01
+      },
+      {
+        "exchange": "ARCA ",
+        "calls": 1263,
+        "puts": 5096,
+        "ratio": 4.03,
+        "volume": 6359,
+        "market_share": 0.11
+      },
+      {
+        "exchange": "BATS ",
+        "calls": 262,
+        "puts": 1144,
+        "ratio": 4.37,
+        "volume": 1406,
+        "market_share": 0.02
+      },
+      {
+        "exchange": "C2   ",
+        "calls": 2846,
+        "puts": 8140,
+        "ratio": 2.86,
+        "volume": 10986,
+        "market_share": 0.19
+      },
+      {
+        "exchange": "CBOE ",
+        "calls": 2840508,
+        "puts": 2782510,
+        "ratio": 0.98,
+        "volume": 5623018,
+        "market_share": 98.2
+      },
+      {
+        "exchange": "GEM  ",
+        "calls": 86,
+        "puts": 87,
+        "ratio": 1.01,
+        "volume": 173,
+        "market_share": 0.0
+      },
+      {
+        "exchange": "ISE  ",
+        "calls": 19362,
+        "puts": 22254,
+        "ratio": 1.15,
+        "volume": 41616,
+        "market_share": 0.73
+      },
+      {
+        "exchange": "PHLX ",
+        "calls": 19760,
+        "puts": 22122,
+        "ratio": 1.12,
+        "volume": 41882,
+        "market_share": 0.73
+      },
+      {
+        "exchange": "Total",
+        "calls": 2884361,
+        "puts": 2841904,
+        "ratio": 0.99,
+        "volume": 5726265,
+        "market_share": 100.0
+      }
+    ],
+    "debt_volume": [],
+    "futures_volume": [
+      {
+        "exchange": "CFE  ",
+        "equity_volume": 0,
+        "index_volume": 169401,
+        "oof_volume": 24,
+        "total_volume": 169425,
+        "market_share": 98.03
+      },
+      {
+        "exchange": "XMFE ",
+        "equity_volume": 0,
+        "index_volume": 3397,
+        "oof_volume": 0,
+        "total_volume": 3397,
+        "market_share": 1.97
+      },
+      {
+        "exchange": "Total",
+        "equity_volume": 0,
+        "index_volume": 172798,
+        "oof_volume": 24,
+        "total_volume": 172822,
+        "market_share": 100.0
+      }
+    ]
+  },
+  "entityType": "com.theocc.data.api.pojo.ExchangeVolumeData",
+  "status": 200,
+  "metadata": {}
+}

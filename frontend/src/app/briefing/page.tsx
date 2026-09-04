@@ -87,7 +87,7 @@ function BriefingContent() {
   );
 
   return (
-    <div className="p-5 flex flex-col gap-4">
+    <div className="p-4 md:p-5 flex flex-col gap-4">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Briefing</h1>
@@ -96,7 +96,7 @@ function BriefingContent() {
             ranked by importance
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <div className="seg" role="tablist">
             {WINDOWS.map((w) => (
               <button

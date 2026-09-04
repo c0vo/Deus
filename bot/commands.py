@@ -6,22 +6,19 @@ Handlers for commands like /start, /status, /trending.
 
 from __future__ import annotations
 
-import asyncio
 import datetime
 import html
 import json
 import re
-import time
 
 import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from google.genai import types
 from config.logging_config import get_logger
 from config.settings import settings
 from data.database import Database
-from bot.formatters import escape_html
+from bot.formatters import EMPTY_BRIEFING_TEXT, chunk_html, escape_html, render_briefing
 
 log = get_logger(__name__)
 fallback_db = Database()
@@ -131,7 +128,14 @@ async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             text += "<i>No usage data recorded in the last 7 days.</i>\n\n"
             
-        text += "\n<i>Based on standard Gemini API pricing</i>"
+        # Real billed cost now, not an estimate from a hand-maintained price
+        # table — except for calls the provider reported nothing for, which are
+        # recorded as $0.00 and counted here so they cannot deflate the total
+        # unnoticed.
+        text += "\n<i>Actual cost as billed by OpenRouter</i>"
+        unpriced = usage.get("unpriced_calls") or 0
+        if unpriced:
+            text += f"\n<i>⚠️ {unpriced} call(s) reported no cost, counted as $0.00</i>"
             
         await update.message.reply_html(text)
         
@@ -155,120 +159,37 @@ async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except ValueError:
                 pass
                 
-        trending_tickers = db.get_top_trending_tickers(hours=hours, limit=15)
-        
-        if not trending_tickers:
+        await update.message.reply_text(f"🔄 Fetching top trending tickers (last {hours}h) and generating AI summaries...")
+
+        # Shares its 24h cache with /api/trending, so this usually costs nothing.
+        from pipeline.trending import get_trending_with_summaries
+        trending, _ = await get_trending_with_summaries(db, hours=hours, limit=15)
+
+        if not trending:
             await update.message.reply_text(f"No trending tickers found in the last {hours} hours.")
             return
-            
-        await update.message.reply_text(f"🔄 Fetching top trending tickers (last {hours}h) and generating AI summaries...")
-            
+
         text = f"<b>📈 Top 15 Trending Tickers (Last {hours}h)</b>\n\n"
-        
-        from config.llm import get_client, parse_structured, DEFAULT_SAFETY_SETTINGS
-        from data.models import TickerNote, notes_to_dict
-        client = get_client()
-        loop = asyncio.get_running_loop()
-        
-        # 1. Collect all context first
-        all_ticker_contexts = {}
-        for t in trending_tickers:
-            ticker_name = t['ticker']
-            summaries = db.get_recent_summaries_for_ticker(ticker_name, hours=hours)
-            if summaries:
-                all_ticker_contexts[ticker_name] = summaries
-                    
-        # 2. Make a single batch LLM call
-        ai_summaries = {}
-        if client and all_ticker_contexts:
-            prompt = (
-                f"You are a Professional, precise, and highly analytical Wall Street analyst.\n"
-                f"Below is a list of trending tickers and their recent news summaries.\n"
-                f"For EACH ticker, write a concise 1-sentence explanation of exactly why it is trending based ONLY on the context.\n"
-                f"You MUST include an exact quote from the context if available. Do NOT use emojis.\n"
-                f"Do NOT use markdown or HTML tags in your summaries. Just plain text.\n"
-                f"Return one entry per ticker in the required response schema.\n\n"
-            )
-            for tk, sums in all_ticker_contexts.items():
-                prompt += f"Ticker: {tk}\nContext:\n" + "\n".join(f"- {s}" for s in sums) + "\n\n"
-                
-            def ask_batch_llm():
-                start_time = time.time()
-                is_error = False
-                error_msg = None
-                response_text = None
-                try:
-                    response = client.models.generate_content(
-                        model=settings.gemini_model_chat,
-                        contents=prompt,
-                        config={
-                            'safety_settings': DEFAULT_SAFETY_SETTINGS,
-                            'response_mime_type': 'application/json',
-                            'response_schema': list[TickerNote],
-                            'thinking_config': types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
-                        }
-                    )
-                    response_text = response.text
-                except Exception as e:
-                    is_error = True
-                    error_msg = str(e)
-                    raise
-                finally:
-                    latency_ms = int((time.time() - start_time) * 1000)
-                    if not is_error and response and response.usage_metadata:
-                        db.log_llm_usage(
-                            model_name=settings.gemini_model_chat,
-                            operation="trending_summary_batch",
-                            prompt_tokens=response.usage_metadata.prompt_token_count,
-                            candidate_tokens=response.usage_metadata.candidates_token_count,
-                            latency_ms=latency_ms,
-                            is_error=False,
-                            error_message=None,
-                            prompt_text=prompt,
-                            response_text=response_text
-                        )
-                    elif is_error:
-                        db.log_llm_usage(
-                            model_name=settings.gemini_model_chat,
-                            operation="trending_summary_batch",
-                            prompt_tokens=0,
-                            candidate_tokens=0,
-                            latency_ms=latency_ms,
-                            is_error=True,
-                            error_message=error_msg,
-                            prompt_text=prompt,
-                            response_text=None
-                        )
-                if isinstance(response.parsed, list):
-                    return notes_to_dict(response.parsed)
-                return notes_to_dict(parse_structured(response.text, list[TickerNote]))
 
-            try:
-                ai_summaries = await loop.run_in_executor(None, ask_batch_llm)
-            except Exception as e:
-                log.error("trending.batch_summary_failed", error=str(e))
-
-        # 3. Construct the message
         all_tickers = []
         all_sentiments = []
-        for i, t in enumerate(trending_tickers, 1):
+        for i, t in enumerate(trending, 1):
             avg_sent = t['avg_sentiment'] or 0.0
             emoji = "🟢" if avg_sent > 0.2 else "🔴" if avg_sent < -0.2 else "⚪"
             ticker_name = t['ticker']
             text += f"<b>{i}. ${ticker_name}</b> - {t['mention_count']} mentions {emoji}\n"
-            
-            if ticker_name in all_ticker_contexts:
-                summary = ai_summaries.get(ticker_name.upper())
-                if summary:
-                    text += f"   <i>Summary:</i> {escape_html(summary)}\n\n"
-                else:
-                    text += "   <i>(Summary failed)</i>\n\n"
-            else:
+
+            if not t.get("has_context"):
                 text += "   <i>(No news context)</i>\n\n"
-                
+            elif t["summary"] == "No AI summary available.":
+                text += "   <i>(Summary failed)</i>\n\n"
+            else:
+                text += f"   <i>Summary:</i> {escape_html(t['summary'])}\n\n"
+
             all_tickers.append(ticker_name)
             all_sentiments.append(avg_sent)
-                
+
+
         # Send text first to avoid 1024 char caption limit
         await update.message.reply_html(text)
         
@@ -371,9 +292,15 @@ async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                                 cache_date = cached_adv.get("_cache_date", "Unknown")
                                 adv_str = f"\n  Exec Summary: {exec_summary}\n  [Cached : {cache_date}]"
                         else:
-                            adv_str = f"\n  Exec Summary: [Generating AI Advisory... check back later]"
-                            asyncio.create_task(predictor.predict_with_agents(t))
-                            
+                            # No prefetch here on purpose. The 08:30 daily job
+                            # (run_daily_predictions) already refreshes every
+                            # tracked ticker behind the same 5-day cache, one at
+                            # a time. Firing predict_with_agents per uncached
+                            # ticker made /markets an unbounded fan-out of 5-6
+                            # call debates whose results this reply never showed.
+                            adv_str = f"\n  Exec Summary: [No advisory yet — run /predict {t}]"
+
+
                         sector_results[sector].append(f"<b>{t}</b> • ${current:.2f} • {sign}{pct_diff:.2f}% {emoji}{pred_str}{adv_str}")
                         
                         pct_diffs.append(round(pct_diff, 2))
@@ -450,25 +377,20 @@ async def briefing_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     await update.message.reply_text("📰 Generating Market Briefing...")
-    
+
     try:
+        from data.taxonomy import BRIEFING_MIN_IMPORTANCE, select_briefing_lanes
+
         db = get_db(context)
-        
-        briefing = db.get_briefing_by_sector(hours=24, limit=10)
-        if not briefing:
-            await update.message.reply_text("No ranked articles found in the last 24 hours for a briefing.")
-            return
-            
-        text = "<b>📰 Daily Market Briefing</b>\n\n"
-        for sector, articles in briefing.items():
-            text += f"<b>--- {escape_html(sector)} ---</b>\n"
-            for r in articles:
-                score = r["importance_score"]
-                text += f"🔹 <b>{escape_html(r['headline'])}</b> (Score: {score})\n"
-                text += f"<i>{escape_html(r['classification_summary'] or r['summary'])}</i>\n"
-                text += f"<a href='{escape_html(r['url'])}'>Read more</a>\n\n"
-            
-        await update.message.reply_html(text, disable_web_page_preview=True)
+
+        rows = db.get_briefing_candidates(
+            hours=24, min_importance=BRIEFING_MIN_IMPORTANCE, limit=40
+        )
+        lanes = select_briefing_lanes(rows)
+        text = render_briefing(lanes) if lanes else EMPTY_BRIEFING_TEXT
+
+        for chunk in chunk_html(text):
+            await update.message.reply_html(chunk, disable_web_page_preview=True)
     except Exception as e:
         log.error("telegram.briefing_failed", error=str(e))
         await update.message.reply_text("❌ Failed to generate briefing.")
@@ -551,19 +473,6 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             text = re.sub(r'(?m)^\*\s+', r'• ', text)
             text = re.sub(r'(?m)^-\s+', r'• ', text)
             return text
-
-        def chunk_html(text: str, limit=3800) -> list[str]:
-            chunks = []
-            paragraphs = text.split('\n\n')
-            chunk = ""
-            for p in paragraphs:
-                if len(chunk) + len(p) > limit:
-                    chunks.append(chunk.strip())
-                    chunk = ""
-                chunk += p + "\n\n"
-            if chunk.strip():
-                chunks.append(chunk.strip())
-            return chunks
 
         if not force:
             cached = db.get_cached_advisory(ticker, days=5)
@@ -815,7 +724,7 @@ async def forecast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         db = get_db(context)
         from pipeline.trend_forecaster import TrendForecaster
         forecaster = TrendForecaster(db)
-        forecast = await forecaster._generate_sector_outlook(sector)
+        forecast = await forecaster.get_sector_outlook(sector)
 
         if not forecast:
             await update.message.reply_text(f"📊 No forecast available for '{sector}'.")

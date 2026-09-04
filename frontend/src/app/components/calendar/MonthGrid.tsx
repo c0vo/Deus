@@ -73,8 +73,10 @@ export default function MonthGrid({
                 year: "numeric",
               })}, ${items.length} ${items.length === 1 ? "item" : "items"}`}
               onClick={() => onSelect(iso)}
-              className={`flex flex-col gap-1 p-1.5 text-left transition-colors ${
-                dense ? "min-h-[220px]" : "min-h-[84px]"
+              className={`flex flex-col gap-1 p-1 md:p-1.5 text-left transition-colors ${
+                dense
+                  ? "min-h-[150px] md:min-h-[220px]"
+                  : "min-h-[56px] md:min-h-[84px]"
               } ${
                 isSelected
                   ? "bg-bg-surface-hover"
@@ -95,23 +97,34 @@ export default function MonthGrid({
                 {day.getDate()}
               </span>
 
-              {items.slice(0, maxRows).map((item) => (
+              {items.length > 0 && (
                 <span
-                  key={item.id}
-                  className="flex items-center gap-1 min-w-0 text-[10px] leading-tight text-terminal-text"
+                  aria-hidden="true"
+                  className="md:hidden num text-[10px] font-semibold text-terminal-signal"
                 >
-                  <KindMark kind={item.kind} confidence={item.confidence} />
-                  <span className="num truncate">
-                    {item.ticker || item.title}
-                  </span>
-                </span>
-              ))}
-
-              {items.length > maxRows && (
-                <span className="num text-[10px] text-terminal-muted-alt">
-                  +{items.length - maxRows}
+                  {items.length}
                 </span>
               )}
+
+              <span className="hidden md:contents">
+                {items.slice(0, maxRows).map((item) => (
+                  <span
+                    key={item.id}
+                    className="flex items-center gap-1 min-w-0 text-[10px] leading-tight text-terminal-text"
+                  >
+                    <KindMark kind={item.kind} confidence={item.confidence} />
+                    <span className="num truncate">
+                      {item.ticker || item.title}
+                    </span>
+                  </span>
+                ))}
+
+                {items.length > maxRows && (
+                  <span className="num text-[10px] text-terminal-muted-alt">
+                    +{items.length - maxRows}
+                  </span>
+                )}
+              </span>
             </button>
           );
         })}

@@ -15,6 +15,11 @@
    ============================================================================ */
 
 :root {
+  /* Native controls — <select> popups, scrollbars, form widgets — follow the
+     app theme. Set here rather than via viewport.colorScheme because the theme
+     is a class from localStorage, not the OS prefers-color-scheme setting. */
+  color-scheme: dark;
+
   /* ── Surface ladder ── */
   --background: #0b0d10;      /* page ground */
   --panel: #12151a;           /* card — rises toward the light */
@@ -65,6 +70,8 @@
 
 /* ===== Light theme ===== */
 :root.light {
+  color-scheme: light;
+
   --background: #f4f6f9;
   --panel: #ffffff;
   --surface: #edf0f5;
@@ -150,6 +157,74 @@
   --animate-shake: shake 0.4s ease-in-out;
 }
 
+/* ============================================================================
+   Mobile utilities
+
+   No --breakpoint-xs is defined on purpose. xs would land at 24rem/384px, and
+   390 > 384 while 360 < 384 — so it would apply on some Android phones and not
+   others. Base classes ARE the mobile styles; `md:` restores desktop. Reach for
+   `max-md:` if something ever needs to be phone-only.
+   ============================================================================ */
+
+/* Used in 6 places (chat, predict) and never defined until now — it was
+   compiling to nothing. */
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+  &::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  &::-webkit-scrollbar-thumb {
+    background-color: var(--border);
+    border-radius: 999px;
+  }
+}
+
+/* Grows the *touch* target to 44px without moving a visible pixel — the
+   painted box stays 28px. This is how the 13px/11px density survives on a
+   phone. For dense chips and icon toggles where growing the control would
+   wreck the layout. Only use it where vertical neighbours are >=44px apart,
+   or one halo will cover another and steal its taps. */
+@utility tap-halo {
+  position: relative;
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 50% -6px auto -6px;
+    height: 44px;
+    transform: translateY(-50%);
+  }
+}
+
+/* Honest growth, for controls where growing IS the right answer. */
+@utility tap {
+  min-height: 44px;
+}
+@utility tap-sq {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+/* Named safe-* rather than pb-safe so they cannot collide with Tailwind's
+   functional pb-<value> namespace. Non-zero only because the viewport export
+   sets viewportFit: "cover". */
+@utility safe-b {
+  padding-bottom: max(0px, env(safe-area-inset-bottom));
+}
+@utility safe-t {
+  padding-top: max(0px, env(safe-area-inset-top));
+}
+@utility safe-x {
+  padding-left: max(0px, env(safe-area-inset-left));
+  padding-right: max(0px, env(safe-area-inset-right));
+}
+
+html {
+  /* Stops Chrome Android font-boosting from inflating the 13px/11px scale. */
+  -webkit-text-size-adjust: 100%;
+}
+
 body {
   background:
     radial-gradient(120% 60% at 50% -10%, var(--glow), transparent 60%),
@@ -160,6 +235,10 @@ body {
   line-height: 1.5;
   margin: 0;
   padding: 0;
+  /* Tailwind gates hover: behind @media (hover: hover), so every
+     hover:bg-bg-surface in this codebase is dead on a touch device. Without
+     this, taps give no feedback at all beyond Chrome's grey flash. */
+  -webkit-tap-highlight-color: color-mix(in srgb, var(--signal) 18%, transparent);
 }
 
 :focus-visible {
@@ -415,6 +494,43 @@ body {
    before. The explicit opt-out is the separate [data-motion="off"] rule below,
    which is a full freeze — that one is a deliberate choice by the user rather
    than an inference from an OS setting, so it is allowed to stop everything. */
+/* ============================================================================
+   Mobile (< md)
+
+   Written as (width < 48rem) to mirror --breakpoint-md literally, so it can
+   never drift from the Tailwind token. This is the only width-based media
+   query in the project — everything else is a Tailwind prefix.
+
+   Nothing here changes the reading type scale. Form controls go to 16px purely
+   because Chrome auto-zooms the page on focus below that, and the padding
+   bumps grow hit areas on the shared primitives so all 10 pages inherit 44px
+   controls without a single per-page edit.
+   ============================================================================ */
+@media (width < 48rem) {
+  /* Deliberately not solved with viewport maximumScale/userScalable, which
+     would disable pinch-zoom entirely. */
+  input:not([type="checkbox"]):not([type="radio"]),
+  select,
+  textarea {
+    font-size: 16px;
+  }
+
+  /* 11px x 1.5 = 16.5px content. Button reaches 40.5px, and .seg's own 2px
+     padding brings the control to 44.5px. */
+  .seg > button {
+    padding: 12px 10px;
+  }
+
+  /* 16.5 + 26 padding + 2 border = 44.5px. */
+  .btn-ghost {
+    padding: 13px 12px;
+  }
+
+  .pill {
+    height: 30px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   :root:not([data-motion="on"]) .animate-fadeIn,
   :root:not([data-motion="on"]) .animate-slideUp,

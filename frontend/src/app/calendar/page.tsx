@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo, Suspense } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, Suspense } from "react";
 import { getApiUrl } from "../utils/api";
 import MonthGrid, { CalendarItem } from "../components/calendar/MonthGrid";
 import DayAgenda, { EventRow } from "../components/calendar/DayAgenda";
@@ -34,6 +34,17 @@ function CalendarContent() {
   const [anchor, setAnchor] = useState<Date>(() => new Date());
   const [mode, setMode] = useState<ViewMode>("month");
   const [selected, setSelected] = useState<string>(() => isoDate(new Date()));
+  // A 7-column month grid is unreadable on a phone, so default to the list
+  // view there. This has to be an effect, not a useState initializer: under
+  // output: "export" the HTML is frozen at build time as "month", and reading
+  // matchMedia during render would be a hydration mismatch. The ref means a
+  // later manual choice is never overridden.
+  const autoModeApplied = useRef(false);
+  useEffect(() => {
+    if (autoModeApplied.current) return;
+    autoModeApplied.current = true;
+    if (window.matchMedia("(width < 48rem)").matches) setMode("list");
+  }, []);
   const [data, setData] = useState<CalendarPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -121,7 +132,7 @@ function CalendarContent() {
   const finnhubMissing = data ? !data.sources.finnhub : false;
 
   return (
-    <div className="p-5 flex flex-col gap-4">
+    <div className="p-4 md:p-5 flex flex-col gap-4">
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Calendar</h1>
@@ -130,7 +141,7 @@ function CalendarContent() {
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center gap-1">
             <button
               type="button"

@@ -108,7 +108,7 @@ export default function SectorHeatmap({ sectors, onSectorClick }: SectorHeatmapP
                   setExpanded(isExpanded ? null : s.sector);
                   onSectorClick?.(s.sector);
                 }}
-                className="w-full grid grid-cols-[minmax(88px,108px)_1fr_52px] items-center gap-3 px-3.5 py-2.5 text-left hover:bg-bg-surface transition-colors"
+                className="w-full grid grid-cols-[minmax(72px,96px)_1fr_44px] gap-2 px-3 md:grid-cols-[minmax(88px,108px)_1fr_52px] md:gap-3 md:px-3.5 items-center py-2.5 text-left hover:bg-bg-surface transition-colors"
               >
                 <div className="min-w-0">
                   <div className="text-[13px] font-medium truncate">{s.sector}</div>

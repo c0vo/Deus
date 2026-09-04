@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from config.llm import get_deepseek_client, is_deepseek_configured
+from config.llm import complete, is_llm_configured
 from config.logging_config import get_logger
 from config.settings import settings
 from config.usage import track_llm
@@ -150,6 +150,33 @@ def build_ticker_search_query(ticker: str) -> str:
     return f"what is happening with {ticker} stock {month_str} news catalysts"
 
 
+def build_bottleneck_search_query(bottleneck: str, bottleneck_type: str = "") -> str:
+    """Build a search query for who supplies a specific chokepoint.
+
+    Distinct from build_ticker_search_query, which asks what is happening to a
+    symbol. Here there is no symbol yet — the whole point is to find one — so
+    the query is phrased around suppliers and market share, and dated so Tavily
+    prefers current sourcing over a years-old industry overview. The model's
+    own training data cannot answer this: who supplies what changes faster than
+    a training cut-off.
+    """
+    month_str = datetime.now(timezone.utc).strftime("%B %Y")
+    qualifier = {
+        "raw_material": "producers and reserves",
+        "capacity": "manufacturing capacity and lead times",
+        "energy": "equipment suppliers and grid operators",
+        "regulatory": "affected companies and license holders",
+        "logistics": "providers and capacity constraints",
+        "ip": "patent holders and licensors",
+        "talent": "employers competing for this skill set",
+        "capital": "lenders and financing providers",
+    }.get((bottleneck_type or "").strip().lower(), "leading suppliers")
+    return (
+        f"{bottleneck} — {qualifier}, publicly traded companies, "
+        f"market share {month_str}"
+    )
+
+
 SEARCH_SUMMARIZATION_PROMPT = """You are a financial news analyst. Below are raw web search results about {ticker}.
 
 For EACH article, write a concise 2-3 sentence factual summary. Focus on:
@@ -193,8 +220,7 @@ async def summarize_search_results(ticker: str, results: list[WebSearchResult], 
     if not results:
         return ""
 
-    client = get_deepseek_client()
-    if not client or not is_deepseek_configured():
+    if not is_llm_configured() or not settings.model_extract:
         log.info("web_search.no_llm_for_summary", fallback="truncated_content")
         return _fallback_format(results)
 
@@ -219,17 +245,17 @@ async def summarize_search_results(ticker: str, results: list[WebSearchResult], 
         # `db` is optional so the existing module-level callers keep working;
         # when supplied, this call stops being invisible in llm_usage_log. It
         # fires on every agent debate and every web-search-backed chat turn.
-        with track_llm(db, settings.deepseek_model_classifier, "web_search_summary") if db else nullcontext() as u:
-            response = await client.chat.completions.create(
-                model=settings.deepseek_model_classifier,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
+        with track_llm(db, settings.model_extract, "web_search_summary") if db else nullcontext() as u:
+            response = await complete(
+                model=settings.model_extract,
+                prompt=prompt,
+                json_mode=True,
                 temperature=0.0,
-                extra_body={"thinking": {"type": "disabled"}},
+                reasoning="none",
             )
             if u is not None:
                 u.response = response
-        text = response.choices[0].message.content.strip()
+        text = response.text.strip()
         summaries = json.loads(text)
 
         if isinstance(summaries, dict):

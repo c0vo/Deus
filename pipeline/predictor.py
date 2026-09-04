@@ -15,7 +15,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score, brier_score_loss, roc_auc_score
 
-from config.llm import get_client, parse_structured
+from config.llm import complete, is_llm_configured, parse_structured
 from config.settings import settings
 from config.usage import track_llm
 from config.logging_config import get_logger
@@ -77,7 +77,66 @@ def _sector_etf(sector: Optional[str]) -> Optional[str]:
 # on disk and a code revert brings them straight back.
 #   v1: the original 23 features (price, sentiment, market regime)
 #   v2: adds insider, >5%-stake and Korean investor-flow features
-FEATURE_SCHEMA_VERSION = 2
+#   v3: adds FINRA off-exchange (dark pool) volume and the market-wide
+#       DIX / GEX / OCC put-call regime series
+FEATURE_SCHEMA_VERSION = 3
+
+# The prediction horizons the dashboard renders, in days. Defined here rather
+# than in api/server.py because the worker's training jobs need them too, and
+# importing the API module into the worker process just to read a constant
+# pulled the whole FastAPI router in with it.
+HORIZON_LABELS = {
+    5: "5d",
+    21: "1m",
+    63: "3m",
+    252: "1y",
+}
+
+
+def _fit_and_score_fold(X_train, y_train, w_train, X_val, y_val):
+    """
+    Fit and score a single cross-validation fold.
+
+    Deliberately synchronous and module-level so train_model can hand it to a
+    worker thread — sklearn's fit yields nothing back to the event loop while
+    it runs.
+
+    Returns (accuracy, brier, auc):
+      * accuracy — fraction of correct UP/DOWN calls.
+      * brier    — mean squared error between predicted probability and
+                   outcome on the positive (UP) class. Lower is better, 0.0 is
+                   perfect; measures calibration and discrimination together.
+      * auc      — ability to rank UP days above DOWN days. 0.5 is random, and
+                   is also what we report for a single-class fold, where AUC
+                   is undefined.
+    """
+    if len(np.unique(y_train)) >= 2:
+        fold_model = GradientBoostingClassifier(
+            n_estimators=100, max_depth=4, learning_rate=0.05,
+            subsample=0.9, random_state=42
+        )
+    else:
+        fold_model = DummyClassifier(strategy="prior")
+    fold_model.fit(X_train, y_train, sample_weight=w_train)
+
+    y_pred = fold_model.predict(X_val)
+    y_proba = fold_model.predict_proba(X_val)
+
+    acc = accuracy_score(y_val, y_pred)
+    if y_proba.shape[1] == 2:
+        brier = brier_score_loss(y_val, y_proba[:, 1])
+    else:
+        brier = brier_score_loss(y_val, y_proba[:, 0])
+
+    try:
+        if len(np.unique(y_val)) > 1 and y_proba.shape[1] == 2:
+            auc = roc_auc_score(y_val, y_proba[:, 1])
+        else:
+            auc = 0.5
+    except ValueError:
+        auc = 0.5
+
+    return float(acc), float(brier), float(auc)
 
 
 class LlmPrediction(BaseModel):
@@ -137,6 +196,25 @@ FEATURE_DEFAULTS: Dict[str, float] = {
     "kr_inst_net_5d_norm": 0.0,
     "kr_foreign_net_5d_norm": 0.0,
     "kr_flow_momentum": 0.0,
+    # ── Off-exchange (dark pool) volume — FINRA CNMS, US only ──
+    # Detrended, never raw. Roughly 40% of the off-exchange tape is market-maker
+    # and retail-wholesaler hedging, so the level of each ratio is close to a
+    # per-ticker constant that carries no signal, and comparing it across
+    # tickers carries less than none. Every feature here is a deviation from the
+    # ticker's OWN trailing distribution, which makes the neutral default
+    # unambiguous: 0.0 means "sitting exactly on its own average".
+    "offexch_short_ratio_z20": 0.0,
+    "offexch_volume_share_z20": 0.0,
+    "offexch_short_ratio_mom": 0.0,
+    # ── Market-wide regime (global, like vix_level above) ──
+    # Z-scored rather than raw. GEX is ~8e9, six orders of magnitude above every
+    # other feature — gradient boosting is scale-invariant per split so it would
+    # not break training, but it would make every feature_snapshot JSON and
+    # feature-importance log unreadable. The put/call ratio gets the same
+    # treatment because no stable neutral level exists to default to.
+    "dix_z60": 0.0,
+    "gex_z60": 0.0,
+    "occ_put_call_ratio_z60": 0.0,
 }
 
 # Insider windows, in days.
@@ -145,6 +223,30 @@ _INSIDER_NET_WINDOW = 30
 _STAKE_ACTIVIST_WINDOW = 90
 _STAKE_ANY_WINDOW = 180
 _DAYS_SINCE_BUY_CAP = 180.0
+
+# Off-exchange windows, in sessions.
+_OFFEXCH_Z_WINDOW = 20
+_OFFEXCH_MOM_WINDOW = 5
+# Below this many visible sessions there is no distribution to z-score against.
+# Must stay above the z-window: _z_score requires a full window and returns
+# None otherwise, so a lower gate here would be dead code and the feature would
+# quietly never fire.
+_OFFEXCH_MIN_SESSIONS = _OFFEXCH_Z_WINDOW + 1
+# A z-score computed against a window that ended weeks ago is worse than the
+# neutral default, because it presents as a live reading. If the newest visible
+# session is staler than this, fall back to the defaults.
+_OFFEXCH_MAX_STALE_DAYS = 7
+
+# Market-regime z-score window, in sessions. Same invariant as above — the gate
+# has to clear the z-window or the feature never fires. DIX/GEX carry 15 years
+# of history and OCC backfills a session per request, so 60 is cheap to satisfy.
+_REGIME_Z_WINDOW = 60
+_REGIME_MIN_SESSIONS = _REGIME_Z_WINDOW + 1
+_REGIME_MAX_STALE_DAYS = 10
+# The regime series is market-wide, so it is cached under one sentinel key
+# rather than per ticker: loading it once per symbol would be N identical
+# full-table scans of the same rows.
+_REGIME_CACHE_KEY = "__market__"
 
 
 def _signed_log_scale(value: float, cap: float = 10.0) -> float:
@@ -162,6 +264,24 @@ def _signed_log_scale(value: float, cap: float = 10.0) -> float:
     return sign * min(math.log10(1.0 + abs(value)) / cap, 1.0)
 
 
+def _z_score(values: List[float], window: int) -> Optional[float]:
+    """Standard score of the newest value against its own trailing window.
+
+    Returns None on a short or flat window rather than 0.0. Both cases mean "no
+    deviation can be measured", which is not the same claim as "no deviation" —
+    and letting the caller fall through to the neutral default keeps that
+    distinction in one place instead of two.
+    """
+    if len(values) < window or window <= 0:
+        return None
+    tail = values[-window:]
+    mean = sum(tail) / window
+    variance = sum((v - mean) ** 2 for v in tail) / window
+    if variance <= 0:
+        return None
+    return (tail[-1] - mean) / math.sqrt(variance)
+
+
 
 class StockPredictor:
     def __init__(self, db: Database):
@@ -176,6 +296,9 @@ class StockPredictor:
         self._insider_cache: Dict[str, tuple] = {}
         self._stakes_cache: Dict[str, tuple] = {}
         self._kr_flow_cache: Dict[str, tuple] = {}
+        self._darkpool_cache: Dict[str, tuple] = {}
+        # Keyed by _REGIME_CACHE_KEY, not by ticker — see the constant.
+        self._regime_cache: Dict[str, tuple] = {}
         self._web_search_cache: Dict[str, tuple[float, str]] = {}
         self._web_search_cache_ttl: int = 3600  # 1 hour
 
@@ -415,6 +538,12 @@ class StockPredictor:
         ml_prediction = {
             "predicted_direction": direction,
             "confidence": confidence,
+            # Which tier answered, so the arena can say "no model trained"
+            # instead of printing the literal string UNKNOWN at 0% confidence.
+            # `_load_model` reports "llm_only" when nothing was found at any
+            # tier — which is every ticker for a horizon whose artifacts were
+            # orphaned by a FEATURE_SCHEMA_VERSION bump.
+            "model_type": model_type,
             "feature_snapshot": json.dumps(features or {})
         }
         
@@ -613,6 +742,9 @@ class StockPredictor:
         if market == US:
             out.update(self._insider_features(ticker, as_of, now))
             out.update(self._stake_features(ticker, as_of, now))
+            # FINRA's TRFs cover US equities and ETFs, so VOO and SPY belong
+            # here too — classify_market already returns US for them.
+            out.update(self._darkpool_features(ticker, as_of, now))
         elif market == KR:
             out.update(self._kr_flow_features(ticker, as_of))
         # Anything else (indices, crypto) keeps the defaults, and short-circuits
@@ -723,6 +855,106 @@ class StockPredictor:
             # Is the last week's flow accelerating relative to the month?
             "kr_flow_momentum": smart_5d - (smart_20d / 4.0),
         }
+
+    def _darkpool_features(self, ticker: str, as_of: Optional[datetime],
+                           now: datetime) -> dict:
+        """Off-exchange volume features for one as-of date.
+
+        Everything here is a z-score against the ticker's own trailing window,
+        never a level — see the FEATURE_DEFAULTS comment and the
+        pipeline.darkpool docstring for why the raw ratios carry no signal.
+        """
+        rows, keys = self._cached_series(
+            self._darkpool_cache, ticker,
+            self.db.get_offexchange_series, "published_at")
+        visible = self._visible(rows, keys, as_of)
+        if len(visible) < _OFFEXCH_MIN_SESSIONS:
+            return {}
+
+        # A gap means the sync has been failing. Scoring today against a window
+        # that ended a fortnight ago produces a confident-looking number built
+        # from stale inputs, which is strictly worse than admitting no data.
+        try:
+            newest = datetime.strptime(
+                str(visible[-1]["session_date"])[:10], "%Y-%m-%d"
+            ).replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return {}
+        if (now - newest).days > _OFFEXCH_MAX_STALE_DAYS:
+            return {}
+
+        short_ratios: list[float] = []
+        shares: list[float] = []
+        for r in visible:
+            total = r["total_volume"] or 0.0
+            if total <= 0:
+                continue
+            if r["short_volume"] is not None:
+                short_ratios.append(r["short_volume"] / total)
+            consolidated = r["consolidated_volume"] or 0.0
+            if consolidated > 0:
+                shares.append(total / consolidated)
+
+        features: dict[str, float] = {}
+
+        short_z = _z_score(short_ratios, _OFFEXCH_Z_WINDOW)
+        if short_z is not None:
+            features["offexch_short_ratio_z20"] = short_z
+
+        # Kept separate from the z-score rather than folded into it: the point
+        # reading says "unusual today", this says "trending", and a ratio can
+        # sit inside its band for a week while walking steadily across it.
+        if len(short_ratios) >= _OFFEXCH_Z_WINDOW:
+            fast = short_ratios[-_OFFEXCH_MOM_WINDOW:]
+            slow = short_ratios[-_OFFEXCH_Z_WINDOW:]
+            features["offexch_short_ratio_mom"] = (
+                sum(fast) / len(fast) - sum(slow) / len(slow)
+            )
+
+        # price_history is filled on demand, so this leg is often absent while
+        # the short-ratio leg is present. Defaulting it independently keeps the
+        # available half of the signal instead of discarding both.
+        share_z = _z_score(shares, _OFFEXCH_Z_WINDOW)
+        if share_z is not None:
+            features["offexch_volume_share_z20"] = share_z
+
+        return features
+
+    def _regime_series_features(self, as_of: Optional[datetime],
+                                now: datetime) -> dict:
+        """DIX / GEX / OCC put-call z-scores. Market-wide, so ticker-independent."""
+        rows, keys = self._cached_series(
+            self._regime_cache, _REGIME_CACHE_KEY,
+            lambda _key: self.db.get_market_regime_series(), "published_at")
+        visible = self._visible(rows, keys, as_of)
+        if not visible:
+            return {}
+
+        by_metric: dict[str, list[float]] = {}
+        latest: dict[str, str] = {}
+        for r in visible:
+            if r["value"] is None:
+                continue
+            by_metric.setdefault(r["metric"], []).append(float(r["value"]))
+            latest[r["metric"]] = str(r["session_date"])[:10]
+
+        out: dict[str, float] = {}
+        for metric, feature in (("dix", "dix_z60"), ("gex", "gex_z60"),
+                                ("occ_put_call_ratio", "occ_put_call_ratio_z60")):
+            values = by_metric.get(metric, [])
+            if len(values) < _REGIME_MIN_SESSIONS:
+                continue
+            try:
+                newest = datetime.strptime(
+                    latest[metric], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError, KeyError):
+                continue
+            if (now - newest).days > _REGIME_MAX_STALE_DAYS:
+                continue
+            score = _z_score(values, _REGIME_Z_WINDOW)
+            if score is not None:
+                out[feature] = score
+        return out
 
     def _get_sentiment_features(self, ticker: str, as_of_date: str = None) -> dict:
         features = self.db.get_ticker_sentiment_features(
@@ -842,7 +1074,15 @@ class StockPredictor:
         tnx_recent = get_recent(tnx_prices)
         if tnx_recent:
             features["treasury_yield_change"] = tnx_recent[-1]["close"] - tnx_recent[-2]["close"]
-            
+
+        # Dark-pool index, gamma exposure and the market-wide put/call ratio.
+        # Market-wide like the three above, but read from market_regime_daily
+        # rather than yfinance, so they slot in here rather than in the
+        # per-ticker smart-money branch.
+        as_of = self._as_of_dt(as_of_date)
+        features.update(self._regime_series_features(
+            as_of, as_of or datetime.now(timezone.utc)))
+
         return features
 
     async def _fetch_and_cache_prices(self, ticker: str, range: str = "6mo") -> list[dict]:
@@ -1067,41 +1307,16 @@ class StockPredictor:
             y_train, y_val = y[train_idx], y[val_idx]
             w_train = weights[train_idx]
             
-            if len(np.unique(y_train)) >= 2:
-                fold_model = GradientBoostingClassifier(
-                    n_estimators=100, max_depth=4, learning_rate=0.05, subsample=0.9, random_state=42
-                )
-                fold_model.fit(X_train, y_train, sample_weight=w_train)
-            else:
-                fold_model = DummyClassifier(strategy="prior")
-                fold_model.fit(X_train, y_train, sample_weight=w_train)
-            
-            y_pred = fold_model.predict(X_val)
-            y_proba = fold_model.predict_proba(X_val)
-            
-            # Accuracy: fraction of correct UP/DOWN predictions
-            acc = accuracy_score(y_val, y_pred)
+            # Offloaded: fitting a GradientBoostingClassifier is seconds of
+            # uninterruptible CPU, and the `await asyncio.sleep(0)` below only
+            # yields *between* folds. Left on the loop it stalls every other
+            # job in this process — most visibly the price refresh that keeps
+            # the dashboard's quotes current.
+            acc, brier, auc = await asyncio.to_thread(
+                _fit_and_score_fold, X_train, y_train, w_train, X_val, y_val
+            )
             fold_accuracies.append(acc)
-            
-            # Brier score: mean squared error between predicted probability
-            # and actual outcome. Lower is better. Measures calibration +
-            # discrimination jointly. Perfect calibration = 0.0.
-            # We use the probability of the positive class (UP).
-            if y_proba.shape[1] == 2:
-                brier = brier_score_loss(y_val, y_proba[:, 1])
-            else:
-                brier = brier_score_loss(y_val, y_proba[:, 0])
             fold_briers.append(brier)
-            
-            # ROC AUC: measures the model's ability to rank UP days higher
-            # than DOWN days. 0.5 = random, 1.0 = perfect discrimination.
-            try:
-                if len(np.unique(y_val)) > 1 and y_proba.shape[1] == 2:
-                    auc = roc_auc_score(y_val, y_proba[:, 1])
-                else:
-                    auc = 0.5  # single-class fold, AUC is undefined
-            except ValueError:
-                auc = 0.5
             fold_aucs.append(auc)
             
             log.info(
@@ -1164,13 +1379,15 @@ class StockPredictor:
                     base_model, param_dist, n_iter=5, cv=tscv_search, 
                     scoring=safe_auc_scorer, n_jobs=2, random_state=42
                 )
-                search.fit(X, y, **{'sample_weight': weights})
+                # n_iter=5 over cv=3 is up to 15 more fits — by far the
+                # heaviest step in training, and equally unfit for the loop.
+                await asyncio.to_thread(search.fit, X, y, sample_weight=weights)
                 final_model = search.best_estimator_
                 log.info(f"Best hyperparameters for {ticker}: {search.best_params_}")
             else:
                 log.warning(f"Skipping hyperparameter search for {ticker} due to single-class training folds.")
                 final_model = GradientBoostingClassifier(random_state=42)
-                final_model.fit(X, y, sample_weight=weights)
+                await asyncio.to_thread(final_model.fit, X, y, sample_weight=weights)
             
             # Log feature importances. Names come from the schema, not from a
             # fresh build_feature_vector(ticker) call — that would rebuild the
@@ -1212,10 +1429,9 @@ class StockPredictor:
         return str(path), cv_metrics
 
     async def _generate_narrative(self, ticker: str, direction: str, confidence: float, features: dict, horizon_days: int, news_context: str = "") -> str:
-        model_name = settings.gemini_model_chat or "gemini-2.5-flash"
+        model_name = settings.model_predictor_narrative
         try:
-            client = get_client()
-            if not client:
+            if not is_llm_configured() or not model_name:
                 return f"Model predicts {direction} based on current technical and sentiment features."
 
             # Select the most impactful features for the narrative (top 6 by importance)
@@ -1243,7 +1459,7 @@ class StockPredictor:
                 f"Do NOT use emojis. Do NOT use Markdown or HTML. Plain professional English only."
             )
             with track_llm(self.db, model_name, "ml_narrative") as u:
-                u.response = resp = client.models.generate_content(model=model_name, contents=prompt)
+                u.response = resp = await complete(model=model_name, prompt=prompt)
             return resp.text.strip()
         except Exception as e:
             log.error(f"Error generating narrative: {e}")
@@ -1251,10 +1467,9 @@ class StockPredictor:
 
     async def _generate_narrative_with_confidence(self, ticker: str, features: dict, horizon_days: int, news_context: str = "") -> dict:
         """When no ML model exists, ask the LLM to act as the full predictor."""
-        model_name = settings.gemini_model_chat or "gemini-2.5-flash"
+        model_name = settings.model_predictor_narrative
         try:
-            client = get_client()
-            if not client:
+            if not is_llm_configured() or not model_name:
                 return {"direction": "UP", "confidence": 0.5, "narrative": "Insufficient data for analysis."}
 
             prompt = (
@@ -1275,13 +1490,10 @@ class StockPredictor:
             # The substitute predictor when no ML model exists — deliberately
             # left on the stronger model, but now visible in the cost log.
             with track_llm(self.db, model_name, "llm_only_prediction") as u:
-                u.response = resp = client.models.generate_content(
+                u.response = resp = await complete(
                     model=model_name,
-                    contents=prompt,
-                    config={
-                        'response_mime_type': 'application/json',
-                        'response_schema': LlmPrediction,
-                    }
+                    prompt=prompt,
+                    schema=LlmPrediction,
                 )
             parsed = resp.parsed if isinstance(resp.parsed, LlmPrediction) else parse_structured(resp.text, LlmPrediction)
             return {

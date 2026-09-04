@@ -212,8 +212,8 @@ class TestResearcherNodes:
     @pytest.mark.asyncio
     async def test_bull_researcher_appends_to_history(self, advisory_graph, minimal_state):
         """Bull node appends to debate_history with 'Bull:' prefix."""
-        # Mock _call_deepseek to return a canned response
-        advisory_graph._call_deepseek = AsyncMock(return_value="AAPL has strong catalysts for growth.")
+        # Mock _call_researcher to return a canned response
+        advisory_graph._call_researcher = AsyncMock(return_value="AAPL has strong catalysts for growth.")
 
         result = await advisory_graph.bull_researcher_node(minimal_state)
 
@@ -228,7 +228,7 @@ class TestResearcherNodes:
         state = dict(minimal_state)
         state["debate_history"] = ["Bull: Initial bull case."]
         state["debate_round_count"] = 0
-        advisory_graph._call_deepseek = AsyncMock(return_value="The bull ignores key risks.")
+        advisory_graph._call_researcher = AsyncMock(return_value="The bull ignores key risks.")
 
         result = await advisory_graph.bear_researcher_node(state)
 
@@ -240,13 +240,13 @@ class TestResearcherNodes:
     async def test_bull_uses_correct_system_message(self, advisory_graph, minimal_state):
         """Bull node should pass the composed bull system message."""
         from pipeline.agents import _BULL_SYSTEM, _BULL_SYSTEM_MESSAGE, _COMMON_RULES
-        advisory_graph._call_deepseek = AsyncMock(return_value="Bull case.")
+        advisory_graph._call_researcher = AsyncMock(return_value="Bull case.")
 
         await advisory_graph.bull_researcher_node(minimal_state)
 
-        # Verify _call_deepseek was called with the bull system message
-        call_kwargs = advisory_graph._call_deepseek.call_args
-        assert call_kwargs is not None, "_call_deepseek was not called"
+        # Verify _call_researcher was called with the bull system message
+        call_kwargs = advisory_graph._call_researcher.call_args
+        assert call_kwargs is not None, "_call_researcher was not called"
         assert call_kwargs[1].get("system_message") == _BULL_SYSTEM
         assert _BULL_SYSTEM_MESSAGE in _BULL_SYSTEM
 
@@ -263,11 +263,11 @@ class TestResearcherNodes:
     @pytest.mark.asyncio
     async def test_bull_prompt_does_not_repeat_the_shared_rules(self, advisory_graph, minimal_state):
         from pipeline.agents import _COMMON_RULES
-        advisory_graph._call_deepseek = AsyncMock(return_value="Bull case.")
+        advisory_graph._call_researcher = AsyncMock(return_value="Bull case.")
 
         await advisory_graph.bull_researcher_node(minimal_state)
 
-        user_prompt = advisory_graph._call_deepseek.call_args[0][0]
+        user_prompt = advisory_graph._call_researcher.call_args[0][0]
         assert _COMMON_RULES not in user_prompt
 
     @pytest.mark.asyncio
@@ -284,12 +284,12 @@ class TestResearcherNodes:
             "debate_round_count": 1,
             "final_advisory": "",
         }
-        advisory_graph._call_deepseek = AsyncMock(return_value="Rebuttal to bear.")
+        advisory_graph._call_researcher = AsyncMock(return_value="Rebuttal to bear.")
 
         await advisory_graph.bull_researcher_node(state)
 
         # Verify the prompt passed to DeepSeek includes the debate history
-        call_text = advisory_graph._call_deepseek.call_args[0][0]
+        call_text = advisory_graph._call_researcher.call_args[0][0]
         assert "Bear" in call_text or "Debate History" in call_text
 
 
@@ -351,42 +351,144 @@ class TestFormatLessons:
         assert "Bear markets" in result
 
 
-# ── _call_deepseek Tests ────────────────────────────────────────────────────
+# ── _call_researcher Tests ──────────────────────────────────────────────────
 
-class TestCallDeepSeek:
-    """_call_deepseek internal method."""
-
-    @pytest.mark.asyncio
-    async def test_no_client_returns_error_message(self, advisory_graph):
-        """If no DeepSeek client, return an error string, don't crash."""
-        with patch("pipeline.agents.get_deepseek_client", return_value=None):
-            result = await advisory_graph._call_deepseek("test prompt")
-        assert "not configured" in result.lower()
+class TestCallResearcher:
+    """_call_researcher internal method."""
 
     @pytest.mark.asyncio
-    async def test_with_streaming_callback(self, advisory_graph):
+    async def test_no_model_returns_error_message(self, advisory_graph, monkeypatch):
+        """An unset MODEL_DEBATE returns an error string, it does not crash."""
+        monkeypatch.setattr("pipeline.agents.settings.model_debate", "")
+        result = await advisory_graph._call_researcher("test prompt")
+        assert "no model configured" in result.lower()
+
+    @staticmethod
+    def _stream(final_finish_reason: str):
+        """The StreamChunk sequence `stream_complete` yields, usage last."""
+        from tests.conftest import make_stream
+
+        def factory(**kwargs):
+            return make_stream(["test ", "response"], finish_reason=final_finish_reason)
+
+        return factory
+
+    @pytest.mark.asyncio
+    async def test_with_streaming_callback(self, advisory_graph, monkeypatch):
         """When debate_chunk_callback is set, use streaming."""
         callback = AsyncMock()
         advisory_graph.debate_chunk_callback = callback
+        monkeypatch.setattr("pipeline.agents.settings.model_debate", "test/debate-model")
+        monkeypatch.setattr("pipeline.agents.stream_complete", self._stream("stop"))
 
-        mock_client = MagicMock()
-        # Create a mock streaming response (async iterable)
-        async def mock_stream():
-            chunk = MagicMock()
-            delta = MagicMock()
-            delta.content = "test "
-            chunk.choices = [MagicMock(delta=delta)]
-            yield chunk
-            chunk2 = MagicMock()
-            delta2 = MagicMock()
-            delta2.content = "response"
-            chunk2.choices = [MagicMock(delta=delta2)]
-            yield chunk2
+        result = await advisory_graph._call_researcher(
+            "prompt", speaker="bull", round_num=1, system_message="You are bullish.",
+        )
 
-        mock_client.chat.completions.create.return_value = mock_stream()
-
-        with patch("pipeline.agents.get_deepseek_client", return_value=mock_client):
-            result = await advisory_graph._call_deepseek("prompt", speaker="bull", round_num=1, system_message="You are bullish.")
-
-        assert "test response" in result
+        assert result == "test response"
         assert callback.called
+
+    @pytest.mark.asyncio
+    async def test_streaming_turn_cut_off_is_marked(self, advisory_graph, monkeypatch):
+        """The finish reason rides on the last content chunk, not its own."""
+        advisory_graph.debate_chunk_callback = AsyncMock()
+        monkeypatch.setattr("pipeline.agents.settings.model_debate", "test/debate-model")
+        monkeypatch.setattr("pipeline.agents.stream_complete", self._stream("length"))
+
+        result = await advisory_graph._call_researcher(
+            "prompt", speaker="bull", round_num=2, system_message="You are bullish.",
+        )
+
+        assert result.startswith("test response")
+        assert "truncated" in result
+
+    @pytest.mark.asyncio
+    async def test_streaming_records_usage_and_cost(self, advisory_graph, monkeypatch):
+        """The most expensive call in the system must not log as free."""
+        advisory_graph.debate_chunk_callback = AsyncMock()
+        monkeypatch.setattr("pipeline.agents.settings.model_debate", "test/debate-model")
+        monkeypatch.setattr("pipeline.agents.stream_complete", self._stream("stop"))
+
+        await advisory_graph._call_researcher(
+            "prompt", speaker="bull", round_num=1, system_message="You are bullish.",
+        )
+
+        kwargs = advisory_graph.db.log_llm_usage.call_args[1]
+        assert kwargs["prompt_tokens"] == 100
+        assert kwargs["candidate_tokens"] == 50
+        assert kwargs["cost_usd"] == pytest.approx(0.0001)
+
+
+# ── Turn Finalization ───────────────────────────────────────────────────────
+
+class TestTurnFinalization:
+    """_finalize_turn — a cut-off or empty turn has to announce itself.
+
+    Reasoning tokens share the completion budget with the answer, so a turn can
+    come back clipped mid-word or with no prose at all. Both used to be stored
+    in `debate_history` and cached as though the researcher had finished.
+    """
+
+    @pytest.mark.asyncio
+    async def test_truncated_turn_is_marked_and_streamed(self, advisory_graph):
+        callback = AsyncMock()
+        advisory_graph.debate_chunk_callback = callback
+
+        result = await advisory_graph._finalize_turn(
+            "The thesis holds because", "length", 8000, "bull", 2
+        )
+
+        assert result.startswith("The thesis holds because")
+        assert "truncated" in result
+        # Live viewers watched the stream stop; the reason goes down the same
+        # channel rather than waiting for the verdict event.
+        callback.assert_awaited_once()
+        assert "truncated" in callback.await_args.args[2]
+
+    @pytest.mark.asyncio
+    async def test_empty_turn_returns_a_placeholder(self, advisory_graph):
+        """An empty turn appended a bare "Bull: " and the arena card vanished."""
+        result = await advisory_graph._finalize_turn("", "length", 8000, "bull", 2)
+        assert result.strip()
+
+    @pytest.mark.asyncio
+    async def test_completed_turn_is_left_alone(self, advisory_graph):
+        result = await advisory_graph._finalize_turn(
+            "Full argument.", "stop", 900, "bear", 1
+        )
+        assert result == "Full argument."
+
+
+# ── Trader State Contract ───────────────────────────────────────────────────
+
+class TestTraderStateContract:
+    """Every key a node returns must be declared on AdvisoryState.
+
+    LangGraph drops writes to undeclared channels without raising. That is how
+    `executive_summary` went missing from the cached advisory, the watchlist
+    card and the Telegram summary for weeks with nothing failing anywhere.
+    """
+
+    @pytest.mark.asyncio
+    async def test_trader_node_returns_only_declared_keys(
+        self, advisory_graph, minimal_state
+    ):
+        from pipeline.agents import AdvisoryState, TraderAdvisory
+
+        from tests.conftest import make_llm_response
+
+        mock_response = make_llm_response(parsed=TraderAdvisory(
+            direction="SELL",
+            conviction="High",
+            executive_summary="TLDR: SELL - margins compress.",
+            full_advisory="### Recommendation. SELL.",
+        ))
+
+        with patch("pipeline.agents.settings.model_trader", "test/trader-model"),              patch("pipeline.agents.complete", AsyncMock(return_value=mock_response)):
+            result = await advisory_graph.trader_risk_manager_node(minimal_state)
+
+        undeclared = set(result) - set(AdvisoryState.__annotations__)
+        assert not undeclared, f"silently dropped by the graph: {undeclared}"
+        assert result["trader_direction"] == "SELL"
+        assert result["trader_conviction"] == "High"
+        assert result["executive_summary"].startswith("TLDR: SELL")

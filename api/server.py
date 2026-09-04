@@ -20,35 +20,31 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
+from config.cache import TTLCache
 from config.logging_config import get_logger
 from config.settings import settings
 from data.database import Database
-from pipeline.predictor import StockPredictor
+from pipeline.predictor import StockPredictor, HORIZON_LABELS
 from pipeline.chat_orchestrator import ChatOrchestrator, build_chat_prompt
 from pipeline.web_search import enrich_chat_context
-from pipeline.embedder import GeminiEmbedder
+from pipeline.embedder import Embedder
 from pipeline.sector_analyzer import SectorAnalyzer
 from pipeline.ipo_detector import IPODetector
 from pipeline.geo_tagger import country_name
 from pipeline.event_tracker import EventTracker
 from pipeline.trend_forecaster import TrendForecaster
+from pipeline.trending import get_trending_with_summaries
+from pipeline.darkpool import DarkPoolTracker
+from pipeline.market_regime import (
+    METRIC_DIX, METRIC_GEX, METRIC_PUT_CALL, MarketRegimeTracker,
+)
 from api.sse_manager import event_bus
-from config.llm import get_client, parse_structured, DEFAULT_SAFETY_SETTINGS
-from data.models import TickerNote, notes_to_dict
+from config.llm import is_llm_configured, response_cost, stream_complete
 from config.usage import track_llm
-from google.genai import types
 
 router = APIRouter()
 
 log = get_logger(__name__)
-
-HORIZON_LABELS = {
-    5: "5d",
-    21: "1m",
-    63: "3m",
-    252: "1y",
-}
-
 
 def _safe_float(value, default: float = 0.0) -> float:
     try:
@@ -67,37 +63,45 @@ def _sse_event(event: str, data="") -> str:
     return f"event: {event}\n" + "".join(f"data: {line}\n" for line in lines) + "\n"
 
 
-# Spot training runs a 1200-day feature loop plus a RandomizedSearchCV on the
-# API event loop. /api/markets is polled every 10s by the globally-mounted
-# ticker tape and can request every (ticker, horizon) pair at once, so without
-# a cap a cold model directory would launch dozens of concurrent searches and
-# stall the API and Telegram bot. Queued tasks keep their active_trainings slot,
-# so the cap throttles rather than drops them.
-MAX_CONCURRENT_SPOT_TRAININGS = 2
-_spot_training_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SPOT_TRAININGS)
+# Response cache for the market grid. The ticker tape polls this from every
+# open tab, so without single-flight caching each tab paid the full build cost
+# independently.
+_markets_cache = TTLCache(ttl_seconds=15)
 
+# /api/status is seven aggregate counts plus a stat(); the header polls it from
+# every open tab every 30s. /api/brain/stream rebuilds its snapshot on every
+# connect, which means on every page load and every SSE reconnect.
+_status_cache = TTLCache(ttl_seconds=15)
+_brain_snapshot_cache = TTLCache(ttl_seconds=15)
 
-async def background_train_and_predict(ticker: str, horizon_days: int, app_state):
-    db = getattr(app_state, "db", None) or Database()
-    predictor = StockPredictor(db)
-    try:
-        async with _spot_training_semaphore:
-            log.info(f"Spot training ML model for {ticker} ({horizon_days}d) in background...")
-            await predictor.train_model(ticker, scope="per_ticker", horizon_days=horizon_days)
-            await predictor.predict(ticker, horizon_days=horizon_days, fast_fallback=False)
-            log.info(f"Spot training complete and prediction saved for {ticker} ({horizon_days}d)")
-        # Clear any earlier failure: without this a pair that failed once stays
-        # pinned to the fast heuristic for the whole process lifetime, and that
-        # fabricated confidence gets written to `predictions` and later scored
-        # as if it were a real model output.
-        getattr(app_state, "failed_trainings", set()).discard((ticker, horizon_days))
-    except Exception as e:
-        log.error(f"Error in spot training for {ticker} ({horizon_days}d): {e}")
-        failed_trainings = getattr(app_state, "failed_trainings", set())
-        failed_trainings.add((ticker, horizon_days))
-    finally:
-        active_trainings = getattr(app_state, "active_trainings", set())
-        active_trainings.discard((ticker, horizon_days))
+# Off-exchange data lands once a day and the dashboard panel polls every 10
+# minutes, so this holds far longer than the 15s grid caches. The window is a
+# cache key rather than a filter on one cached series: the three presets are
+# few enough to each keep their own entry.
+_darkpool_cache = TTLCache(ttl_seconds=60)
+
+# Analyst consensus is captured once a day and technical ratings once a day, so
+# this can hold far longer than the panels above. Five minutes rather than an
+# hour only because the watchlist panel is expanded on demand and a stale card
+# after a manual backfill would look broken.
+_analyst_cache = TTLCache(ttl_seconds=300)
+
+# Theses are generated once a day and re-scored once a day, so this can hold far
+# longer than the price-driven grids.
+_thesis_cache = TTLCache(ttl_seconds=120)
+
+# Generation runs a reasoning call plus several web searches, and this endpoint
+# lives in the read-mostly API process. One at a time, so two open tabs cannot
+# start two runs.
+_thesis_stream_lock = asyncio.Semaphore(1)
+
+# Sized off measured throughput, not guessed. deepseek-v4-pro at xhigh streams
+# roughly 30 tokens/sec here, so decompose alone can spend ~400s of the
+# thesis_max_output_tokens budget before the searches, extraction, ticker
+# resolution and scoring that follow it. The previous 600s was set when that
+# budget was 4000 and no longer leaves room; a timeout here reads to the user
+# as another silent stall.
+THESIS_STREAM_TIMEOUT_SECONDS = 1200
 
 
 def _prediction_to_badge(pred: dict | None) -> dict | None:
@@ -140,40 +144,24 @@ async def get_smart_money(
 
     Insider rows are open-market buys/sells only — grants, option exercises and
     tax withholding are compensation mechanics and would drown the signal.
+
+    `limit` caps only the transaction list the UI renders. Totals and per-ticker
+    rolls aggregate the entire window in SQL, so the headline figures stay true
+    to the window instead of describing whichever page happened to be fetched.
     """
     db = getattr(request.app.state, "db", None) or Database()
     transactions = db.get_recent_insider_activity(days=days, limit=limit)
     stakes = db.get_recent_stakes(days=max(days, 90), limit=25)
 
-    buy_value = sum(abs(t["value_usd"] or 0) for t in transactions
-                    if t["transaction_code"] == "P")
-    sell_value = sum(abs(t["value_usd"] or 0) for t in transactions
-                     if t["transaction_code"] == "S")
-    denom = buy_value + sell_value
-
     # Per-ticker net, so the UI can rank who is being bought and who is being sold.
-    by_ticker: dict[str, dict] = {}
-    for t in transactions:
-        row = by_ticker.setdefault(t["ticker"], {
-            "ticker": t["ticker"], "buy_value": 0.0, "sell_value": 0.0,
-            "buy_count": 0, "sell_count": 0, "buyers": set(),
-        })
-        value = abs(t["value_usd"] or 0)
-        if t["transaction_code"] == "P":
-            row["buy_value"] += value
-            row["buy_count"] += 1
-            if t["insider_name"]:
-                row["buyers"].add(t["insider_name"])
-        else:
-            row["sell_value"] += value
-            row["sell_count"] += 1
-
-    tickers = []
-    for row in by_ticker.values():
-        row["distinct_buyers"] = len(row.pop("buyers"))
+    tickers = db.get_insider_window_rollup(days=days)
+    for row in tickers:
         row["net_value"] = row["buy_value"] - row["sell_value"]
-        tickers.append(row)
     tickers.sort(key=lambda r: r["net_value"], reverse=True)
+
+    buy_value = sum(r["buy_value"] for r in tickers)
+    sell_value = sum(r["sell_value"] for r in tickers)
+    denom = buy_value + sell_value
 
     return {"data": {
         "window_days": days,
@@ -182,7 +170,7 @@ async def get_smart_money(
             "sell_value": sell_value,
             "net_value": buy_value - sell_value,
             "buy_ratio": (buy_value / denom) if denom else None,
-            "transaction_count": len(transactions),
+            "transaction_count": sum(r["buy_count"] + r["sell_count"] for r in tickers),
         },
         "by_ticker": tickers,
         "transactions": transactions,
@@ -228,6 +216,377 @@ async def get_kr_flows(
     }}
 
 
+def _build_darkpool_payload(db: Database, symbol: str, days: int) -> dict:
+    """
+    Assemble the Dark Pool card's payload. Synchronous by design.
+
+    Six SQLite round-trips, so this runs in a worker thread rather than on the
+    event loop — one executor hop for the whole build, not one per query.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    series = []
+    for row in db.get_offexchange_series(symbol):
+        if str(row["session_date"]) < cutoff:
+            continue
+        total = row["total_volume"] or 0.0
+        consolidated = row["consolidated_volume"] or 0.0
+        series.append({
+            "session_date": row["session_date"],
+            "off_exchange_volume": total,
+            "consolidated_volume": consolidated or None,
+            "off_exchange_share": (total / consolidated) if consolidated > 0 else None,
+            "short_ratio": (row["short_volume"] / total) if total > 0 else None,
+        })
+
+    regime = {
+        metric: db.get_recent_market_regime(metric, days=days)
+        for metric in (METRIC_DIX, METRIC_GEX, METRIC_PUT_CALL)
+    }
+
+    return {"data": {
+        "ticker": symbol,
+        "summary": DarkPoolTracker(db).get_summary(symbol, days=20),
+        "series": series,
+        "regime": regime,
+        "regime_summary": MarketRegimeTracker(db).get_summary(days=60),
+    }}
+
+
+@router.get("/api/darkpool/{ticker}")
+async def get_darkpool_for_ticker(
+    request: Request,
+    ticker: str,
+    days: int = Query(60, ge=1, le=730),
+):
+    """Off-exchange (dark pool) volume for one ticker, plus market-wide regime.
+
+    Each session carries both ratios the dashboard plots: the share of the
+    day's tape that printed off-exchange, and the share of that off-exchange
+    volume that was short. Sessions with no matching price_history row report a
+    null share rather than being dropped, so a gap in prices does not silently
+    shorten the series.
+
+    Read-only and cached, like every other panel endpoint — the dashboard polls
+    this on a timer from every open tab, and the underlying tables only change
+    once a day.
+    """
+    db = getattr(request.app.state, "db", None) or Database()
+    symbol = ticker.upper().strip()
+
+    return await _darkpool_cache.get_or_build(
+        (symbol, days),
+        lambda: asyncio.to_thread(_build_darkpool_payload, db, symbol, days),
+    )
+
+
+def _build_analyst_payload(db: Database, symbol: str) -> dict:
+    """
+    Assemble the analyst panel's payload. Synchronous by design.
+
+    Three SQLite round-trips, so this runs in a worker thread — one executor hop
+    for the whole build, not one per query.
+
+    Consensus and technical ratings are returned together because they are one
+    card in the UI, and because they fail independently: a ticker can have no
+    analyst coverage but a perfectly good technical rating, or deep price history
+    with no sell-side following. Each side reports its own absence rather than
+    the endpoint 404ing on either.
+    """
+    from pipeline.analyst_ratings import AnalystRatingsTracker
+    from pipeline.technical_rating import TechnicalRatingTracker
+
+    consensus = AnalystRatingsTracker(db).get_summary(symbol)
+    ratings = TechnicalRatingTracker(db).get_summary(symbol)
+
+    # Prefer the live tape for the implied-upside figure. The consensus row
+    # carries the spot from the morning snapshot, which is hours stale by the
+    # time anyone opens the panel.
+    live = db.get_latest_prices([symbol]).get(symbol) or {}
+    spot = live.get("price") or (consensus.get("latest") or {}).get("spot_price")
+
+    target_mean = (consensus.get("latest") or {}).get("target_mean")
+    return {"data": {
+        "ticker": symbol,
+        "spot_price": spot,
+        "consensus": consensus,
+        "upside_pct": ((target_mean - spot) / spot * 100.0)
+                      if (spot and target_mean and spot > 0) else None,
+        "technical": ratings["timeframes"],
+        "min_bars": ratings["min_bars"],
+    }}
+
+
+@router.get("/api/analysts/{ticker}")
+async def get_analysts_for_ticker(request: Request, ticker: str):
+    """Analyst consensus, price targets and technical ratings for one ticker.
+
+    The consensus buckets and targets are fetched sell-side opinion; the
+    technical ratings are computed locally from stored OHLCV under TradingView's
+    published methodology. Both are daily, so this is cached hard.
+
+    A ticker with neither returns 200 with `consensus.covered` false and an empty
+    `technical` map — absence of coverage is a real answer, not an error.
+    """
+    db = getattr(request.app.state, "db", None) or Database()
+    symbol = ticker.upper().strip()
+
+    return await _analyst_cache.get_or_build(
+        symbol,
+        lambda: asyncio.to_thread(_build_analyst_payload, db, symbol),
+    )
+
+# ── Thesis Engine ────────────────────────────────────────────────────
+#
+# Route order matters: the literal paths below are declared before
+# /api/thesis/{thesis_id}, or the parameterised route swallows them. Same trap
+# /api/predict/history/recent and /api/reflections/sectors already dodge.
+
+
+def _build_thesis_list_payload(db: Database, limit: int) -> dict:
+    """Active theses, each with its top candidates.
+
+    Synchronous on purpose — several blocking SQLite reads, wrapped in one
+    executor hop by the caller rather than one hop per query.
+    """
+    theses = db.get_active_theses(limit=limit)
+    out = []
+    for t in theses:
+        detail = db.get_thesis_detail(t["id"]) or {}
+        candidates = detail.get("candidates", [])
+        out.append({
+            **t,
+            "consensus_tickers": _safe_json_list(t.get("consensus_tickers_json")),
+            "evidence": _safe_json_list(t.get("evidence_json")),
+            "node_count": len(detail.get("nodes", [])),
+            "candidate_count": len(candidates),
+            "top_candidates": [_thesis_candidate_dto(c) for c in candidates[:5]],
+        })
+    return {"data": out}
+
+
+def _build_thesis_detail_payload(db: Database, thesis_id: str) -> Optional[dict]:
+    detail = db.get_thesis_detail(thesis_id)
+    if not detail:
+        return None
+    detail["consensus_tickers"] = _safe_json_list(detail.get("consensus_tickers_json"))
+    detail["evidence"] = _safe_json_list(detail.get("evidence_json"))
+    detail["candidates"] = [_thesis_candidate_dto(c) for c in detail["candidates"]]
+    detail["nodes"] = [_thesis_node_dto(n) for n in detail.get("nodes", [])]
+    return {"data": detail}
+
+
+def _thesis_node_dto(n: dict) -> dict:
+    """Chain node with its per-hop citations parsed out of the JSON column."""
+    return {**n, "sources": _safe_json_list(n.get("evidence_json"))}
+
+
+def _safe_json_list(raw) -> list:
+    try:
+        value = json.loads(raw or "[]")
+        return value if isinstance(value, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _thesis_candidate_dto(c: dict) -> dict:
+    """Candidate row plus its parsed evidence URLs."""
+    return {**c, "evidence_urls": _safe_json_list(c.get("evidence_json"))}
+
+
+@router.get("/api/thesis/candidates")
+async def get_thesis_candidates(
+    request: Request,
+    stage: str = Query("", description="Filter by rumour stage, e.g. EARLY"),
+    limit: int = Query(40, ge=1, le=200),
+):
+    """Cross-thesis candidate list, least crowded first."""
+    db = getattr(request.app.state, "db", None) or Database()
+    wanted = (stage or "").upper().strip()
+
+    def build() -> dict:
+        rows = db.get_scoreable_candidates(limit=limit * 3)
+        dtos = [_thesis_candidate_dto(r) for r in rows]
+        if wanted:
+            dtos = [d for d in dtos if (d.get("rumour_stage") or "") == wanted]
+        # Highest edge first; unscored names sort last rather than as zero.
+        dtos.sort(key=lambda d: (d.get("edge_score") is None,
+                                 -(d.get("edge_score") or 0.0)))
+        return {"data": dtos[:limit]}
+
+    return await _thesis_cache.get_or_build(
+        ("candidates", wanted, limit), lambda: asyncio.to_thread(build)
+    )
+
+
+@router.get("/api/thesis/transitions")
+async def get_thesis_transitions(
+    request: Request,
+    days: int = Query(3, ge=1, le=30),
+):
+    """Candidates whose rumour stage moved between their last two snapshots.
+
+    The dashboard widget also receives these live over SSE, but only at the
+    instant the daily re-score publishes them. Without this endpoint the strip
+    is empty on every page load until the next 09:10 job happens to fire.
+    """
+    db = getattr(request.app.state, "db", None) or Database()
+    return await _thesis_cache.get_or_build(
+        ("transitions", days),
+        lambda: asyncio.to_thread(
+            lambda: {"data": db.get_stage_transitions(days=days)}
+        ),
+    )
+
+
+@router.get("/api/thesis/stream")
+async def thesis_stream(request: Request, seed: str = Query("", max_length=300)):
+    """Build a thesis from a user-supplied topic, streaming as it reasons.
+
+    Deliberately does NOT publish to event_bus: this page is already receiving
+    the events directly, and publishing as well would double-deliver to any
+    dashboard listening on the broadcast topic.
+    """
+    topic = (seed or "").strip()
+    if not topic:
+        raise HTTPException(status_code=400, detail="A seed topic is required")
+
+    db = getattr(request.app.state, "db", None) or Database()
+    queue: asyncio.Queue = asyncio.Queue()
+    background_task = None
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        break
+                    continue
+                event, data = item["event"], item["data"]
+                yield _sse_event(event, data)
+                if event in ("done", "error"):
+                    break
+        except asyncio.CancelledError:
+            raise
+        finally:
+            nonlocal background_task
+            if background_task and not background_task.done():
+                background_task.cancel()
+
+    async def progress_callback(message: str):
+        await queue.put({"event": "agent_update", "data": message})
+
+    async def chunk_callback(token: str):
+        await queue.put({"event": "reasoning_chunk", "data": json.dumps({"text": token})})
+
+    async def research_callback(event_type: str, data: dict):
+        await queue.put({"event": event_type, "data": json.dumps(data)})
+
+    async def node_callback(node: dict):
+        await queue.put({"event": "chain_node", "data": json.dumps(node)})
+
+    async def candidate_callback(candidate: dict):
+        await queue.put({"event": "candidate", "data": json.dumps(candidate, default=str)})
+
+    async def run_thesis():
+        if _thesis_stream_lock.locked():
+            await queue.put({"event": "error",
+                             "data": "Another thesis is already being generated."})
+            await queue.put({"event": "done", "data": ""})
+            return
+        async with _thesis_stream_lock:
+            try:
+                from pipeline.thesis_engine import ThesisEngine
+
+                result = await asyncio.wait_for(
+                    ThesisEngine(db).generate_from_text(
+                        topic,
+                        progress_callback=progress_callback,
+                        chunk_callback=chunk_callback,
+                        research_callback=research_callback,
+                        node_callback=node_callback,
+                        candidate_callback=candidate_callback,
+                    ),
+                    timeout=THESIS_STREAM_TIMEOUT_SECONDS,
+                )
+                await queue.put({"event": "verdict", "data": json.dumps({
+                    "thesis_id": result.get("thesis_id"),
+                    "nodes": result.get("chain_nodes", []),
+                    "candidates": result.get("scored", []),
+                    "errors": result.get("errors", []),
+                }, default=str)})
+                if not result.get("thesis_id"):
+                    # A run that reasoned and then died — most often the chain
+                    # never parsed — reaches here with errors and no thesis.
+                    # Without this the page just stops mid-stream and looks
+                    # like it is still thinking.
+                    reasons = result.get("errors") or [
+                        "the run finished without producing a thesis"
+                    ]
+                    # Flattened: _sse_event splits a multi-line payload across
+                    # several data: lines, and the page's parser only reads the
+                    # first one. Validation errors are routinely multi-line.
+                    await queue.put({
+                        "event": "error",
+                        "data": " ".join("; ".join(reasons).split()),
+                    })
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError:
+                await queue.put({"event": "error", "data": "Thesis generation timed out."})
+            except Exception as e:
+                log.error("api.thesis_stream_failed", error=str(e))
+                await queue.put({"event": "error", "data": str(e)})
+            finally:
+                await queue.put({"event": "done", "data": ""})
+
+    background_task = asyncio.create_task(run_thesis())
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.get("/api/thesis")
+async def get_theses(request: Request, limit: int = Query(10, ge=1, le=50)):
+    db = getattr(request.app.state, "db", None) or Database()
+    return await _thesis_cache.get_or_build(
+        ("list", limit),
+        lambda: asyncio.to_thread(_build_thesis_list_payload, db, limit),
+    )
+
+
+@router.get("/api/thesis/{thesis_id}")
+async def get_thesis(request: Request, thesis_id: str):
+    db = getattr(request.app.state, "db", None) or Database()
+    payload = await _thesis_cache.get_or_build(
+        ("detail", thesis_id),
+        lambda: asyncio.to_thread(_build_thesis_detail_payload, db, thesis_id),
+    )
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Thesis not found")
+    return payload
+
+
+@router.post("/api/thesis/candidates/{candidate_id}/track")
+async def track_thesis_candidate(request: Request, candidate_id: str):
+    """Promote a candidate onto the watchlist by hand."""
+    db = getattr(request.app.state, "db", None) or Database()
+
+    def promote() -> Optional[str]:
+        with db.connection() as conn:
+            row = conn.execute(
+                "SELECT ticker FROM thesis_candidates WHERE id = ?", (candidate_id,)
+            ).fetchone()
+        if not row or not row["ticker"]:
+            return None
+        db.add_tracked_ticker(row["ticker"])
+        return row["ticker"]
+
+    ticker = await asyncio.to_thread(promote)
+    if not ticker:
+        raise HTTPException(status_code=404,
+                            detail="Candidate not found or has no resolved ticker")
+    return {"success": True, "ticker": ticker}
 # ── Watchlist CRUD ───────────────────────────────────────────────────
 
 @router.get("/api/watchlist")
@@ -257,75 +616,80 @@ async def remove_watchlist(request: Request, ticker: str):
 
 @router.get("/api/markets")
 async def get_markets(request: Request):
+    """
+    The market grid behind the ticker tape.
+
+    Reads only — no network calls, no model loading, no training. Quotes come
+    from `latest_prices`, refreshed by the worker (pipeline/price_feed.py), and
+    predictions come from rows the worker has already generated. Every open tab
+    polls this continuously, so anything expensive here is paid forever.
+    """
     db = getattr(request.app.state, "db", None) or Database()
-    tickers = db.get_tracked_tickers()
+    tickers = await asyncio.to_thread(db.get_tracked_tickers)
     if not tickers:
         tickers = ["AAPL", "MSFT", "GOOGL"]
 
-    if not hasattr(request.app.state, "active_trainings"):
-        request.app.state.active_trainings = set()
-    if not hasattr(request.app.state, "failed_trainings"):
-        request.app.state.failed_trainings = set()
-    active_trainings = request.app.state.active_trainings
-    failed_trainings = request.app.state.failed_trainings
+    # Keyed on the watchlist so adding or removing a ticker invalidates the
+    # entry immediately rather than showing a stale grid for the whole TTL.
+    cache_key = tuple(sorted(tickers))
+    return await _markets_cache.get_or_build(
+        cache_key, lambda: _build_markets_payload(db, tickers)
+    )
 
-    def fetch_market_snapshot(ticker: str) -> dict:
-        try:
-            t = yf.Ticker(ticker)
-            df = t.history(period="5d")
-            if not df.empty:
-                closes = [float(c) for c in df["Close"].dropna().tolist()]
-                current = closes[-1] if closes else 0.0
-                previous = closes[-2] if len(closes) >= 2 else current
-            else:
-                current = _safe_float(t.fast_info.get("lastPrice", 0.0))
-                previous = _safe_float(t.fast_info.get("previousClose", current))
-            daily_change = ((current - previous) / previous * 100) if previous else 0.0
-            return {"current_price": current, "daily_change_pct": daily_change}
-        except Exception:
-            return {"current_price": 0.0, "daily_change_pct": 0.0}
 
-    snapshots = await asyncio.gather(*(asyncio.to_thread(fetch_market_snapshot, t) for t in tickers))
+def _load_quotes(db: Database, tickers: list[str]) -> dict[str, dict]:
+    """
+    Last-known quotes for the grid.
 
-    async def process_ticker(ticker: str, snapshot: dict) -> dict:
-        recent_preds = db.get_recent_predictions(ticker, limit=20)
+    Falls back to stored OHLCV for anything the worker has not refreshed yet,
+    so a cold start shows real numbers instead of a grid of zeros.
+    """
+    quotes = db.get_latest_prices(tickers)
+    missing = [t for t in tickers if t not in quotes]
+    if missing:
+        quotes.update(db.get_closes_from_history(missing))
+    return quotes
+
+
+async def _build_markets_payload(db: Database, tickers: list[str]) -> dict:
+    """Assemble the market grid from state the worker has already computed."""
+    quotes = await asyncio.to_thread(_load_quotes, db, tickers)
+
+    def load_ticker_rows(ticker: str):
+        # Grouped into one executor hop: three separate to_thread calls would
+        # each open their own connection for a few milliseconds of work.
+        return (
+            db.get_recent_predictions(ticker, limit=20, active_only=True),
+            db.get_cached_advisory(ticker, days=5),
+            db.get_ticker_sector(ticker),
+        )
+
+    async def process_ticker(ticker: str) -> dict:
+        recent_preds, cached_advisory, sector = await asyncio.to_thread(
+            load_ticker_rows, ticker
+        )
+
         predictions = {}
         for pred in recent_preds:
             label = HORIZON_LABELS.get(pred.get("horizon_days"))
             if label and label not in predictions:
                 predictions[label] = _prediction_to_badge(pred)
 
-        predictor = StockPredictor(db)
         for horizon_days, label in HORIZON_LABELS.items():
             if label not in predictions:
-                model, model_type = predictor._load_model(ticker, horizon_days)
-                if model:
-                    try:
-                        new_pred = await predictor.predict(ticker, horizon_days=horizon_days, fast_fallback=False)
-                        predictions[label] = _prediction_to_badge(new_pred)
-                    except Exception:
-                        pass
-                else:
-                    if (ticker, horizon_days) in failed_trainings:
-                        try:
-                            new_pred = await predictor.predict(ticker, horizon_days=horizon_days, fast_fallback=True)
-                            predictions[label] = _prediction_to_badge(new_pred)
-                        except Exception:
-                            pass
-                    else:
-                        predictions[label] = {
-                            "direction": "TRAINING",
-                            "confidence": 0.0,
-                            "horizon_days": horizon_days
-                        }
-                        if (ticker, horizon_days) not in active_trainings:
-                            active_trainings.add((ticker, horizon_days))
-                            asyncio.create_task(background_train_and_predict(ticker, horizon_days, request.app.state))
+                # No live prediction for this horizon. Training and prediction
+                # both belong to the worker (see train_missing_models in
+                # orchestrator/scheduler.py) — a page load must never trigger a
+                # five-fold model fit.
+                predictions[label] = {
+                    "direction": "TRAINING",
+                    "confidence": 0.0,
+                    "horizon_days": horizon_days,
+                }
 
-        cached_advisory = db.get_cached_advisory(ticker, days=5)
-        sector = await asyncio.to_thread(db.get_ticker_sector, ticker)
-        current_price = _safe_float(snapshot.get("current_price"))
-        daily_change_pct = _safe_float(snapshot.get("daily_change_pct"))
+        quote = quotes.get(ticker) or {}
+        current_price = _safe_float(quote.get("price"))
+        daily_change_pct = _safe_float(quote.get("daily_change_pct"))
 
         return {
             "ticker": ticker,
@@ -333,13 +697,14 @@ async def get_markets(request: Request):
             "price": current_price,
             "current_price": current_price,
             "daily_change_pct": daily_change_pct,
+            "price_updated_at": quote.get("updated_at"),
             "predictions": predictions,
             "cached_prediction": recent_preds[0] if recent_preds else None,
             "cached_advisory": cached_advisory,
             "cached_debate": cached_advisory,
         }
 
-    data = await asyncio.gather(*(process_ticker(t, s) for t, s in zip(tickers, snapshots)))
+    data = await asyncio.gather(*(process_ticker(t) for t in tickers))
     return {"data": data}
 
 
@@ -535,8 +900,13 @@ async def predict_stream(request: Request, ticker: str, refresh: bool = False):
 
                     verdict_data = {
                         "ticker": ticker,
+                        # The ML baseline, not the trade call — see the live
+                        # path below. Advisories cached before the trader
+                        # started reporting its own call have neither field.
                         "predicted_direction": cached.get("ml_prediction", {}).get("predicted_direction", "UNKNOWN"),
                         "confidence": cached.get("ml_prediction", {}).get("confidence", 0.0),
+                        "advisory_direction": cached.get("trader_direction"),
+                        "advisory_conviction": cached.get("trader_conviction"),
                         "final_advisory": cached.get("final_advisory"),
                         "bull_report": bull_report,
                         "bear_report": bear_report,
@@ -587,8 +957,14 @@ async def predict_stream(request: Request, ticker: str, refresh: bool = False):
 
             verdict_data = {
                 "ticker": ticker,
+                # `predicted_direction`/`confidence` are the GradientBoosting
+                # baseline and go stale to UNKNOWN/0.0 whenever no model exists
+                # for the horizon. The trade call the debate actually reached
+                # is `advisory_*`, which is what the arena headlines.
                 "predicted_direction": result.get("ml_prediction", {}).get("predicted_direction", "UNKNOWN"),
                 "confidence": result.get("ml_prediction", {}).get("confidence", 0.0),
+                "advisory_direction": result.get("trader_direction"),
+                "advisory_conviction": result.get("trader_conviction"),
                 "final_advisory": result.get("final_advisory"),
                 "bull_report": bull_report,
                 "bear_report": bear_report,
@@ -716,49 +1092,38 @@ async def chat_stream(request: Request, payload: ChatRequest):
                     "data": json.dumps({"articles": all_articles})
                 })
 
-            client = get_client()
-            if not client:
+            # Was: a hardcoded pair of slugs shadowing the settings whenever
+            # they happened to be empty, so the configured chat models were
+            # never actually reached. The settings are the only source now.
+            model = (
+                settings.model_chat_shallow if decision == "shallow"
+                else settings.model_chat_complex
+            )
+            if not is_llm_configured() or not model:
                 await queue.put({"event": "error", "data": "❌ LLM not configured."})
                 return
 
-            model = (
-                settings.gemini_model_chat_shallow if decision == "shallow"
-                else settings.gemini_model_chat_complex
-            )
-            if not model:
-                model = "gemini-3.1-flash-lite" if decision == "shallow" else "gemini-3-flash-preview"
-
             prompt = build_chat_prompt(message, context)
 
-            config = types.GenerateContentConfig(
-                safety_settings=DEFAULT_SAFETY_SETTINGS
-            )
-            if decision == "complex":
-                config.thinking_config = types.ThinkingConfig(thinking_level=types.ThinkingLevel.MEDIUM)
-
             # This is the primary user-facing chat path and it recorded nothing
-            # at all until now. Streamed responses carry usage_metadata on the
-            # trailing chunks, so keep the last one seen and log it after the
-            # stream drains.
+            # at all until it was instrumented. Streamed responses carry usage
+            # on a trailing chunk, so keep the last one seen and log it after
+            # the stream drains.
             with track_llm(db, model, "chat_stream") as usage:
-                response = await client.aio.models.generate_content_stream(
-                    model=model,
-                    contents=prompt,
-                    config=config
-                )
-
                 collected = []
-                final_usage = None
-                async for chunk in response:
+                async for chunk in stream_complete(
+                    model=model,
+                    prompt=prompt,
+                    reasoning=None if decision == "shallow" else "medium",
+                ):
                     if chunk.text:
                         collected.append(chunk.text)
                         await queue.put({"event": "token", "data": json.dumps({"text": chunk.text})})
-                    if getattr(chunk, "usage_metadata", None):
-                        final_usage = chunk.usage_metadata
+                    if chunk.usage is not None:
+                        usage.prompt_tokens = getattr(chunk.usage, "prompt_tokens", None)
+                        usage.candidate_tokens = getattr(chunk.usage, "completion_tokens", None)
+                        usage.cost = response_cost(chunk.usage)
 
-                if final_usage is not None:
-                    usage.prompt_tokens = final_usage.prompt_token_count
-                    usage.candidate_tokens = final_usage.candidates_token_count
                 usage.response_text = "".join(collected)
 
         except asyncio.CancelledError:
@@ -818,119 +1183,14 @@ async def get_briefing(request: Request, hours: int = 24, limit: int = 10):
     return {"data": briefings}
 
 
-_trending_cache = {}
-
 @router.get("/api/trending")
 async def get_trending(request: Request, hours: int = 24, limit: int = 15, refresh: bool = False):
-    global _trending_cache
-    
-    current_time = time.time()
-    cache_key = f"{hours}_{limit}"
-    
-    if not refresh and cache_key in _trending_cache:
-        cached_data, cache_time = _trending_cache[cache_key]
-        if current_time - cache_time < 86400:
-            return {"data": cached_data, "cached": True}
-
     db = getattr(request.app.state, "db", None) or Database()
-    trending_tickers = db.get_top_trending_tickers(hours=hours, limit=limit)
-    if not trending_tickers:
-        return {"data": []}
-
-    # 1. Collect all context first
-    all_ticker_contexts = {}
-    for t in trending_tickers:
-        ticker_name = t['ticker']
-        summaries = db.get_recent_summaries_for_ticker(ticker_name, hours=hours)
-        if summaries:
-            all_ticker_contexts[ticker_name] = summaries
-
-    # 2. Make a single batch LLM call
-    ai_summaries = {}
-    client = get_client()
-    if client and all_ticker_contexts:
-        prompt = (
-            f"You are a Professional, precise, and highly analytical Wall Street analyst.\n"
-            f"Below is a list of trending tickers and their recent news summaries.\n"
-            f"For EACH ticker, write a concise 1-sentence explanation of exactly why it is trending based ONLY on the context.\n"
-            f"You MUST include an exact quote from the context if available. Do NOT use emojis.\n"
-            f"Do NOT use markdown or HTML tags in your summaries. Just plain text.\n"
-            f"Return one entry per ticker in the required response schema.\n\n"
-        )
-        for tk, sums in all_ticker_contexts.items():
-            prompt += f"Ticker: {tk}\nContext:\n" + "\n".join(f"- {s}" for s in sums) + "\n\n"
-
-        try:
-            loop = asyncio.get_running_loop()
-            def ask_batch_llm():
-                start_time = time.time()
-                is_error = False
-                error_msg = None
-                response_text = None
-                try:
-                    response = client.models.generate_content(
-                        model=settings.gemini_model_chat,
-                        contents=prompt,
-                        config={
-                            'safety_settings': DEFAULT_SAFETY_SETTINGS,
-                            'response_mime_type': 'application/json',
-                            'response_schema': list[TickerNote],
-                            'thinking_config': types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
-                        }
-                    )
-                    response_text = response.text
-                except Exception as e:
-                    is_error = True
-                    error_msg = str(e)
-                    raise
-                finally:
-                    latency_ms = int((time.time() - start_time) * 1000)
-                    if not is_error and response and response.usage_metadata:
-                        db.log_llm_usage(
-                            model_name=settings.gemini_model_chat,
-                            operation="trending_summary_batch",
-                            prompt_tokens=response.usage_metadata.prompt_token_count,
-                            candidate_tokens=response.usage_metadata.candidates_token_count,
-                            latency_ms=latency_ms,
-                            is_error=False,
-                            prompt_text=prompt,
-                            response_text=response_text
-                        )
-                    elif is_error:
-                        db.log_llm_usage(
-                            model_name=settings.gemini_model_chat,
-                            operation="trending_summary_batch",
-                            prompt_tokens=0,
-                            candidate_tokens=0,
-                            latency_ms=latency_ms,
-                            is_error=True,
-                            error_message=error_msg,
-                            prompt_text=prompt,
-                            response_text=None
-                        )
-                if isinstance(response.parsed, list):
-                    return notes_to_dict(response.parsed)
-                return notes_to_dict(parse_structured(response.text, list[TickerNote]))
-
-            ai_summaries = await loop.run_in_executor(None, ask_batch_llm)
-        except Exception as e:
-            log.error("api.trending_batch_summary_failed", error=str(e))
-
-    # 3. Construct data payload with top articles per ticker
-    data = []
-    for t in trending_tickers:
-        ticker = t["ticker"]
-        articles = db.get_recent_articles_for_ticker(ticker, hours=hours, limit=5)
-        data.append({
-            "ticker": ticker,
-            "mention_count": t["mention_count"],
-            "avg_sentiment": t["avg_sentiment"],
-            "summary": ai_summaries.get(ticker.upper()) or "No AI summary available.",
-            "articles": articles,
-        })
-
-    _trending_cache[cache_key] = (data, current_time)
-
+    data, was_cached = await get_trending_with_summaries(
+        db, hours=hours, limit=limit, refresh=refresh
+    )
+    if was_cached:
+        return {"data": data, "cached": True}
     return {"data": data}
 
 
@@ -1147,13 +1407,19 @@ async def delete_reflection(request: Request, reflection_id: int):
 @router.get("/api/status")
 async def get_status(request: Request):
     db = getattr(request.app.state, "db", None) or Database()
-    stats = db.get_stats()
-    with db.connection() as conn:
-        stats["total_predictions"] = conn.execute("SELECT COUNT(*) AS c FROM predictions").fetchone()["c"]
-        stats["total_reflections"] = conn.execute("SELECT COUNT(*) AS c FROM reflection_log").fetchone()["c"]
-    stats["db_size_bytes"] = int(_safe_float(stats.get("db_size_mb")) * 1024 * 1024)
-    stats["watchlist_size"] = len(db.get_tracked_tickers())
-    return stats
+
+    def build_status() -> dict:
+        stats = db.get_stats()
+        with db.connection() as conn:
+            stats["total_predictions"] = conn.execute("SELECT COUNT(*) AS c FROM predictions").fetchone()["c"]
+            stats["total_reflections"] = conn.execute("SELECT COUNT(*) AS c FROM reflection_log").fetchone()["c"]
+        stats["db_size_bytes"] = int(_safe_float(stats.get("db_size_mb")) * 1024 * 1024)
+        stats["watchlist_size"] = len(db.get_tracked_tickers())
+        return stats
+
+    return await _status_cache.get_or_build(
+        "status", lambda: asyncio.to_thread(build_status)
+    )
 
 @router.get("/api/usage")
 async def get_usage(request: Request):
@@ -1169,6 +1435,9 @@ async def get_usage(request: Request):
         current["tokens"] += row.get("tokens") or 0
         current["cost"] += row.get("cost") or 0.0
     usage["by_model"] = by_model
+    # `unpriced_calls` comes straight from get_usage_stats. It counts successful
+    # calls the provider reported no cost for, which are stored at $0.00 — the
+    # one way the totals here can understate real spend.
     return usage
 
 
@@ -1220,7 +1489,7 @@ async def get_brain_dashboard(request: Request, q: Optional[str] = None):
     # 4. Semantic search results (if q is provided)
     semantic_results = []
     if q:
-        embedder = GeminiEmbedder()
+        embedder = Embedder()
         await embedder.initialize()
         query_vec = await embedder.get_embedding(q)
         if query_vec is not None:
@@ -1559,7 +1828,7 @@ async def get_trend_forecast(request: Request, sector: str, refresh: bool = Fals
             }}
 
     # Cold cache or forced refresh → generate fresh and persist
-    forecast = await forecaster._generate_sector_outlook(sector)
+    forecast = await forecaster.get_sector_outlook(sector)
     if forecast:
         forecaster._store_forecast(forecast)
     return {"data": forecast}
@@ -1587,12 +1856,18 @@ async def brain_stream(request: Request):
         "pipeline_status", "new_articles", "sector_heatmap",
         "rotation_signal", "ipo_alert", "trend_forecast",
         "hot_tickers", "market_ticker", "sentiment_distribution",
-        "embedding_status", "events_updated",
+        "embedding_status", "events_updated", "thesis_update",
     ]
     subscriber = event_bus.subscribe(topics)
 
-    async def _build_brain_snapshot():
-        """Build a full snapshot for late-joining SSE clients."""
+    def _build_brain_snapshot():
+        """
+        Build a full snapshot for late-joining SSE clients.
+
+        Synchronous on purpose — every statement below is blocking SQLite, so
+        the caller runs it in a thread rather than pinning the event loop for
+        the duration of a dozen aggregates plus a sector recompute.
+        """
         with db.connection() as conn:
             # Last 50 articles
             articles = conn.execute(
@@ -1643,8 +1918,12 @@ async def brain_stream(request: Request):
 
     async def event_generator():
         try:
-            # 1. Send full snapshot first
-            snapshot = await _build_brain_snapshot()
+            # 1. Send full snapshot first. Cached and single-flighted: this
+            # runs on every page load and every SSE reconnect, so a reconnect
+            # storm would otherwise multiply the cost by the number of tabs.
+            snapshot = await _brain_snapshot_cache.get_or_build(
+                "snapshot", lambda: asyncio.to_thread(_build_brain_snapshot)
+            )
             yield _sse_event("snapshot", json.dumps(snapshot))
 
             # 2. Stream incremental updates

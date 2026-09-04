@@ -6,6 +6,7 @@ import { Plus, Trash2, ChevronDown, ChevronUp, AlertCircle, RefreshCw, ExternalL
 import FormattedText from "../components/FormattedText";
 import GeneralNewsFeed from "../components/GeneralNewsFeed";
 import PriceChart from "../components/PriceChart";
+import AnalystPanel from "../components/AnalystPanel";
 
 interface PredictionInfo {
   direction: "UP" | "DOWN" | "TRAINING";
@@ -252,10 +253,10 @@ export default function WatchlistPage() {
   });
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-4 md:p-6 space-y-4 md:space-y-6">
 
       {/* Top Title Banner */}
-      <div className="flex items-center justify-between border-b border-border-dim pb-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border-dim pb-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">
             Markets
@@ -281,7 +282,7 @@ export default function WatchlistPage() {
       )}
 
       {/* Watchlist Quickbar & Add Symbol Form */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6">
 
         {/* Watchlist Panel */}
         <div className="md:col-span-2 border border-border-dim bg-bg-card p-4">
@@ -383,16 +384,16 @@ export default function WatchlistPage() {
                       className="border border-border-dim bg-bg-card hover:border-terminal-text transition-all duration-200"
                     >
                       {/* Grid Header Info Row */}
-                      <div className="p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 text-sm">
+                      <div className="p-3 md:p-4 flex flex-col md:flex-row md:items-center justify-between gap-3 md:gap-4 text-sm">
 
-                        <div className="flex items-center gap-4 min-w-[180px]">
+                        <div className="flex flex-wrap items-center gap-3 md:gap-4 min-w-0 md:min-w-[180px]">
                           <span className="text-lg font-bold text-terminal-text">{item.ticker}</span>
                           <span className="text-xs text-terminal-muted px-2 py-0.5 border border-border-dim">
                             {item.sector}
                           </span>
                         </div>
 
-                        <div className="flex items-center gap-6">
+                        <div className="flex items-center gap-4 md:gap-6 shrink-0">
                           <div>
                             <span className="text-xs text-terminal-muted block">PRICE</span>
                             <span className="font-bold text-terminal-text">{money(currentPrice)}</span>
@@ -406,7 +407,7 @@ export default function WatchlistPage() {
                         </div>
 
                         {/* 4 Horizons Predictions Grid */}
-                        <div className="flex flex-wrap items-center gap-3">
+                        <div className="flex flex-wrap items-center gap-2">
                           {/* ML model source indicator */}
                           <div className="w-full mb-0.5">
                             <span className="text-[9px] text-terminal-muted/50 uppercase tracking-wider flex items-center gap-1">
@@ -449,7 +450,7 @@ export default function WatchlistPage() {
                         {/* Collapsible Trigger */}
                         <button
                           onClick={() => toggleExpand(item.ticker)}
-                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs border border-border-dim hover:bg-bg-surface text-terminal-text transition-colors self-start md:self-auto"
+                          className="flex items-center justify-center gap-1.5 w-full md:w-auto px-3 py-2.5 md:py-1.5 text-xs border border-border-dim hover:bg-bg-surface text-terminal-text transition-colors self-start md:self-auto"
                         >
                           {isExpanded ? (
                             <>
@@ -468,7 +469,19 @@ export default function WatchlistPage() {
 
                       {/* Expandable AI Narrative Section */}
                       {isExpanded && (
-                        <div className="border-t border-border-dim bg-bg-surface/50 p-4 space-y-4">
+                        <div className="border-t border-border-dim bg-bg-surface/50 p-3 md:p-4 space-y-4">
+
+                          {/* Sell-side consensus and the local technical rating.
+                              Fetches itself rather than riding on fetchTickerDetail:
+                              both sides are daily data behind a 5-minute server
+                              cache, so it has no reason to reload when the chart
+                              range changes. */}
+                          <div className="border-b border-border-dim pb-3">
+                            <h4 className="text-xs font-bold text-terminal-text uppercase tracking-wider mb-1">
+                              [Analyst Consensus &amp; Technical Rating]
+                            </h4>
+                            <AnalystPanel ticker={item.ticker} />
+                          </div>
 
                           <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
 

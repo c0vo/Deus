@@ -35,6 +35,18 @@ FINANCIAL_RESEARCHER = (
     "interpretations where they exist."
 )
 
+SECOND_ORDER_ANALYST = (
+    "You are a supply-chain and second-order-effects analyst at a macro fund. "
+    "Your specialty is tracing a demand shock through the physical value chain "
+    "to the chokepoint that actually binds. You assume the obvious beneficiary "
+    "is already fully priced, because by the time a story reaches the news the "
+    "first-order name has been bought. You reason in purchase orders: at every "
+    "step you ask what the previous step must physically buy, who has pricing "
+    "power over it, and how long it would take a competitor to add capacity. "
+    "You state the observation that would prove you wrong. No rhetoric, no "
+    "hedging prose, no restating the question."
+)
+
 HEAD_TRADER = (
     "You are the Head Trader and Risk Manager at a quantitative hedge fund. "
     "You synthesize conflicting analyst reports into actionable trade decisions. "
@@ -78,6 +90,37 @@ EVENT_TYPE_TAXONOMY = """Event type taxonomy:
 - "ipo": Initial or secondary public offerings, direct listings, SPAC mergers
 - "personnel": CEO/CFO changes, board shakeups, major layoffs
 - "general": Catch-all for market-relevant news that doesn't fit the above (use sparingly)"""
+
+BOTTLENECK_TAXONOMY = """Bottleneck types:
+- "capacity": fab, plant, or line throughput is the binding limit
+- "raw_material": a physical input is scarce or geographically concentrated
+- "energy": power generation, grid interconnect, cooling
+- "regulatory": export controls, permits, licensing, approvals
+- "talent": a specific scarce skill set
+- "logistics": shipping, packaging, test, assembly, warehousing
+- "ip": a patent or licensing chokepoint
+- "capital": financing cost or availability gates the buildout"""
+
+CONFIDENCE_CALIBRATION = """Confidence calibration:
+- 0.3-0.5: speculative — a plausible mechanism with no confirming evidence in the context
+- 0.5-0.7: plausible — mechanism plus at least one supporting data point
+- 0.7-0.85: well-supported — multiple independent confirmations
+- 0.85+: overwhelming — reserve for near-certainties (rare)"""
+
+EXPOSURE_GUIDANCE = """Revenue exposure is the single most important field you produce.
+
+Estimate what share of the company's TOTAL revenue is exposed to this specific
+bottleneck, as a percentage:
+- A pure-play (>50%) moves materially on this thesis.
+- A diversified supplier (10-50%) moves noticeably.
+- A conglomerate (<10%) does not: the tailwind is diluted below its own noise
+  floor, and naming it is worse than naming nothing because it looks like an
+  answer.
+
+Worked example: for an HBM memory bottleneck, SK hynix is high exposure —
+memory is most of what it sells. Samsung Electronics is low exposure despite
+being a larger HBM producer, because phones, displays and appliances swamp the
+effect. Prefer the smaller, more exposed company; say so in exposure_basis."""
 
 # ── Common Formatting Rules ─────────────────────────────────────────────────
 

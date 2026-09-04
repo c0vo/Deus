@@ -1,8 +1,8 @@
 """
 Batch Importance Ranker
 
-Uses Gemini to evaluate a list of classified articles and rank them
-by their importance/market impact score from 0.0 to 10.0.
+Scores a list of classified articles by their importance / market impact,
+0.0 to 10.0. The model is whatever MODEL_RANKER points at.
 """
 
 from __future__ import annotations
@@ -10,16 +10,24 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from google import genai
-from google.genai import types
+from pydantic import BaseModel, Field
 
 from config.logging_config import get_logger
-from config.llm import get_client, is_configured, is_transient, DEFAULT_SAFETY_SETTINGS
+from config.llm import complete, is_llm_configured, is_transient, parse_json_list
 from config.settings import settings
+from config.usage import track_llm
 from data.models import NewsArticle
 from data.database import Database
 
 log = get_logger(__name__)
+
+
+class RankedArticle(BaseModel):
+    """One scored article. Sent as `list[RankedArticle]` so the required shape
+    travels with the request instead of as a sentence in the prompt."""
+    id: str
+    importance_score: float = Field(default=0.0, ge=0.0, le=10.0)
+
 
 RANKING_PROMPT = """
 You are a senior financial analyst evaluating news for an active retail stock investor. Below is a list of classified news articles. Assign an importance score (0.0–10.0) to each based on its potential market impact.
@@ -46,23 +54,24 @@ You are a senior financial analyst evaluating news for an active retail stock in
 Articles:
 {articles_json}
 
-Respond ONLY with a JSON array of objects in the exact order and IDs provided. No markdown, no backticks.
-Schema:
-[
-  {{
-    "id": "string",
-    "importance_score": 0.0
-  }}
-]
+Return exactly one result per input article, echoing each article's "id" back
+verbatim — results are matched by id, not by position. No markdown, no backticks.
+
+Reply with a single object holding one "items" array, and one entry in it per
+input article — not one object per line, and not one result for the batch:
+{{
+  "items": [
+    {{ "id": "a1", "importance_score": 0.0 }}
+  ]
+}}
 """
 
 class ArticleRanker:
     """Ranks a batch of NewsArticles by importance."""
 
-    def __init__(self, client: Optional[genai.Client] = None, db: Optional[Database] = None):
-        self.client = client or get_client()
+    def __init__(self, db: Optional[Database] = None):
         self.db = db or Database()
-        self.model_name = settings.gemini_model_ranker
+        self.model_name = settings.model_ranker
 
     async def rank_batch(self, articles: list[NewsArticle]) -> list[NewsArticle]:
         """
@@ -72,7 +81,7 @@ class ArticleRanker:
         if not articles:
             return []
 
-        if not self.client or not is_configured():
+        if not is_llm_configured() or not self.model_name:
             log.warning("ranker.skipped", reason="LLM not configured", count=len(articles))
             return articles
 
@@ -91,76 +100,57 @@ class ArticleRanker:
         prompt = RANKING_PROMPT.format(articles_json=json.dumps(payload, indent=2))
 
         try:
-            import time
-            start_time = time.time()
-            is_error = False
-            error_msg = None
-            response_text = None
-            try:
-                response = await self.client.aio.models.generate_content(
+            with track_llm(self.db, self.model_name, "rank_batch",
+                           prompt_text=prompt, store_text=True) as u:
+                u.response = response = await complete(
                     model=self.model_name,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.1,
-                        safety_settings=DEFAULT_SAFETY_SETTINGS,
-                        response_mime_type="application/json",
-                        # {"id","importance_score"} per article is ~25 tokens;
-                        # the headroom is because JSON mode truncates into
-                        # unparseable output rather than degrading.
-                        max_output_tokens=settings.rank_max_output_tokens_per_article * len(articles),
-                    )
+                    prompt=prompt,
+                    temperature=0.1,
+                    # A schema rather than json_mode. json_mode only constrains
+                    # the root to *an object*, which contradicts a prompt asking
+                    # for an array — and a model resolving that conflict answers
+                    # with one flat result for the whole batch. `list[...]`
+                    # travels as a json_schema and comes back unwrapped.
+                    schema=list[RankedArticle],
+                    # Scoring against fixed calibration anchors is recall, not
+                    # deliberation. Left at the model default, reasoning tokens
+                    # draw down the same max_tokens budget as the answer and a
+                    # batch comes back with an empty content field.
+                    reasoning="none",
+                    # {"id","importance_score"} per article is ~25 tokens;
+                    # the headroom is because a constrained response truncates
+                    # into unparseable output rather than degrading.
+                    max_tokens=settings.rank_max_output_tokens_per_article * len(articles),
                 )
-                response_text = response.text
-            except Exception as e:
-                is_error = True
-                error_msg = str(e)
-                raise
-            finally:
-                latency_ms = int((time.time() - start_time) * 1000)
-                if not is_error and response and response.usage_metadata:
-                    self.db.log_llm_usage(
-                        model_name=self.model_name,
-                        operation="rank_batch",
-                        prompt_tokens=response.usage_metadata.prompt_token_count,
-                        candidate_tokens=response.usage_metadata.candidates_token_count,
-                        latency_ms=latency_ms,
-                        is_error=False,
-                        error_message=None,
-                        prompt_text=prompt,
-                        response_text=response_text
-                    )
-                elif is_error:
-                    self.db.log_llm_usage(
-                        model_name=self.model_name,
-                        operation="rank_batch",
-                        prompt_tokens=0,
-                        candidate_tokens=0,
-                        latency_ms=latency_ms,
-                        is_error=True,
-                        error_message=error_msg,
-                        prompt_text=prompt,
-                        response_text=None
-                    )
+
+            results = response.parsed
+            if results is None:
+                # The response missed the schema. The tolerant text parse still
+                # salvages the shapes a model reaches for unprompted, and one
+                # malformed entry must not cost the rest of the batch.
+                results = []
+                for item in parse_json_list(response.text):
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        results.append(RankedArticle.model_validate(item))
+                    except Exception:
+                        continue
+
+            result_map = {r.id: r.importance_score for r in results}
             
-            text = response.text.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-                
-            results = json.loads(text.strip())
-            
-            # Map results back to articles
-            result_map = {item["id"]: item for item in results if "id" in item}
-            
+            applied = 0
             for article in articles:
                 if article.id in result_map:
-                    res = result_map[article.id]
-                    article.importance_score = float(res.get("importance_score", 0.0))
-            
-            log.info("ranker.success", count=len(articles))
+                    article.importance_score = float(result_map[article.id])
+                    applied += 1
+
+            # Report what was scored, not what was sent. These were the same
+            # number until a response shape the parser did not expect scored
+            # none of them and still logged a full batch.
+            log.info("ranker.success", count=len(articles), applied=applied)
+            if applied < len(articles):
+                log.warning("ranker.partial", count=len(articles), applied=applied)
             
         except Exception as e:
             log.error("ranker.failed", error=str(e), count=len(articles))

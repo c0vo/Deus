@@ -32,10 +32,12 @@ function Cell({
   note?: string;
 }) {
   return (
-    <div className="bg-bg-card px-3.5 py-2.5">
+    <div className="bg-bg-card px-3.5 py-2.5 min-w-0">
       <div className="label">{label}</div>
       <div className="num mt-1 text-lg font-medium">{value}</div>
-      {note && <div className="num text-[11px] text-terminal-muted-alt">{note}</div>}
+      {note && (
+        <div className="num text-[11px] text-terminal-muted-alt break-words">{note}</div>
+      )}
     </div>
   );
 }

@@ -7,21 +7,30 @@ Provides WebSocket endpoints for real-time market data, news, and chat.
 
 import asyncio
 import logging
+import mimetypes
 import os
 import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from api.server import router as api_router
+from api.auth import AccessControlMiddleware, auth_router
+from api.middleware import CacheControlMiddleware
+from api import sse_manager
+from api.sse_manager import event_bus
 
 from config.logging_config import get_logger, setup_logging
-from config.settings import settings
+from config.settings import settings, preflight_models
 from data.database import Database
 from bot.telegram_bot import DeusBot
 from orchestrator.scheduler import PipelineOrchestrator
+# Startup/shutdown helpers are shared with the worker so the in-process
+# development path behaves identically to the deployed one.
+import worker
 
 log = get_logger(__name__)
 
@@ -38,59 +47,108 @@ FRONTEND_BUILT = os.path.isdir(FRONTEND_OUT)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifecycle manager for the FastAPI application."""
+    """
+    Lifecycle manager for the FastAPI application.
+
+    Everything here must be local and fast: uvicorn does not create the
+    listening socket until this function reaches its yield, so any network
+    call made before that point delays — or prevents — the dashboard from
+    being reachable at all. The Telegram bot and the ingest pipeline live in
+    worker.py for exactly this reason.
+    """
     global bot, orchestrator
-    
+    telegram_running = False
+
     setup_logging()
     log.info("system.starting", version="2.0.0")
-    
+
     # 1. Init Database
     db.initialize()
     app.state.db = db
-    
-    # 2. Init Bot
-    bot = DeusBot(db=db)
-    bot.initialize()
-    app.state.bot = bot
-    
-    # 3. Init Orchestrator
-    orchestrator = PipelineOrchestrator(db=db, alert_manager=bot.alert_manager)
-    app.state.orchestrator = orchestrator
-    
-    # Start Bot and Orchestrator
-    try:
-        if bot.application:
-            log.info("telegram.starting_polling")
-            await bot.application.initialize()
-            await bot.application.start()
-            await bot.application.updater.start_polling()
-            
+
+    # 2. Relay pipeline events published by the worker process out to SSE
+    #    clients. Without this the Brain dashboard receives its initial
+    #    snapshot and then never updates.
+    sse_manager.configure(db)
+    event_bus.start_tailer()
+
+    # 3. The pipeline and bot normally run in worker.py so they can never
+    #    stall this event loop. ENABLE_IN_PROCESS_WORKER puts them back here
+    #    for single-process local development.
+    if settings.enable_in_process_worker:
+        log.warning("worker.in_process",
+                    reason="ENABLE_IN_PROCESS_WORKER is set; pipeline shares the API event loop")
+        bot = DeusBot(db=db)
+        bot.initialize()
+        app.state.bot = bot
+        orchestrator = PipelineOrchestrator(db=db, alert_manager=bot.alert_manager)
+        app.state.orchestrator = orchestrator
+        telegram_running = await worker._start_telegram(bot)
         orchestrator.start(interval_minutes=settings.pipeline_interval_minutes)
+    else:
+        log.info("worker.external",
+                 hint="run `python worker.py` for the pipeline and Telegram bot")
+
+    try:
         log.info("system.ready")
-        
         yield  # Let the FastAPI app run
-        
+
     finally:
         log.info("system.shutdown_initiated")
-        if orchestrator:
-            orchestrator.stop()
-        if bot and bot.application:
-            await bot.application.updater.stop()
-            await bot.application.stop()
-            await bot.application.shutdown()
+        await event_bus.stop_tailer()
+        if orchestrator or bot:
+            await worker._shutdown(bot, orchestrator, telegram_running)
         log.info("system.shutdown_complete")
+
+# The SPA catch-all serves unknown files via FileResponse with no explicit
+# media_type, so Starlette falls back to mimetypes.guess_type. .webmanifest is
+# not in Python's table, so Next's out/manifest.webmanifest would go out as
+# text/plain and the PWA manifest would be ignored.
+mimetypes.add_type("application/manifest+json", ".webmanifest")
 
 app = FastAPI(title="Deus", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    # Removed allow_credentials=True since it's incompatible with allow_origins=["*"] and not needed here
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Same-origin by default. In the Termux deployment FastAPI serves the static
+# export and the API from the same port, so no cross-origin request is ever
+# legitimate and CORS_ORIGINS stays empty. It used to be allow_origins=["*"],
+# which let any site the phone's browser visited read every endpoint.
+# allow_credentials is on because the session cookie is what authenticates, and
+# it is only safe here because the origin list is explicit — the browser refuses
+# credentialed requests against a wildcard.
+_cors_origins = settings.cors_origin_list
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+# Starlette builds the stack so the LAST registered middleware ends up
+# OUTERMOST: add_middleware inserts at index 0, and build_middleware_stack then
+# wraps in reverse. The resulting order is:
+#
+#     AccessControl -> CacheControl -> GZip -> CORS -> router
+#
+# All of them wrap the whole router, so the /_next mount and the catch-all below
+# are covered without any ordering relationship to the routes themselves.
+#
+# GZip excludes text/event-stream by default (starlette/middleware/gzip.py),
+# so /api/brain/stream and the chat/debate streams keep flowing unbuffered.
+# compresslevel is 6 rather than the library default of 9 because compression
+# runs synchronously on the event loop — level 9 over a 370 KB chunk is a
+# multi-hundred-millisecond stall on a phone CPU for ~3% more ratio.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
+app.add_middleware(CacheControlMiddleware)
+# Registered last so it is outermost: an untrusted peer or a missing session is
+# refused before the gzip and cache-header work happens, and before the /_next
+# StaticFiles mount below can serve a single byte of the dashboard.
+app.add_middleware(AccessControlMiddleware)
 
 # ── Mount API router (must come BEFORE the catch-all) ─────────────────
+# auth_router first: /login and /healthz have to win against the SPA catch-all.
+app.include_router(auth_router)
 app.include_router(api_router)
 
 
@@ -236,8 +294,8 @@ async def ws_news(websocket: WebSocket):
 async def ws_chat(websocket: WebSocket):
     """Interactive chat with the ChatOrchestrator (RAG-powered)."""
     from pipeline.chat_orchestrator import ChatOrchestrator, build_chat_prompt
-    from google.genai import types
-    from config.llm import get_client, DEFAULT_SAFETY_SETTINGS
+    from config.llm import response_cost, stream_complete
+    from config.usage import track_llm
 
     await websocket.accept()
     try:
@@ -263,27 +321,34 @@ async def ws_chat(websocket: WebSocket):
             context = rag_res.get("context", "")
             state["context"] = context
 
-            # Generation
-            client = get_client()
+            # Generation. Two things are fixed here beyond the provider swap:
+            # this used to iterate a SYNCHRONOUS stream with a plain `for`
+            # inside an async handler, blocking the event loop — and with it
+            # every SSE endpoint and the sse_events outbox tail — for the whole
+            # response; and it recorded nothing in llm_usage_log, so a chat
+            # session was free as far as the cost dashboard was concerned.
             model = (
-                settings.gemini_model_chat_shallow if decision == "shallow"
-                else settings.gemini_model_chat_complex
+                settings.model_chat_shallow if decision == "shallow"
+                else settings.model_chat_complex
             )
-
             prompt = build_chat_prompt(user_msg, context)
 
-            response = client.models.generate_content_stream(
-                model=model or "gemini-3.1-flash-lite",
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    safety_settings=DEFAULT_SAFETY_SETTINGS,
-                    max_output_tokens=2048,
-                ),
-            )
-
-            for chunk in response:
-                if chunk.text:
-                    await websocket.send_json({"type": "token", "text": chunk.text})
+            collected: list[str] = []
+            with track_llm(db, model, "ws_chat_stream") as usage:
+                async for chunk in stream_complete(
+                    model=model,
+                    prompt=prompt,
+                    max_tokens=2048,
+                    reasoning=None if decision == "shallow" else "medium",
+                ):
+                    if chunk.text:
+                        collected.append(chunk.text)
+                        await websocket.send_json({"type": "token", "text": chunk.text})
+                    if chunk.usage is not None:
+                        usage.prompt_tokens = getattr(chunk.usage, "prompt_tokens", None)
+                        usage.candidate_tokens = getattr(chunk.usage, "completion_tokens", None)
+                        usage.cost = response_cost(chunk.usage)
+                usage.response_text = "".join(collected)
 
             await websocket.send_json({"type": "done"})
 
@@ -295,6 +360,10 @@ async def ws_chat(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     import subprocess
+
+    # Same check the worker runs. The API process serves chat and the thesis
+    # stream, so an unset MODEL_* is user-visible here too.
+    preflight_models()
 
     # If no static build exists, auto-build OR start dev server
     if os.path.isdir(FRONTEND_DIR) and not FRONTEND_BUILT:
@@ -318,5 +387,23 @@ if __name__ == "__main__":
     elif FRONTEND_BUILT:
         log.info("frontend.static.ready",
                  url=f"http://0.0.0.0:{settings.api_port}")
+
+    # State the access posture at boot. An instance that is listening on every
+    # interface with no passphrase looks completely healthy in the logs
+    # otherwise, which is exactly the failure worth being loud about.
+    log.info(
+        "api.access_control",
+        bind=settings.api_host,
+        login_required=settings.auth_enabled,
+        trusted_networks=settings.trusted_network_list or ["<any>"],
+        cors_origins=settings.cors_origin_list or ["<same-origin only>"],
+    )
+    if settings.api_host not in ("127.0.0.1", "localhost", "::1") and not settings.auth_enabled:
+        log.warning(
+            "api.open_instance",
+            hint="Listening on all interfaces with no DASHBOARD_PASSPHRASE set. "
+                 "Anyone who can reach this port has full access, including the "
+                 "endpoints that spend API credits.",
+        )
 
     uvicorn.run("main:app", host=settings.api_host, port=settings.api_port, reload=False)

@@ -100,7 +100,7 @@ export default function Trending() {
   };
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-4 md:p-6 space-y-4 md:space-y-6">
       {/* Title */}
       <div className="border-b border-border-dim pb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
@@ -113,7 +113,7 @@ export default function Trending() {
         </div>
 
         {/* Hour filter controls */}
-        <div className="flex items-center gap-3 text-xs self-start sm:self-auto">
+        <div className="flex flex-wrap items-center gap-2 text-xs self-start sm:self-auto">
           <span className="label">Time window</span>
           <div className="flex border border-border-dim">
             {[12, 24, 48, 72].map((h) => (
@@ -196,7 +196,7 @@ export default function Trending() {
                     </div>
 
                     {/* Quick Action buttons */}
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <Link
                         href={`/predict?ticker=${item.ticker}`}
                         className="px-3 py-1 rounded border border-terminal-signal text-terminal-signal hover:bg-terminal-signal/10 text-xs font-medium flex items-center gap-1.5 transition-colors"

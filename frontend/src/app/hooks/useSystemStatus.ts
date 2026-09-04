@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import { fetchJson, nonOverlapping } from "../utils/api";
 
 export interface SystemStatus {
   total_articles: number;
@@ -26,11 +27,9 @@ export function useSystemStatus() {
 
   useEffect(() => {
     mounted.current = true;
-    const fetchStatus = async () => {
+    const fetchStatus = nonOverlapping(async () => {
       try {
-        const res = await fetch("/api/status");
-        if (!res.ok) throw new Error("Status endpoint unavailable");
-        const data = await res.json();
+        const data = await fetchJson<any>("/api/status", { timeoutMs: 6000 });
         if (mounted.current) {
           setStatus({
             total_articles: data.total_articles ?? 0,
@@ -46,7 +45,7 @@ export function useSystemStatus() {
           setStatus((prev) => ({ ...prev, online: false }));
         }
       }
-    };
+    });
 
     fetchStatus();
     const interval = setInterval(fetchStatus, 30_000);
