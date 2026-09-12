@@ -42,6 +42,7 @@ import httpx
 
 from config.logging_config import get_logger
 from data.database import Database
+from data.watchlist import DEFAULT_WATCHLIST
 
 log = get_logger(__name__)
 
@@ -88,9 +89,29 @@ class PriceFeed:
     def __init__(self, db: Database):
         self.db = db
 
+    def universe(self) -> list[str]:
+        """
+        Every symbol this feed keeps warm: tracked plus the default watchlist.
+
+        The default names used to be absent, which is what made the market
+        scanner fetch Yahoo itself: SPY and QQQ were never in `latest_prices`
+        unless somebody happened to track them, so there was no stored session
+        context to read a drop against. Now the two tables the scanner and the
+        dashboard read are the only thing either of them needs.
+
+        FALLBACK_TICKERS is still applied when nothing is tracked, because
+        /api/markets falls back to exactly that list and GOOGL is not in the
+        default watchlist — without it that cold-start path shows a dash.
+        """
+        tracked = self.db.get_tracked_tickers() or []
+        symbols = set(tracked) | set(DEFAULT_WATCHLIST)
+        if not tracked:
+            symbols |= set(FALLBACK_TICKERS)
+        return sorted(symbols)
+
     async def refresh(self) -> int:
-        """Fetch every tracked ticker and persist the results. Returns the count stored."""
-        tickers = self.db.get_tracked_tickers() or FALLBACK_TICKERS
+        """Fetch the whole universe and persist the results. Returns the count stored."""
+        tickers = self.universe()
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 
         async with httpx.AsyncClient(timeout=10) as client:
@@ -107,13 +128,13 @@ class PriceFeed:
         return stored
 
     async def refresh_history(self) -> int:
-        """Fetch daily OHLCV for every tracked ticker into price_history.
+        """Fetch daily OHLCV for the whole universe into price_history.
 
         Returns the number of rows written. Each ticker is stored as its own
         upsert rather than one batch at the end, so a symbol Yahoo refuses
         cannot cost the rest of the watchlist its update.
         """
-        tickers = self.db.get_tracked_tickers() or FALLBACK_TICKERS
+        tickers = self.universe()
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_FETCHES)
 
         async with httpx.AsyncClient(timeout=HISTORY_TIMEOUT) as client:
@@ -176,7 +197,7 @@ class PriceFeed:
         semaphore: asyncio.Semaphore,
         ticker: str,
     ) -> Optional[dict]:
-        """Fetch one ticker's last two daily closes."""
+        """Fetch one ticker's last two daily closes, plus the last bar's volume."""
         async with semaphore:
             try:
                 resp = await client.get(
@@ -192,20 +213,32 @@ class PriceFeed:
                     return None
 
                 quote = chart[0].get("indicators", {}).get("quote", [{}])[0]
-                closes = [c for c in quote.get("close", []) if c is not None]
-                if not closes:
+                closes = quote.get("close") or []
+                # Index-aligned rather than compacted: the volume has to come
+                # from the same bar as the close, and compacting the close array
+                # first (as this did) throws away the index that says which one.
+                traded = [i for i, c in enumerate(closes) if c is not None]
+                if not traded:
                     return None
 
-                current = float(closes[-1])
-                previous = float(closes[-2]) if len(closes) >= 2 else current
+                last = traded[-1]
+                current = float(closes[last])
+                previous = (
+                    float(closes[traded[-2]]) if len(traded) >= 2 else current
+                )
                 change_pct = (
                     ((current - previous) / previous * 100) if previous else 0.0
                 )
+                # The live session's running volume, which is what an anomalous
+                # volume alert compares against the 20-session average. None
+                # when Yahoo left it null — 0 would read as "no volume today".
+                volume = _at(quote.get("volume"), last)
                 return {
                     "ticker": ticker,
                     "price": current,
                     "previous_close": previous,
                     "daily_change_pct": change_pct,
+                    "volume": float(volume) if volume is not None else None,
                 }
             except Exception as e:
                 log.warning("price_feed.fetch_failed", ticker=ticker, error=str(e))

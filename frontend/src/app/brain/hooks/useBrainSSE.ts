@@ -3,6 +3,43 @@
 import { useEffect, useRef, useCallback } from "react";
 import { getApiUrl } from "../../utils/api";
 
+/**
+ * State of the classification queue, published by the worker's backlog job and
+ * also included in the SSE snapshot so a freshly-opened page is not blank.
+ *
+ * `pending` is the real unclassified count. Nothing on the dashboard reported it
+ * before: the "pending" number was `total_articles - embedded_articles`, which
+ * counts pre-filtered noise forever and says nothing about classification.
+ */
+export interface ClassificationStatus {
+  /** Unclassified, non-duplicate rows — the backlog. */
+  pending: number;
+  /** Of those, the ones inside the age window with retries left. */
+  pending_in_window: number;
+  /** Unclassified rows that have used up their retry budget. */
+  exhausted: number;
+  stale: number;
+  error: number;
+  noise: number;
+  /** Corpus total, excluding noise/error/stale. */
+  classified: number;
+  embedding_pending: number;
+  embedding_exhausted: number;
+  embedding_skipped_noise: number;
+  /** False when no MODEL_CLASSIFIER slug is set — ingest is embedding-only. */
+  classifier_configured?: boolean;
+  /** Fields below come from the last backlog run, when there has been one. */
+  last_run_at?: string;
+  last_run_classified?: number;
+  trigger?: string;
+  candidates?: number;
+  failed?: number;
+  stale_marked?: number;
+  error_requeued?: number;
+  duration_s?: number;
+  configured?: boolean;
+}
+
 export interface BrainSnapshot {
   articles: any[];
   embedding_status: {
@@ -10,11 +47,14 @@ export interface BrainSnapshot {
     embedded_articles: number;
     pending_articles: number;
     success_rate_pct: number;
+    /** Rows skipped by the embed pass because they are already noise. */
+    embedding_skipped_noise?: number;
     /** Articles flagged as semantic duplicates of an earlier story. */
     duplicate_articles?: number;
     unique_articles?: number;
     dedup_pending?: number;
   };
+  classification_status?: ClassificationStatus;
   sentiment_distribution: {
     bullish: number;
     bearish: number;
@@ -38,7 +78,13 @@ export interface SSEOptions {
   onMarketTicker?: (data: any) => void;
   onSentimentDistribution?: (data: any) => void;
   onEmbeddingStatus?: (data: any) => void;
+  onClassificationStatus?: (data: ClassificationStatus) => void;
   onThesisUpdate?: (data: any) => void;
+  onMacroThemes?: (data: unknown) => void;
+  /** One pushed alert row, same shape as a /api/alerts entry. */
+  onAlert?: (data: unknown) => void;
+  /** The worker published a new weekly-tip digest; refetch /api/digests/latest. */
+  onWeeklyTip?: (data: unknown) => void;
   onError?: (error: string) => void;
   onReconnect?: () => void;
 }
@@ -111,7 +157,7 @@ export function useBrainSSE(options: SSEOptions) {
               continue;
             }
 
-            const { onSnapshot, onPipelineStatus, onNewArticles, onSectorHeatmap, onRotationSignal, onIpoAlert, onEventsUpdated, onTrendForecast, onHotTickers, onMarketTicker, onSentimentDistribution, onEmbeddingStatus, onThesisUpdate, onReconnect } = optionsRef.current;
+            const { onSnapshot, onPipelineStatus, onNewArticles, onSectorHeatmap, onRotationSignal, onIpoAlert, onEventsUpdated, onTrendForecast, onHotTickers, onMarketTicker, onSentimentDistribution, onEmbeddingStatus, onClassificationStatus, onThesisUpdate, onMacroThemes, onAlert, onWeeklyTip, onReconnect } = optionsRef.current;
 
             switch (currentEvent) {
               case "snapshot":
@@ -151,8 +197,20 @@ export function useBrainSSE(options: SSEOptions) {
               case "embedding_status":
                 onEmbeddingStatus?.(data);
                 break;
+              case "classification_status":
+                onClassificationStatus?.(data as ClassificationStatus);
+                break;
               case "thesis_update":
                 onThesisUpdate?.(data);
+                break;
+              case "macro_themes":
+                onMacroThemes?.(data);
+                break;
+              case "alert":
+                onAlert?.(data);
+                break;
+              case "weekly_tip":
+                onWeeklyTip?.(data);
                 break;
               case "heartbeat":
                 // keep-alive, no action needed

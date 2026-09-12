@@ -587,7 +587,524 @@ class TestOptionChainDaily:
         assert db.get_last_option_chain_date("NVDA") is None
 
 
+# ── Alerts & Digests ────────────────────────────────────────────────────────
+
+def _alert(ticker="AAPL", kind="price_drop", pct=-3.1, **kw):
+    row = {
+        "ticker": ticker,
+        "kind": kind,
+        "pct": pct,
+        "price": 100.0,
+        "title": f"{ticker} moved {pct}%",
+    }
+    row.update(kw)
+    return row
+
+
+class TestAlerts:
+    """The alerts table stores what was pushed, not just that it was."""
+
+    def test_table_created(self, db):
+        with db.connection() as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='alerts'"
+            ).fetchone()
+        assert row is not None
+
+    def test_insert_returns_row_id(self, db):
+        first = db.insert_alert(_alert())
+        second = db.insert_alert(_alert(pct=-6.2))
+        assert first >= 1 and second > first
+
+    def test_round_trips_the_fields_the_card_renders(self, db):
+        db.insert_alert(_alert(grounded_by="web", summary="Guidance cut",
+                               sources_json=[{"url": "https://example.com/a"}]))
+        row = db.get_recent_alerts(limit=1)[0]
+        assert row["ticker"] == "AAPL"
+        assert row["pct"] == -3.1
+        assert row["grounded_by"] == "web"
+        assert row["summary"] == "Guidance cut"
+        # Accepted as a list and stored as JSON, because that is what the
+        # grounding module produces.
+        assert json.loads(row["sources_json"])[0]["url"] == "https://example.com/a"
+
+    def test_defaults_when_grounding_is_absent(self, db):
+        db.insert_alert(_alert())
+        row = db.get_recent_alerts(limit=1)[0]
+        assert row["sources_json"] == "[]"
+        assert row["grounded_by"] == "none"
+
+    def test_newest_first_within_the_same_second(self, db):
+        """CURRENT_TIMESTAMP only has second resolution; id is the tiebreak."""
+        db.insert_alert(_alert(pct=-3.1))
+        db.insert_alert(_alert(pct=-6.2))
+        assert [r["pct"] for r in db.get_recent_alerts()] == [-6.2, -3.1]
+
+    def test_honours_the_limit(self, db):
+        for pct in (-3.1, -4.2, -5.3):
+            db.insert_alert(_alert(pct=pct))
+        assert len(db.get_recent_alerts(limit=2)) == 2
+
+    def test_filters_by_kind(self, db):
+        db.insert_alert(_alert(kind="price_drop"))
+        db.insert_alert(_alert(kind="volume"))
+        kinds = [r["kind"] for r in db.get_recent_alerts(kind="volume")]
+        assert kinds == ["volume"]
+
+    def test_last_abs_pct_is_none_when_nothing_was_sent(self, db):
+        assert db.get_last_alert_abs_pct_today("AAPL", ("price_drop",)) is None
+
+    def test_last_abs_pct_takes_the_deepest_move(self, db):
+        db.insert_alert(_alert(pct=-3.1))
+        db.insert_alert(_alert(pct=-6.2))
+        db.insert_alert(_alert(pct=-4.0))
+        assert db.get_last_alert_abs_pct_today("AAPL", ("price_drop",)) == 6.2
+
+    def test_last_abs_pct_is_per_ticker(self, db):
+        db.insert_alert(_alert(ticker="AAPL", pct=-6.2))
+        assert db.get_last_alert_abs_pct_today("MSFT", ("price_drop",)) is None
+
+    def test_last_abs_pct_respects_the_kinds_filter(self, db):
+        db.insert_alert(_alert(kind="volume", pct=-6.2))
+        assert db.get_last_alert_abs_pct_today("AAPL", ("price_drop",)) is None
+
+    def test_last_abs_pct_with_no_kinds_queries_nothing(self, db):
+        db.insert_alert(_alert(pct=-6.2))
+        assert db.get_last_alert_abs_pct_today("AAPL", ()) is None
+
+    def test_last_abs_pct_ignores_earlier_days(self, db):
+        """Yesterday's alert must not suppress today's first one."""
+        db.insert_alert(_alert(pct=-6.2))
+        with db.connection() as conn:
+            conn.execute(
+                "UPDATE alerts SET created_at = datetime('now', '-2 days')"
+            )
+        assert db.get_last_alert_abs_pct_today("AAPL", ("price_drop",)) is None
+
+
+class TestDigests:
+    """Generated pushes are persisted so they can be shown and re-read."""
+
+    def test_table_created(self, db):
+        with db.connection() as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='digests'"
+            ).fetchone()
+        assert row is not None
+
+    def test_insert_and_fetch_latest(self, db):
+        db.insert_digest("weekly_tip", "<b>older</b>")
+        db.insert_digest("weekly_tip", "<b>newer</b>")
+        assert db.get_latest_digest("weekly_tip")["body_html"] == "<b>newer</b>"
+
+    def test_kinds_do_not_leak_into_each_other(self, db):
+        db.insert_digest("weekly_tip", "<b>tip</b>")
+        db.insert_digest("daily_briefing", "<b>brief</b>")
+        assert db.get_latest_digest("daily_briefing")["body_html"] == "<b>brief</b>"
+        assert len(db.get_digests("weekly_tip")) == 1
+
+    def test_unknown_kind_returns_none(self, db):
+        assert db.get_latest_digest("never_generated") is None
+
+    def test_facts_are_stored_as_json_from_a_dict(self, db):
+        """facts_json is the audit trail for every number in the body."""
+        db.insert_digest("weekly_tip", "<b>a</b>",
+                         facts_json={"spy_september_median": -0.6})
+        row = db.get_latest_digest("weekly_tip")
+        assert json.loads(row["facts_json"])["spy_september_median"] == -0.6
+
+    def test_period_and_model_round_trip(self, db):
+        db.insert_digest("weekly_tip", "<b>a</b>", body_text="a", model="vendor/model",
+                         period_start="2026-09-06", period_end="2026-09-12")
+        row = db.get_latest_digest("weekly_tip")
+        assert row["period_start"] == "2026-09-06"
+        assert row["period_end"] == "2026-09-12"
+        assert row["model"] == "vendor/model"
+        assert row["body_text"] == "a"
+
+    def test_history_is_newest_first_and_limited(self, db):
+        for i in range(3):
+            db.insert_digest("weekly_tip", f"<b>{i}</b>")
+        bodies = [r["body_html"] for r in db.get_digests("weekly_tip", limit=2)]
+        assert bodies == ["<b>2</b>", "<b>1</b>"]
+
+
+# ── Daily Stance Tests ──────────────────────────────────────────────────────
+
+class TestStances:
+    """One evidence-based call per ticker per day, keyed so a re-run replaces it."""
+
+    def test_table_created(self, db):
+        with db.connection() as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='stances'"
+            ).fetchone()
+        assert row is not None
+
+    def test_insert_and_fetch_latest(self, db):
+        db.upsert_stance("NVDA", "2026-09-11", "HOLD", conviction="Low")
+        db.upsert_stance("NVDA", "2026-09-12", "TRIM", conviction="Medium",
+                         thesis="Rating flipped to Sell.",
+                         key_risk="Target implies upside.",
+                         what_would_change="A close above $185.",
+                         model="vendor/model")
+        row = db.get_latest_stance("NVDA")
+        assert row["action"] == "TRIM"
+        assert row["conviction"] == "Medium"
+        assert row["what_would_change"] == "A close above $185."
+        assert row["model"] == "vendor/model"
+
+    def test_before_excludes_the_row_just_written(self, db):
+        """
+        The arrow compares today against yesterday. Without `before`, a re-run
+        the same morning would read back the row it had written and report every
+        stance as unchanged.
+        """
+        db.upsert_stance("NVDA", "2026-09-11", "HOLD")
+        db.upsert_stance("NVDA", "2026-09-12", "SELL")
+        assert db.get_latest_stance("NVDA", before="2026-09-12")["action"] == "HOLD"
+
+    def test_before_with_no_earlier_row_is_none(self, db):
+        db.upsert_stance("NVDA", "2026-09-12", "SELL")
+        assert db.get_latest_stance("NVDA", before="2026-09-12") is None
+
+    def test_same_day_rerun_replaces_rather_than_duplicates(self, db):
+        db.upsert_stance("NVDA", "2026-09-12", "HOLD", prev_action="BUY/ADD")
+        db.upsert_stance("NVDA", "2026-09-12", "SELL", prev_action="HOLD")
+        with db.connection() as conn:
+            count = conn.execute("SELECT COUNT(*) c FROM stances").fetchone()["c"]
+        assert count == 1
+        row = db.get_latest_stance("NVDA")
+        assert row["action"] == "SELL"
+        assert row["prev_action"] == "HOLD"
+
+    def test_ticker_is_upper_cased(self, db):
+        db.upsert_stance("nvda", "2026-09-12", "HOLD")
+        assert db.get_latest_stance("NVDA") is not None
+
+    def test_unknown_ticker_is_none(self, db):
+        assert db.get_latest_stance("NOSUCH") is None
+
+    def test_json_columns_accept_python_objects(self, db):
+        db.upsert_stance("NVDA", "2026-09-12", "TRIM",
+                         evidence_json=["rsi", "analyst_target"],
+                         facts_json={"ret_1d": -3.1})
+        row = db.get_latest_stance("NVDA")
+        assert json.loads(row["evidence_json"]) == ["rsi", "analyst_target"]
+        assert json.loads(row["facts_json"])["ret_1d"] == -3.1
+
+    def test_latest_stances_is_one_row_per_ticker(self, db):
+        db.upsert_stance("NVDA", "2026-09-11", "HOLD")
+        db.upsert_stance("NVDA", "2026-09-12", "SELL")
+        db.upsert_stance("AMD", "2026-09-12", "BUY/ADD",
+                         evidence_json=["ml", "news"])
+        latest = db.get_latest_stances()
+        assert set(latest) == {"NVDA", "AMD"}
+        assert latest["NVDA"]["action"] == "SELL"
+        # Decoded in the DB layer: the API hands this straight to the browser,
+        # and a nested JSON string would need a second parse there.
+        assert latest["AMD"]["evidence_used"] == ["ml", "news"]
+        assert "evidence_json" not in latest["AMD"]
+
+    def test_latest_stances_is_empty_before_the_first_run(self, db):
+        assert db.get_latest_stances() == {}
+
+    def test_malformed_evidence_json_degrades_to_empty(self, db):
+        """A bad blob must not take the whole market grid down with it."""
+        db.upsert_stance("NVDA", "2026-09-12", "HOLD", evidence_json="not json")
+        assert db.get_latest_stances()["NVDA"]["evidence_used"] == []
+# ── Classification Queue Tests ──────────────────────────────────────────────
+
+class TestClassificationQueue:
+    """
+    The bounded classification backlog.
+
+    Every test here corresponds to one way the unbounded version went wrong on
+    the phone: a permanently poisoned row re-selected forever, an archive of old
+    articles keeping the queue non-empty, and a 'pending' number that measured
+    embeddings rather than classification.
+    """
+
+    @staticmethod
+    def _insert(db, article_id, *, days_old=0, event_type=None, attempts=0,
+                duplicate_of=None, summary=None):
+        published = datetime.now(timezone.utc) - timedelta(days=days_old)
+        with db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO articles (
+                    id, headline, summary, content_hash, source_name, source_type,
+                    url, published_at, fetched_at, event_type,
+                    classification_attempts, duplicate_of, classification_summary
+                ) VALUES (?, ?, ?, ?, 'test', 'rss', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    article_id, f"Headline {article_id}", "Summary",
+                    f"hash_{article_id}", f"https://example.com/{article_id}",
+                    published.isoformat(), published.isoformat(),
+                    event_type, attempts, duplicate_of, summary,
+                ),
+            )
+
+    def test_migration_adds_classification_attempts_column(self, db):
+        with db.connection() as conn:
+            columns = [c["name"] for c in conn.execute("PRAGMA table_info(articles)")]
+        assert "classification_attempts" in columns
+
+    def test_migration_creates_partial_unclassified_index(self, db):
+        with db.connection() as conn:
+            names = [
+                r["name"] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            ]
+        assert "idx_articles_unclassified" in names
+
+    def test_candidates_exclude_duplicates_exhausted_and_old(self, db):
+        self._insert(db, "fresh")
+        self._insert(db, "dup", duplicate_of="fresh")
+        self._insert(db, "exhausted", attempts=3)
+        self._insert(db, "ancient", days_old=90)
+        self._insert(db, "classified", event_type="macro")
+
+        ids = {
+            r["id"] for r in db.get_classification_candidates(
+                limit=50, max_attempts=3, max_age_days=30
+            )
+        }
+        assert ids == {"fresh"}
+
+    def test_candidates_are_newest_first_and_respect_limit(self, db):
+        for i, age in enumerate((5, 1, 3)):
+            self._insert(db, f"a{i}", days_old=age)
+
+        rows = db.get_classification_candidates(limit=2, max_attempts=3, max_age_days=30)
+        assert [r["id"] for r in rows] == ["a1", "a2"]
+
+    def test_candidates_allow_attempts_below_the_cap(self, db):
+        self._insert(db, "one_try", attempts=1)
+        self._insert(db, "two_tries", attempts=2)
+        ids = {
+            r["id"] for r in db.get_classification_candidates(
+                limit=50, max_attempts=3, max_age_days=30
+            )
+        }
+        assert ids == {"one_try", "two_tries"}
+
+    def test_record_failure_increments_and_returns_new_counts(self, db):
+        self._insert(db, "a", attempts=1)
+        self._insert(db, "b")
+
+        counts = db.record_classification_failure(["a", "b"])
+        assert counts == {"a": 2, "b": 1}
+        # The rows stay NULL so a later pass can retry them.
+        with db.connection() as conn:
+            types = [
+                r["event_type"] for r in conn.execute(
+                    "SELECT event_type FROM articles"
+                )
+            ]
+        assert types == [None, None]
+
+    def test_record_failure_on_empty_list_is_a_noop(self, db):
+        assert db.record_classification_failure([]) == {}
+
+    def test_mark_stale_only_touches_old_unclassified_rows(self, db):
+        self._insert(db, "fresh")
+        self._insert(db, "ancient", days_old=60)
+        self._insert(db, "ancient_classified", days_old=60, event_type="macro")
+
+        assert db.mark_stale_unclassified(max_age_days=30) == 1
+        with db.connection() as conn:
+            rows = {
+                r["id"]: (r["event_type"], r["classification_summary"], r["urgency"])
+                for r in conn.execute(
+                    "SELECT id, event_type, classification_summary, urgency FROM articles"
+                )
+            }
+        assert rows["ancient"][0] == "stale"
+        assert "older than 30 days" in rows["ancient"][1]
+        assert rows["ancient"][2] == "low"
+        assert rows["fresh"][0] is None
+        assert rows["ancient_classified"][0] == "macro"
+
+    def test_mark_stale_honours_its_limit(self, db):
+        for i in range(5):
+            self._insert(db, f"old{i}", days_old=40 + i)
+
+        assert db.mark_stale_unclassified(max_age_days=30, limit=2) == 2
+        with db.connection() as conn:
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS c FROM articles WHERE event_type IS NULL"
+            ).fetchone()["c"]
+        assert remaining == 3
+
+    def test_requeue_error_articles_clears_verdict_and_attempts(self, db):
+        self._insert(db, "recent_error", event_type="error", attempts=1,
+                     summary="Classification failed.")
+        self._insert(db, "old_error", days_old=90, event_type="error", attempts=2)
+        self._insert(db, "noise", event_type="noise")
+
+        assert db.requeue_error_articles(max_age_days=30) == 1
+        with db.connection() as conn:
+            rows = {
+                r["id"]: (r["event_type"], r["classification_attempts"],
+                          r["classification_summary"])
+                for r in conn.execute(
+                    "SELECT id, event_type, classification_attempts, "
+                    "classification_summary FROM articles"
+                )
+            }
+        assert rows["recent_error"] == (None, 0, None)
+        # Out of window: left alone rather than requeued into work nobody wants.
+        assert rows["old_error"][0] == "error"
+        assert rows["noise"][0] == "noise"
+
+    def test_reset_parked_attempts_unparks_only_exhausted_unclassified_rows(self, db):
+        """Give back the retries a broken request shape spent, nothing more.
+
+        The batch schema demanded only `id` and put no minimum on the items
+        array, so ten articles came back as one near-empty object: nine rows per
+        batch took a `batch_missing_result` and burnt all three attempts inside
+        fifteen minutes, on requests that never asked about them.
+        """
+        self._insert(db, "parked", attempts=3)
+        self._insert(db, "very_parked", attempts=7)
+        self._insert(db, "still_trying", attempts=2)
+        self._insert(db, "untried")
+        # A row that reached a verdict keeps it, whatever its attempt count —
+        # otherwise this would re-queue work that is already paid for and done.
+        self._insert(db, "classified_but_retried", attempts=3, event_type="macro")
+        self._insert(db, "noise", attempts=3, event_type="noise")
+
+        assert db.reset_parked_classification_attempts(max_attempts=3) == 2
+
+        with db.connection() as conn:
+            rows = {
+                r["id"]: (r["event_type"], r["classification_attempts"])
+                for r in conn.execute(
+                    "SELECT id, event_type, classification_attempts FROM articles"
+                )
+            }
+        assert rows["parked"] == (None, 0)
+        assert rows["very_parked"] == (None, 0)
+        # Below the cap: still a live candidate, so its count must not move.
+        assert rows["still_trying"] == (None, 2)
+        assert rows["untried"] == (None, 0)
+        assert rows["classified_but_retried"] == ("macro", 3)
+        assert rows["noise"] == ("noise", 3)
+
+    def test_reset_parked_attempts_makes_rows_selectable_again(self, db):
+        """The whole point: the row has to come back out of the candidate query."""
+        self._insert(db, "parked", attempts=3)
+
+        assert db.get_classification_candidates(
+            limit=50, max_attempts=3, max_age_days=30
+        ) == []
+
+        db.reset_parked_classification_attempts(max_attempts=3)
+        ids = {
+            r["id"] for r in db.get_classification_candidates(
+                limit=50, max_attempts=3, max_age_days=30
+            )
+        }
+        assert ids == {"parked"}
+
+    def test_reset_parked_attempts_is_idempotent_and_honours_the_cap(self, db):
+        """It runs once per deploy, but a worker that dies mid-run re-runs it."""
+        self._insert(db, "parked", attempts=3)
+
+        assert db.reset_parked_classification_attempts(max_attempts=3) == 1
+        assert db.reset_parked_classification_attempts(max_attempts=3) == 0
+
+        # A different cap selects a different set; nothing below it is touched.
+        self._insert(db, "two_tries", attempts=2)
+        assert db.reset_parked_classification_attempts(max_attempts=5) == 0
+        assert db.reset_parked_classification_attempts(max_attempts=2) == 1
+
+    def test_reset_parked_attempts_on_an_empty_table_is_a_noop(self, db):
+        assert db.reset_parked_classification_attempts(max_attempts=3) == 0
+
+    def test_stats_exposes_every_documented_key(self, db):
+        stats = db.get_classification_stats()
+        assert set(stats) == {
+            "pending", "pending_in_window", "exhausted", "stale", "error",
+            "noise", "classified", "embedding_pending", "embedding_exhausted",
+            "embedding_skipped_noise",
+        }
+
+    def test_stats_separate_the_backlog_from_its_terminal_states(self, db):
+        self._insert(db, "pending_fresh")
+        self._insert(db, "pending_old", days_old=60)
+        self._insert(db, "exhausted", attempts=3)
+        self._insert(db, "stale", event_type="stale")
+        self._insert(db, "error", event_type="error")
+        self._insert(db, "noise", event_type="noise")
+        self._insert(db, "real", event_type="earnings")
+
+        stats = db.get_classification_stats(max_age_days=30, max_attempts=3)
+        assert stats["pending"] == 3            # fresh + old + exhausted
+        assert stats["pending_in_window"] == 1  # only the fresh one is workable
+        assert stats["exhausted"] == 1
+        assert stats["stale"] == 1
+        assert stats["error"] == 1
+        assert stats["noise"] == 1
+        assert stats["classified"] == 1         # 'real' only
+
+    def test_embedding_pending_excludes_noise_rows(self, db):
+        """The whole "17,551 pending" illusion in one assertion.
+
+        99.8% of that number was noise rows the embed query skips by design, so
+        it could never fall and said nothing about anything.
+        """
+        self._insert(db, "needs_embedding")
+        self._insert(db, "noise_unembedded", event_type="noise")
+
+        stats = db.get_classification_stats()
+        assert stats["embedding_pending"] == 1
+        assert stats["embedding_skipped_noise"] == 1
+
+    def test_unranked_excludes_noise_error_and_stale(self, db):
+        self._insert(db, "ok", event_type="earnings")
+        self._insert(db, "noise", event_type="noise")
+        self._insert(db, "error", event_type="error")
+        self._insert(db, "stale", event_type="stale")
+
+        ids = {r["id"] for r in db.get_unranked_articles(limit=50)}
+        assert ids == {"ok"}
+
+    def test_get_stats_reports_the_backlog(self, db):
+        self._insert(db, "pending")
+        self._insert(db, "stale", event_type="stale")
+        self._insert(db, "error", event_type="error")
+        self._insert(db, "dup", duplicate_of="pending")
+
+        stats = db.get_stats()
+        assert stats["unclassified_articles"] == 1  # the duplicate does not count
+        assert stats["stale_articles"] == 1
+        assert stats["error_articles"] == 1
+
+
 # ── sqlite-vec Extension Tests ──────────────────────────────────────────────
+
+class TestPriceHistoryStarts:
+    def test_returns_the_earliest_row_only_for_requested_tickers(self, db):
+        db.upsert_price_history("SPY", [
+            {"date": "1993-01-29", "open": 43.9, "high": 43.9,
+             "low": 43.9, "close": 43.9},
+            {"date": "2026-09-11", "open": 650.0, "high": 650.0,
+             "low": 650.0, "close": 650.0},
+        ])
+        db.upsert_price_history("QQQ", [{"date": "1999-03-10", "open": 51.0,
+                                           "high": 51.0, "low": 51.0, "close": 51.0}])
+
+        assert db.get_price_history_starts([" spy ", "MISSING", "QQQ"]) == {
+            "SPY": "1993-01-29", "QQQ": "1999-03-10",
+        }
+
+    def test_empty_input_does_not_build_invalid_sql(self, db):
+        assert db.get_price_history_starts([]) == {}
+
 
 @pytest.mark.skipif(
     not __import__("importlib").util.find_spec("sqlite_vec"),

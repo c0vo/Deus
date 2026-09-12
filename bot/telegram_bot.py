@@ -18,6 +18,8 @@ from bot.commands import (
     markets_command, track_command, untrack_command, briefing_command, handle_query,
     predict_command, accuracy_command,
     sectors_command, ipos_command, events_command, themes_command, forecast_command,
+    macro_command,
+    tip_command,
 )
 from bot.alerts import AlertManager
 from data.database import Database
@@ -68,6 +70,8 @@ class DeusBot:
         self.application.add_handler(CommandHandler("sectors", sectors_command))
         self.application.add_handler(CommandHandler("ipos", ipos_command))
         self.application.add_handler(CommandHandler("events", events_command))
+        self.application.add_handler(CommandHandler("macro", macro_command))
+        self.application.add_handler(CommandHandler("tip", tip_command))
         self.application.add_handler(CommandHandler("themes", themes_command))
         self.application.add_handler(CommandHandler("forecast", forecast_command))
         
@@ -98,6 +102,8 @@ class DeusBot:
                 BotCommand("sectors", "Sector sentiment heatmap"),
                 BotCommand("ipos", "IPO watchlist"),
                 BotCommand("events", "Upcoming earnings & events"),
+                BotCommand("macro", "Macro calendar (e.g. /macro 30)"),
+                BotCommand("tip", "Weekly tip (/tip now to rebuild)"),
                 BotCommand("themes", "Current macro themes"),
                 BotCommand("forecast", "Sector outlook (e.g. /forecast Technology)"),
             ]

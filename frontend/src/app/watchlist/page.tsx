@@ -19,6 +19,23 @@ interface AdvisoryInfo {
   _cache_date?: string;
 }
 
+// This morning's evidence-based call, written by the worker's daily advisor job.
+// Distinct from cached_advisory, which is the standing 5-day Bull/Bear debate.
+// NO CALL and UNAVAILABLE are not stances: they mean the job produced no call,
+// and the UI has to keep saying so rather than rendering them as a HOLD.
+interface DailyStanceInfo {
+  ticker: string;
+  date: string;
+  action: string;
+  conviction?: string | null;
+  thesis?: string | null;
+  key_risk?: string | null;
+  what_would_change?: string | null;
+  evidence_used?: string[];
+  prev_action?: string | null;
+  model?: string | null;
+}
+
 interface MarketTickerData {
   ticker: string;
   sector: string;
@@ -26,6 +43,7 @@ interface MarketTickerData {
   daily_change_pct: number;
   predictions: Record<string, PredictionInfo>;
   cached_advisory?: AdvisoryInfo;
+  daily_stance?: DailyStanceInfo | null;
 }
 
 interface ChartPoint {
@@ -63,6 +81,46 @@ const RANGE_TO_DAYS: Record<string, number> = {
 
 const money = (value?: number | null) => `$${Number(value ?? 0).toFixed(2)}`;
 const pct = (value?: number | null) => `${Number(value ?? 0) >= 0 ? "+" : ""}${Number(value ?? 0).toFixed(2)}%`;
+
+// Ranked weakest to strongest, mirroring _ACTION_RANK in pipeline/daily_stance.py.
+// A key missing here is not a call (NO CALL / UNAVAILABLE) and gets the muted
+// treatment plus no arrow, because there is nothing to compare it against.
+const STANCE_RANK: Record<string, number> = { SELL: 0, TRIM: 1, HOLD: 2, "BUY/ADD": 3 };
+
+// Kept as two maps rather than one "border-x text-y" string so the text colour
+// can be used on its own without slicing a class list apart.
+const STANCE_TEXT: Record<string, string> = {
+  "BUY/ADD": "text-terminal-green",
+  HOLD: "text-terminal-text",
+  TRIM: "text-terminal-yellow",
+  SELL: "text-terminal-red",
+};
+
+const STANCE_BORDER: Record<string, string> = {
+  "BUY/ADD": "border-terminal-green",
+  HOLD: "border-border-dim",
+  TRIM: "border-terminal-yellow",
+  SELL: "border-terminal-red",
+};
+
+const stanceText = (action?: string | null) =>
+  STANCE_TEXT[action ?? ""] ?? "text-terminal-muted";
+
+const stanceBorder = (action?: string | null) =>
+  STANCE_BORDER[action ?? ""] ?? "border-terminal-muted";
+
+// Same arrow vocabulary the Telegram note uses, recomputed here from the stored
+// prev_action rather than shipped as a rendered string, so the chip and the note
+// cannot drift apart.
+const stanceArrow = (action?: string | null, prev?: string | null) => {
+  const now = STANCE_RANK[action ?? ""];
+  const before = STANCE_RANK[prev ?? ""];
+  if (now === undefined) return "";
+  if (before === undefined) return "🆕";
+  if (now > before) return "⬆";
+  if (now < before) return "⬇";
+  return "↔";
+};
 
 // Client-side memory cache to persist markets data across route changes (Stale-While-Revalidate pattern)
 let cachedWatchlist: string[] | null = null;
@@ -391,6 +449,16 @@ export default function WatchlistPage() {
                           <span className="text-xs text-terminal-muted px-2 py-0.5 border border-border-dim">
                             {item.sector}
                           </span>
+                          {item.daily_stance && (
+                            <span
+                              className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 border ${stanceBorder(item.daily_stance.action)} ${stanceText(item.daily_stance.action)}`}
+                              title={item.daily_stance.thesis || undefined}
+                            >
+                              Daily stance: {item.daily_stance.action}
+                              {item.daily_stance.conviction ? ` (${item.daily_stance.conviction})` : ""}{" "}
+                              {stanceArrow(item.daily_stance.action, item.daily_stance.prev_action)}
+                            </span>
+                          )}
                         </div>
 
                         <div className="flex items-center gap-4 md:gap-6 shrink-0">
@@ -470,6 +538,52 @@ export default function WatchlistPage() {
                       {/* Expandable AI Narrative Section */}
                       {isExpanded && (
                         <div className="border-t border-border-dim bg-bg-surface/50 p-3 md:p-4 space-y-4">
+
+                          {/* This morning's stance, with the evidence behind it.
+                              Sits above the 5-day debate because it is the newer
+                              and narrower call: today's read on the position,
+                              against the debate's standing five-day view. */}
+                          {item.daily_stance && (
+                            <div className="border-b border-border-dim pb-3 space-y-1.5">
+                              <h4 className="text-xs font-bold text-terminal-text uppercase tracking-wider">
+                                [Daily Stance &mdash; {item.daily_stance.date}]
+                              </h4>
+                              <p className="text-sm">
+                                <span className={`font-bold ${stanceText(item.daily_stance.action)}`}>
+                                  {item.daily_stance.action}
+                                  {item.daily_stance.conviction ? ` (${item.daily_stance.conviction})` : ""}
+                                </span>{" "}
+                                <span className="text-terminal-muted">
+                                  {stanceArrow(item.daily_stance.action, item.daily_stance.prev_action)}
+                                  {item.daily_stance.prev_action &&
+                                   item.daily_stance.prev_action !== item.daily_stance.action
+                                    ? ` was ${item.daily_stance.prev_action}`
+                                    : ""}
+                                </span>
+                              </p>
+                              {item.daily_stance.thesis && (
+                                <p className="text-sm text-terminal-text leading-relaxed font-sans">
+                                  {item.daily_stance.thesis}
+                                </p>
+                              )}
+                              {item.daily_stance.key_risk && (
+                                <p className="text-xs text-terminal-muted font-sans">
+                                  <span className="font-bold">Risk:</span> {item.daily_stance.key_risk}
+                                </p>
+                              )}
+                              {item.daily_stance.what_would_change && (
+                                <p className="text-xs text-terminal-muted font-sans">
+                                  <span className="font-bold">Changes mind:</span>{" "}
+                                  {item.daily_stance.what_would_change}
+                                </p>
+                              )}
+                              {!!item.daily_stance.evidence_used?.length && (
+                                <p className="text-[10px] text-terminal-muted uppercase tracking-wider">
+                                  Evidence: {item.daily_stance.evidence_used.join(", ")}
+                                </p>
+                              )}
+                            </div>
+                          )}
 
                           {/* Sell-side consensus and the local technical rating.
                               Fetches itself rather than riding on fetchTickerDetail:

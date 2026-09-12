@@ -21,6 +21,27 @@ export const EVENT_LABELS: Record<string, string> = {
   split: "Stock split",
   acquisition: "Acquisition",
   ipo: "IPO",
+  // macro_events.kind — the full enum, so a row never renders as a raw
+  // snake_case string. Keep in step with MACRO_EVENT_KINDS in
+  // data/macro_calendar.py.
+  fomc: "FOMC decision",
+  fomc_minutes: "FOMC minutes",
+  cpi: "CPI",
+  ppi: "PPI",
+  pce: "PCE",
+  nfp: "Jobs report",
+  gdp: "GDP",
+  retail_sales: "Retail sales",
+  fed_speech: "Fed speech",
+  jackson_hole: "Jackson Hole",
+  opex: "Options expiry",
+  quad_witching: "Quad witching",
+  month_end: "Month end",
+  quarter_end: "Quarter end",
+  holiday: "Market holiday",
+  early_close: "Early close",
+  earnings_season: "Earnings season",
+  other: "Macro event",
 };
 
 export const WEEKDAY_LABELS = ["M", "T", "W", "T", "F", "S", "S"];

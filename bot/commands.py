@@ -18,7 +18,14 @@ from telegram.ext import ContextTypes
 from config.logging_config import get_logger
 from config.settings import settings
 from data.database import Database
-from bot.formatters import EMPTY_BRIEFING_TEXT, chunk_html, escape_html, render_briefing
+from bot.formatters import (
+    EMPTY_BRIEFING_TEXT,
+    MACRO_IMPORTANCE_MARKERS,
+    chunk_html,
+    escape_html,
+    render_briefing,
+    render_weekly_tip,
+)
 
 log = get_logger(__name__)
 fallback_db = Database()
@@ -63,6 +70,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• /accuracy [TICKER] - View prediction accuracy (e.g. <code>/accuracy AAPL</code>)\n"
         "• /track &lt;TICKER&gt; - Add to watchlist (e.g. <code>/track MSFT</code>)\n"
         "• /untrack &lt;TICKER&gt; - Remove from watchlist (e.g. <code>/untrack MSFT</code>)\n"
+        "• /macro [DAYS] - Scheduled macro events: FOMC, CPI, jobs report (e.g. <code>/macro 30</code>)\n"
+        "• /tip - The weekly tip: seasonal precedents plus the coming week's events (<code>/tip now</code> rebuilds it)\n"
         "• /status - View system usage statistics (e.g. <code>/status</code>)\n"
         "• /usage - View API token costs (e.g. <code>/usage</code>)\n\n"
         "<b>Proactive Features:</b>\n"
@@ -70,7 +79,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• <b>05:00 AM Daily Briefing</b>: You will receive an automated briefing every morning.\n"
         "• <b>Anomalous Volume Scanner</b>: I monitor your watchlist for unusual trading volume (>3x 30-day average).\n"
         "• <b>Earnings Whispers</b>: I send sentiment predictions 1 day before any of your tickers report earnings.\n"
-        "• <b>Weekly Review</b>: Expect a comprehensive portfolio recap every Friday at 6:00 PM KST.\n\n"
+        "• <b>Weekly Review</b>: Expect a comprehensive portfolio recap every Friday at 6:00 PM KST.\n"
+        "• <b>Weekly Tip</b>: Every Sunday evening — what history says about the week ahead, measured on our own price data, plus every event already on its calendar.\n\n"
         "Just ask me any natural language question about the market to get started!"
     )
     await update.message.reply_html(help_text)
@@ -88,6 +98,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         status_text += f"📦 DB Size: {stats['db_size_mb']} MB\n"
         status_text += f"📰 Total Articles: {stats['total_articles']}\n"
         status_text += f"🧠 Classified: {stats['classified_articles']}\n"
+        # The backlog, with the two terminal non-verdicts broken out. Without
+        # this line a stalled classifier looks identical to a healthy one from
+        # Telegram: article totals keep climbing either way.
+        status_text += (
+            f"⏳ Unclassified: {stats.get('unclassified_articles', 0)}"
+            f" (stale {stats.get('stale_articles', 0)},"
+            f" errors {stats.get('error_articles', 0)})\n"
+        )
         status_text += f"🗑️ Noise (Skipped): {stats.get('noise_articles', 0)}\n"
         status_text += f"🔢 Embedded: {stats['embedded_articles']}\n\n"
         
@@ -620,10 +638,11 @@ async def ipos_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             name = escape_html(ipo["company_name"])
             ticker = ipo["ticker"] or "TBA"
             sector = f" | {ipo['sector']}" if ipo.get("sector") else ""
-            date_info = f"📅 {ipo['ipo_date']}" if ipo.get("ipo_date") else ""
+            # An unannounced listing date reads as TBA rather than vanishing,
+            # matching IPOWatchlist.tsx on the dashboard.
+            date_info = f"📅 {ipo['ipo_date']}" if ipo.get("ipo_date") else "📅 TBA"
             text += f"{emoji} <b>{name}</b> ({ticker}{sector})\n"
-            if date_info:
-                text += f"   {date_info}\n"
+            text += f"   {date_info}\n"
             text += f"   Status: <b>{ipo['status'].upper()}</b>\n\n"
 
         await update.message.reply_html(text)
@@ -673,6 +692,115 @@ async def events_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         log.error("telegram.events_failed", error=str(e))
         await update.message.reply_text("❌ Failed to fetch events.")
+
+
+MACRO_MAX_DAYS = 400
+
+
+async def macro_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /macro [DAYS] — upcoming scheduled macro events."""
+    if not await auth_middleware(update, context):
+        return
+    try:
+        db = get_db(context)
+        from pipeline.macro_calendar import MacroCalendar
+
+        days = 14
+        if context.args:
+            try:
+                days = max(1, min(int(context.args[0]), MACRO_MAX_DAYS))
+            except ValueError:
+                await update.message.reply_text(
+                    "Usage: /macro [DAYS] — e.g. /macro 30"
+                )
+                return
+
+        rows = MacroCalendar(db).upcoming(days=days)
+        title = f"🌐 <b>Macro Calendar</b> — next {days} day{'s' if days != 1 else ''}"
+
+        if not rows:
+            await update.message.reply_html(
+                f"{title}\n\nNothing scheduled in this window."
+            )
+            return
+
+        # Grouped by date so a day carrying three releases reads as one block
+        # instead of three repetitions of the same date.
+        by_date: dict[str, list[dict]] = {}
+        for row in rows:
+            by_date.setdefault(row["date"], []).append(row)
+
+        text = f"{title}\n\n"
+        for day, events in by_date.items():
+            text += f"<b>{escape_html(day)}</b>\n"
+            for ev in events:
+                marker = MACRO_IMPORTANCE_MARKERS.get(ev.get("importance") or 1, "⚪")
+                line = f"{marker} {escape_html(ev['name'])}"
+                if ev.get("time_et"):
+                    line += f" — {escape_html(ev['time_et'])} ET"
+                if (ev.get("source") or "seed") == "web":
+                    line += " <i>(est.)</i>"
+                text += f"{line}\n"
+            text += "\n"
+
+        for chunk in chunk_html(text):
+            await update.message.reply_html(chunk, disable_web_page_preview=True)
+    except Exception as e:
+        log.error("telegram.macro_failed", error=str(e))
+        await update.message.reply_text("❌ Failed to fetch the macro calendar.")
+
+
+TIP_EMPTY_TEXT = (
+    "🧭 <b>Weekly Tip</b>\n\nNo tip has been generated yet — it runs weekly, or "
+    "send <code>/tip now</code> to build one from the current data."
+)
+
+
+async def tip_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /tip — resend the stored weekly tip, or /tip now to regenerate it.
+
+    Plain /tip is a reread and costs nothing: the digest is already in the
+    database, and chunking it here is the same path the scheduled send took.
+    `/tip now` is the expensive form — a full facts gather plus one LLM call —
+    so it is behind an explicit argument rather than being the default.
+    """
+    if not await auth_middleware(update, context):
+        return
+    try:
+        db = get_db(context)
+        regenerate = bool(context.args) and context.args[0].strip().lower() in (
+            "now", "new", "refresh"
+        )
+
+        if not regenerate:
+            row = db.get_latest_digest("weekly_tip")
+            if not row or not row.get("body_html"):
+                await update.message.reply_html(TIP_EMPTY_TEXT)
+                return
+            header = (
+                f"<i>Generated {escape_html(str(row.get('created_at') or '')[:16])}"
+                " — /tip now to rebuild.</i>\n\n"
+            )
+            for chunk in chunk_html(header + row["body_html"]):
+                await update.message.reply_html(chunk, disable_web_page_preview=True)
+            return
+
+        from pipeline.price_feed import PriceFeed
+        from pipeline.weekly_tip import WeeklyTipComposer
+
+        await update.message.reply_text("🧭 Building this week's tip…")
+        composer = WeeklyTipComposer(db, PriceFeed(db))
+        facts = await composer.gather_facts()
+        tips = await composer.compose(facts)
+        body_html = render_weekly_tip(facts, tips)
+        await composer.persist_and_publish(facts, tips, body_html)
+
+        for chunk in chunk_html(body_html):
+            await update.message.reply_html(chunk, disable_web_page_preview=True)
+    except Exception as e:
+        log.error("telegram.tip_failed", error=str(e))
+        await update.message.reply_text("❌ Failed to build the weekly tip.")
 
 
 async def themes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

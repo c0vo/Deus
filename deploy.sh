@@ -23,6 +23,24 @@ WORKER_SCRIPT="worker.py"
 PID_FILE=".deus.pid"
 WORKER_PID_FILE=".deus-worker.pid"
 FRONTEND_DIR="frontend"
+LOG_DIR="storage/logs"
+WORKER_LOG="$LOG_DIR/worker.log"
+API_LOG="$LOG_DIR/api.log"
+LOG_MAX_BYTES=$((20 * 1024 * 1024))
+# Written once the off-width embedding reset has run; see
+# reset_invalid_embeddings_once.
+EMBEDDING_RESET_MARKER="storage/.embedding_width_reset_done"
+
+# nohup, not setsid. nohup *execs* the program rather than forking, so `$!`
+# remains the python PID the PID file has to hold. setsid forks whenever the
+# caller is already a process-group leader — which a backgrounded command is — and
+# the PID file would then name a wrapper that had already exited, leaving
+# kill_running with nothing to stop.
+if command -v nohup >/dev/null 2>&1; then
+    DETACH="nohup"
+else
+    DETACH=""
+fi
 
 # ---- Colors ----
 RED='\033[0;31m'
@@ -244,42 +262,98 @@ kill_running() {
     stop_pid_file "$WORKER_PID_FILE" "$WORKER_SCRIPT"
 }
 
-start_app() {
-    check_env_file
-    activate_venv
-    log "Cleaning up invalid embeddings from database..."
+# Keep a log file from growing without bound. Three generations of 20 MB is
+# enough to cover a few days of a phone's worth of output while staying far
+# inside the storage a Termux install can spare; an unrotated worker log reached
+# 246 MB on its own.
+rotate_log() {
+    local file="$1" size=0
+    [ -f "$file" ] || return 0
+    # stat's flags differ between GNU coreutils and Android/BSD; wc is the
+    # portable fallback and is only ever run once per restart.
+    size=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null || wc -c < "$file")
+    [ "${size:-0}" -gt "$LOG_MAX_BYTES" ] || return 0
+    rm -f "${file}.3"
+    [ -f "${file}.2" ] && mv "${file}.2" "${file}.3"
+    [ -f "${file}.1" ] && mv "${file}.1" "${file}.2"
+    mv "$file" "${file}.1"
+    log "Rotated $(basename "$file") (was $size bytes)."
+}
+
+# One-shot repair, not a startup chore.
+#
+# This reset ran on EVERY restart. With the embedder discarding off-width
+# vectors, that made it a self-replenishing embedding backlog: anything the
+# producer got wrong was nulled, re-embedded, nulled again. The producer side is
+# fixed (the embedder rejects rather than stores an off-width vector), so this
+# only needs to clean up what was stored before — once. The marker file is what
+# makes it once.
+reset_invalid_embeddings_once() {
+    if [ -f "$EMBEDDING_RESET_MARKER" ]; then
+        return 0
+    fi
+    log "Clearing embeddings with a wrong vector width (one-time)..."
     # Path comes from .env. This used to be hardcoded to storage/deus.db while
     # .env pointed at storage/scrooge.db, so the cleanup silently did nothing
     # and created an empty database alongside the real one.
-    DEUS_DB_PATH="$(db_path_from_env)" python -c "
-import sqlite3, os
-db_path = os.environ.get('DEUS_DB_PATH', 'storage/scrooge.db')
+    DEUS_DB_PATH="$(db_path_from_env)" python - <<'PY' || true
+import os
+import sqlite3
+
+db_path = os.environ.get("DEUS_DB_PATH", "storage/scrooge.db")
 if os.path.exists(db_path):
     conn = sqlite3.connect(db_path)
-    cur = conn.execute(\"SELECT name FROM sqlite_master WHERE type='table' AND name='articles'\")
+    cur = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='articles'"
+    )
     if cur.fetchone():
         try:
-            count = conn.execute('SELECT COUNT(*) FROM articles WHERE length(embedding) != 12288').fetchone()[0]
-            conn.execute('UPDATE articles SET embedding = NULL WHERE length(embedding) != 12288')
+            count = conn.execute(
+                "SELECT COUNT(*) FROM articles WHERE length(embedding) != 12288"
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE articles SET embedding = NULL WHERE length(embedding) != 12288"
+            )
             conn.commit()
-            if count > 0:
-                print(f'Removed {count} invalid embeddings.')
+            print(f"Removed {count} invalid embeddings.")
         except Exception as e:
-            print(f'Embedding cleanup skipped: {e}')
+            print(f"Embedding cleanup skipped: {e}")
     conn.close()
-" || true
+PY
+    mkdir -p "$(dirname "$EMBEDDING_RESET_MARKER")"
+    date -u '+%Y-%m-%dT%H:%M:%SZ' > "$EMBEDDING_RESET_MARKER"
+}
+
+start_app() {
+    check_env_file
+    activate_venv
+    reset_invalid_embeddings_once
+
+    # Both processes used to be backgrounded with no redirection at all, so
+    # structlog's output existed only in Termux scrollback: the moment the SSH
+    # session or the Termux session that started deploy.sh went away, every log
+    # line the app had produced was gone. That is why the classifier stall had to
+    # be diagnosed out of the database rather than the logs.
+    mkdir -p "$LOG_DIR"
+    rotate_log "$WORKER_LOG"
+    rotate_log "$API_LOG"
+
     # Two processes. The pipeline and Telegram bot run in the worker so they
     # can never stall the API's event loop; the API is read-mostly and stays
     # responsive while a cycle is running. They share state through SQLite
     # (WAL) and the sse_events outbox table.
-    log "Starting $WORKER_SCRIPT..."
-    python "$WORKER_SCRIPT" &
+    #
+    # $DETACH (nohup) detaches them from the controlling terminal, so closing
+    # the SSH session that started the watcher does not SIGHUP the app out from
+    # under it.
+    log "Starting $WORKER_SCRIPT (logging to $WORKER_LOG)..."
+    $DETACH python "$WORKER_SCRIPT" >> "$WORKER_LOG" 2>&1 &
     local worker_pid=$!
     echo "$worker_pid" > "$WORKER_PID_FILE"
     ok "Started $WORKER_SCRIPT (PID $worker_pid)"
 
-    log "Starting $MAIN_SCRIPT..."
-    python "$MAIN_SCRIPT" &
+    log "Starting $MAIN_SCRIPT (logging to $API_LOG)..."
+    $DETACH python "$MAIN_SCRIPT" >> "$API_LOG" 2>&1 &
     local new_pid=$!
     echo "$new_pid" > "$PID_FILE"
     ok "Started $MAIN_SCRIPT (PID $new_pid)"

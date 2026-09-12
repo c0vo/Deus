@@ -16,7 +16,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from pipeline.price_feed import PriceFeed, _at
+from data.watchlist import DEFAULT_WATCHLIST, INDEX_TICKERS
+from pipeline.price_feed import FALLBACK_TICKERS, HISTORY_RANGE, PriceFeed, _at
 
 
 # Two US sessions, stamped 09:30 America/New_York as Yahoo does it.
@@ -72,6 +73,14 @@ def _fetch(payload=None, ticker="TSLA", raise_on_get=None):
     client = _StubClient(payload, raise_on_get)
     return asyncio.run(
         feed._fetch_history(client, asyncio.Semaphore(1), ticker)
+    ), client
+
+
+def _fetch_quote(payload=None, ticker="TSLA", raise_on_get=None):
+    feed = PriceFeed(db=MagicMock())
+    client = _StubClient(payload, raise_on_get)
+    return asyncio.run(
+        feed._fetch_quote(client, asyncio.Semaphore(1), ticker)
     ), client
 
 
@@ -181,11 +190,190 @@ def test_empty_timestamps_yield_no_rows():
 
 
 def test_requests_a_wide_range_so_gaps_self_heal():
-    """A single run has to repair what earlier runs missed, not just add a day."""
+    """A single run has to repair what earlier runs missed, not just add a day.
+
+    The range also has to warm a 200-period daily moving average for the
+    technical rating, which is why it is years rather than the 3mo it started
+    as: 3mo is ~63 sessions, short of a single timeframe let alone the
+    resampled weekly and monthly legs.
+    """
     _, client = _fetch(_payload([1786109400], [420.5], [39370100]))
     params = client.calls[0][1]["params"]
     assert params["interval"] == "1d"
-    assert params["range"].endswith("mo")
+    assert params["range"] == HISTORY_RANGE
+    assert HISTORY_RANGE.endswith("y")   # years, not days or months
+
+
+# ── universe ─────────────────────────────────────────────────────────
+
+
+def _universe(tracked):
+    db = MagicMock()
+    db.get_tracked_tickers.return_value = tracked
+    return PriceFeed(db=db).universe()
+
+
+def test_universe_is_tracked_plus_the_default_watchlist():
+    symbols = _universe(["MU", "AAPL"])
+    assert "MU" in symbols
+    assert set(DEFAULT_WATCHLIST) <= set(symbols)
+
+
+def test_universe_is_sorted_and_deduped():
+    """AAPL is both tracked and on the default list; it appears once."""
+    symbols = _universe(["MU", "AAPL"])
+    assert symbols == sorted(set(symbols))
+    assert symbols.count("AAPL") == 1
+
+
+def test_universe_always_warms_the_index_symbols():
+    """A price alert cannot say market-wide vs idiosyncratic without these.
+
+    They were absent before, which is why the scanner fetched Yahoo itself:
+    SPY and QQQ had no latest_prices row unless somebody happened to track them.
+    """
+    assert set(INDEX_TICKERS) <= set(_universe(["MU"]))
+
+
+def test_universe_falls_back_only_when_nothing_is_tracked():
+    """GOOGL is /api/markets' cold-start fallback and not on the default list."""
+    assert set(FALLBACK_TICKERS) <= set(_universe([]))
+    assert "GOOGL" not in _universe(["MU"])
+
+
+def test_universe_handles_a_none_from_the_database():
+    assert _universe(None)
+
+
+def test_refresh_fetches_the_universe(monkeypatch):
+    db = MagicMock()
+    db.get_tracked_tickers.return_value = ["MU"]
+    db.upsert_latest_prices.return_value = 1
+    feed = PriceFeed(db=db)
+
+    seen = []
+
+    async def fake_fetch(client, semaphore, ticker):
+        seen.append(ticker)
+        return {"ticker": ticker, "price": 1.0, "previous_close": 1.0,
+                "daily_change_pct": 0.0, "volume": 10.0}
+
+    monkeypatch.setattr(feed, "_fetch_quote", fake_fetch)
+    asyncio.run(feed.refresh())
+
+    assert sorted(seen) == feed.universe()
+
+
+def test_refresh_history_fetches_the_universe(monkeypatch):
+    db = MagicMock()
+    db.get_tracked_tickers.return_value = ["MU"]
+    feed = PriceFeed(db=db)
+
+    seen = []
+
+    async def fake_fetch(client, semaphore, ticker):
+        seen.append(ticker)
+        return None
+
+    monkeypatch.setattr(feed, "_fetch_history", fake_fetch)
+    asyncio.run(feed.refresh_history())
+
+    assert sorted(seen) == feed.universe()
+
+
+# ── _fetch_quote ─────────────────────────────────────────────────────
+
+
+def test_quote_reports_the_last_bar_and_the_one_before():
+    quote, _ = _fetch_quote(
+        _payload([1786023000, 1786109400], [415.0, 420.5], [31000000, 39370100])
+    )
+    assert quote["ticker"] == "TSLA"
+    assert quote["price"] == 420.5
+    assert quote["previous_close"] == 415.0
+    assert quote["daily_change_pct"] == pytest.approx(1.3253, abs=1e-4)
+
+
+def test_quote_carries_the_volume_off_the_same_bar_as_the_close():
+    """What the anomalous-volume alert divides by the 20-session average.
+
+    Index-aligned on purpose: compacting the close array first — as this did —
+    throws away the index that says which volume belongs to the last close, so
+    a null-padded session silently shifted the figure by one bar.
+    """
+    quote, _ = _fetch_quote(
+        _payload(
+            [1786023000, 1786066200, 1786109400],
+            [415.0, None, 420.5],            # middle session untraded
+            [31000000, 999, 39370100],
+        )
+    )
+    assert quote["price"] == 420.5
+    assert quote["previous_close"] == 415.0   # not the null bar
+    assert quote["volume"] == 39370100.0      # not the 999 padding bar
+
+
+def test_quote_volume_is_a_float():
+    quote, _ = _fetch_quote(_payload([1786109400], [420.5], [39370100]))
+    assert isinstance(quote["volume"], float)
+
+
+def test_quote_null_volume_is_none_not_zero():
+    """0 would read as 'no volume today' and the upsert COALESCEs on None."""
+    quote, _ = _fetch_quote(_payload([1786109400], [420.5], [None]))
+    assert quote["volume"] is None
+
+
+def test_quote_missing_volume_array_is_none():
+    quote, _ = _fetch_quote(
+        _payload([1786023000, 1786109400], [415.0, 420.5], [31000000])
+    )
+    assert quote["volume"] is None
+
+
+def test_quote_with_a_single_traded_bar_reports_no_change():
+    quote, _ = _fetch_quote(_payload([1786109400], [420.5], [39370100]))
+    assert quote["previous_close"] == 420.5
+    assert quote["daily_change_pct"] == 0.0
+
+
+def test_quote_requests_only_a_few_days():
+    """The quote needs two closes, not two years of them."""
+    _, client = _fetch_quote(_payload([1786109400], [420.5], [39370100]))
+    params = client.calls[0][1]["params"]
+    assert params == {"range": "5d", "interval": "1d"}
+
+
+def test_quote_returns_none_when_nothing_traded():
+    quote, _ = _fetch_quote(_payload([1786109400], [None], [None]))
+    assert quote is None
+
+
+def test_quote_returns_none_on_transport_error():
+    quote, _ = _fetch_quote(raise_on_get=RuntimeError("connection reset"))
+    assert quote is None
+
+
+def test_refresh_drops_failed_quotes_without_dropping_the_batch(monkeypatch):
+    db = MagicMock()
+    db.get_tracked_tickers.return_value = ["MU", "TSLA"]
+    db.upsert_latest_prices.side_effect = lambda quotes: len(quotes)
+    feed = PriceFeed(db=db)
+
+    async def fake_fetch(client, semaphore, ticker):
+        if ticker == "MU":
+            return None
+        if ticker == "TSLA":
+            raise RuntimeError("boom")
+        return {"ticker": ticker, "price": 1.0, "previous_close": 1.0,
+                "daily_change_pct": 0.0, "volume": None}
+
+    monkeypatch.setattr(feed, "_fetch_quote", fake_fetch)
+    stored = asyncio.run(feed.refresh())
+
+    persisted = db.upsert_latest_prices.call_args.args[0]
+    assert stored == len(persisted)
+    assert {q["ticker"] for q in persisted}.isdisjoint({"MU", "TSLA"})
 
 
 # ── refresh_history ──────────────────────────────────────────────────
@@ -195,6 +383,7 @@ def test_refresh_history_upserts_per_ticker_and_counts_rows(monkeypatch):
     db = MagicMock()
     db.get_tracked_tickers.return_value = ["TSLA", "MU", "BADSYM"]
     feed = PriceFeed(db=db)
+    expected = [t for t in feed.universe() if t != "BADSYM"]
 
     async def fake_fetch(client, semaphore, ticker):
         if ticker == "BADSYM":
@@ -206,10 +395,10 @@ def test_refresh_history_upserts_per_ticker_and_counts_rows(monkeypatch):
 
     stored = asyncio.run(feed.refresh_history())
 
-    assert stored == 2
+    assert stored == len(expected)
     upserted = [c.args[0] for c in db.upsert_price_history.call_args_list]
-    assert upserted == ["TSLA", "MU"]      # the failed symbol is skipped
-    assert db.upsert_price_history.call_count == 2
+    assert upserted == expected            # the failed symbol is skipped
+    assert db.upsert_price_history.call_count == len(expected)
 
 
 def test_refresh_history_falls_back_when_watchlist_is_empty(monkeypatch):
@@ -234,6 +423,7 @@ def test_refresh_history_survives_a_raising_fetch(monkeypatch):
     db = MagicMock()
     db.get_tracked_tickers.return_value = ["TSLA", "MU"]
     feed = PriceFeed(db=db)
+    expected = [t for t in feed.universe() if t != "TSLA"]
 
     async def fake_fetch(client, semaphore, ticker):
         if ticker == "TSLA":
@@ -244,8 +434,8 @@ def test_refresh_history_survives_a_raising_fetch(monkeypatch):
     monkeypatch.setattr(feed, "_fetch_history", fake_fetch)
 
     stored = asyncio.run(feed.refresh_history())
-    assert stored == 1
-    assert [c.args[0] for c in db.upsert_price_history.call_args_list] == ["MU"]
+    assert stored == len(expected)
+    assert [c.args[0] for c in db.upsert_price_history.call_args_list] == expected
 
 
 # ── Scheduler wiring ─────────────────────────────────────────────────

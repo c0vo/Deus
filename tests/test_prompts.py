@@ -1,5 +1,7 @@
 """Tests that all prompt templates are well-formed and contain required placeholders."""
 
+from pathlib import Path
+
 import pytest
 from pipeline.classifier import CLASSIFICATION_PROMPT, REDDIT_CLASSIFICATION_PROMPT
 from pipeline.ranker import RANKING_PROMPT
@@ -10,6 +12,13 @@ from pipeline.agents import (
     _COMMON_RULES,
 )
 from pipeline.chat_orchestrator import build_chat_prompt
+from pipeline.grounded_answer import (
+    GRADER_PROMPT,
+    HONESTY_SENTENCE,
+    MOVE_EXPLANATION_PROMPT,
+)
+from pipeline.daily_stance import DAILY_STANCE_PROMPT
+from pipeline.weekly_tip import WEEKLY_TIP_PROMPT
 
 
 class TestClassifierPrompts:
@@ -153,3 +162,122 @@ class TestChatPrompts:
         """Should work with only the query, no context argument."""
         result = build_chat_prompt("Analyze the market")
         assert "Analyze the market" in result
+
+    def test_honesty_rule_is_absent_by_default(self):
+        assert HONESTY_SENTENCE not in build_chat_prompt("Why is NVDA down?", "ctx")
+
+    def test_honesty_rule_appears_when_required(self):
+        prompt = build_chat_prompt(
+            "Why is NVDA down?", "some weakly related context",
+            honesty_required=True,
+        )
+        assert HONESTY_SENTENCE in prompt
+        assert "Do NOT invent a cause" in prompt
+
+    def test_honesty_rule_appears_without_any_context(self):
+        prompt = build_chat_prompt("Why is NVDA down?", "", honesty_required=True)
+        assert HONESTY_SENTENCE in prompt
+
+    def test_honesty_rule_is_suppressed_when_web_results_exist(self):
+        """The rule would be a lie: a web block is grounding by definition."""
+        context = (
+            "IN-HOUSE NEWS\nnothing much\n\n"
+            "LIVE WEB SEARCH RESULTS\n1. [reuters] Guidance cut"
+        )
+        prompt = build_chat_prompt(
+            "Why is NVDA down?", context, honesty_required=True
+        )
+        assert HONESTY_SENTENCE not in prompt
+
+
+class TestGroundedAnswerPrompts:
+    """
+    The two prompts that stop an alert from being generic. The no-speculation
+    rule is the whole mechanism: without it the model answers "profit taking"
+    for every ticker on every red day, which is what these replace.
+    """
+
+    def test_move_prompt_is_non_empty(self):
+        assert MOVE_EXPLANATION_PROMPT and len(MOVE_EXPLANATION_PROMPT) > 200
+
+    def test_move_prompt_has_required_placeholders(self):
+        for token in ("{ticker}", "{direction}", "{abs_pct", "{price",
+                      "{session_line}", "{macro_line}", "{evidence}"):
+            assert token in MOVE_EXPLANATION_PROMPT
+
+    def test_move_prompt_forbids_speculation(self):
+        assert "Do NOT speculate" in MOVE_EXPLANATION_PROMPT
+        assert "general knowledge" in MOVE_EXPLANATION_PROMPT
+
+    def test_move_prompt_names_the_generic_answers_it_rejects(self):
+        """Naming them is what makes the rule enforceable by the model."""
+        assert "Profit taking" in MOVE_EXPLANATION_PROMPT
+        assert "risk-off sentiment" in MOVE_EXPLANATION_PROMPT
+
+    def test_move_prompt_requires_citation_indices(self):
+        assert "source_indices" in MOVE_EXPLANATION_PROMPT
+        assert "catalyst_found=false" in MOVE_EXPLANATION_PROMPT
+
+    def test_move_prompt_says_an_unexplained_move_is_an_answer(self):
+        assert "unexplained move is a legitimate" in MOVE_EXPLANATION_PROMPT
+
+    def test_grader_prompt_has_required_placeholders(self):
+        for token in ("{purpose}", "{query}", "{context}"):
+            assert token in GRADER_PROMPT
+
+    def test_grader_prompt_errs_toward_false(self):
+        assert "Err toward false" in GRADER_PROMPT
+
+    def test_grader_prompt_does_not_ask_for_an_answer(self):
+        assert "not answering the question" in GRADER_PROMPT
+
+
+class TestDailyStancePrompt:
+    """The morning stance rules, and the absence of the rule they replaced."""
+
+    def test_prompt_is_non_empty(self):
+        assert DAILY_STANCE_PROMPT and len(DAILY_STANCE_PROMPT) > 500
+
+    def test_hold_is_not_a_default(self):
+        """The load-bearing rule: without it the model reverts to HOLD for all."""
+        assert "HOLD is not a default" in DAILY_STANCE_PROMPT
+
+    def test_all_four_actions_are_offered(self):
+        for action in ("BUY/ADD", "HOLD", "TRIM", "SELL"):
+            assert action in DAILY_STANCE_PROMPT
+
+    def test_no_news_still_requires_quoted_indicators(self):
+        lowered = DAILY_STANCE_PROMPT.lower()
+        assert "no news" in lowered
+        assert "technicals" in lowered and "positioning" in lowered
+
+    def test_absent_data_is_framed_as_information(self):
+        assert "no analyst coverage" in DAILY_STANCE_PROMPT
+        assert "not a gap to fill" in DAILY_STANCE_PROMPT
+
+    def test_model_is_not_asked_whether_it_changed_its_mind(self):
+        """changed_since_yesterday is computed from the record, never asked."""
+        assert "Do NOT mention yesterday's stance" in DAILY_STANCE_PROMPT
+
+    def test_falsifier_must_be_checkable(self):
+        assert "what_would_change_my_mind" in DAILY_STANCE_PROMPT
+        assert "never a sentiment" in DAILY_STANCE_PROMPT
+
+    def test_scheduler_no_longer_defaults_to_hold(self):
+        """
+        The old advisor prompt lived inline in send_daily_advisor and told the
+        model to fall back to HOLD. Nothing in the scheduler may say that again:
+        it is the instruction that made every morning note identical, and the
+        two hardcoded strings below did the same thing without an LLM at all.
+        """
+        source = (Path(__file__).resolve().parents[1]
+                  / "orchestrator" / "scheduler.py").read_text(encoding="utf-8")
+        assert "Default to HOLD" not in source
+        assert "HOLD - No significant news today." not in source
+        assert "HOLD - Unable to generate advice." not in source
+
+
+class TestWeeklyTipPrompt:
+    def test_prompt_limits_the_model_to_the_fact_block(self):
+        assert "ONLY" in WEEKLY_TIP_PROMPT
+        assert "FACTS:" in WEEKLY_TIP_PROMPT

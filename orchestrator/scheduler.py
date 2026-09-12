@@ -25,9 +25,13 @@ from config.logging_config import get_logger
 from config.settings import settings
 from config.llm import complete, is_llm_configured, is_transient, parse_structured
 from config.usage import track_llm
+# Imported as a module, not as `from config.usage import tally`: the cycle reads
+# the counter at two different points in time, and binding the object into this
+# namespace would hide a replacement (a test's, or a future reset) from both.
+from config import usage as llm_usage
 from data.database import Database
 from pipeline.aggregator import NewsAggregator
-from pipeline.classifier import ArticleClassifier
+from pipeline.classifier import ArticleClassifier, ClassifierNotConfigured
 from pipeline.ranker import ArticleRanker
 from pipeline.embedder import Embedder
 from pipeline.market_scanner import MarketScanner
@@ -46,7 +50,11 @@ from pipeline.market_regime import MarketRegimeTracker
 from pipeline.options_flow import OptionsSnapshotTracker
 from pipeline.analyst_ratings import AnalystRatingsTracker
 from pipeline.technical_rating import TechnicalRatingTracker
+from pipeline.macro_calendar import MacroCalendar
+from pipeline.seasonality import ensure_deep_history
+from pipeline.weekly_tip import WeeklyTipComposer
 from bot.alerts import AlertManager
+from bot.formatters import render_weekly_tip
 from api.sse_manager import event_bus
 
 log = get_logger(__name__)
@@ -56,6 +64,11 @@ log = get_logger(__name__)
 # a single tick.
 REFLECTION_LOOKBACK_DAYS = 14
 REFLECTION_BATCH_LIMIT = 25
+
+# How many tickers the startup catch-up will pull full history for. Each is the
+# heaviest request we make of Yahoo, and the monthly seasonality job covers the
+# rest — so a cold boot gets the benchmarks deep and then gets out of the way.
+STARTUP_DEEP_HISTORY_TICKERS = 3
 
 # How many wrong predictions get a fresh multi-agent debate per run. Reflection
 # itself is one cheap call per prediction, but each correction is a full debate,
@@ -68,9 +81,15 @@ REFLECTION_REPREDICT_LIMIT = 3
 # time passes while the event loop is busy is dropped for the day, not run late.
 # On the Termux deployment that is the normal case, not an edge case — Android
 # Doze suspends timers whenever the phone is idle, so a 06:30 job typically
-# wakes minutes late and was silently skipped every morning. Daily thesis jobs
-# are "sometime this morning" work, so a wide window costs nothing; coalesce
-# (on by default) still collapses a backlog into a single run.
+# wakes minutes late and was silently skipped every morning.
+#
+# Every job now inherits settings.job_misfire_grace_seconds as the scheduler-wide
+# default (see the AsyncIOScheduler construction below), which is what covers the
+# interval jobs. This wider window is the override applied to every daily and
+# weekly job: a brief, a scan or a thesis is "sometime this morning" work, so
+# hours of slack cost nothing, whereas a 15-minute interval job would rather be
+# skipped than run four times back to back. coalesce (on by default, and now
+# explicit) still collapses a backlog into a single run.
 DAILY_MISFIRE_GRACE_SECONDS = 6 * 3600
 
 # When the morning thesis is due, in Asia/Seoul. Shared by the cron trigger and
@@ -92,6 +111,11 @@ class ReflectionLesson(BaseModel):
 
 class PipelineOrchestrator:
     """Orchestrates the periodic execution of the Deus pipeline."""
+
+    # How long to leave a (ticker, horizon) pair alone after training failed for
+    # want of price history. A day: the only thing that can change the answer is
+    # more sessions being ingested, and that happens once per trading day.
+    TRAINING_RETRY_BACKOFF_SECONDS = 24 * 3600
 
     def __init__(self, db: Database, alert_manager: Optional[AlertManager] = None):
         self.db = db
@@ -115,11 +139,44 @@ class PipelineOrchestrator:
         self.options_tracker = OptionsSnapshotTracker(db=self.db)
         self.analyst_tracker = AnalystRatingsTracker(db=self.db)
         self.technical_rating_tracker = TechnicalRatingTracker(db=self.db)
+        self.macro_calendar = MacroCalendar(db=self.db)
 
         self.thesis_engine = ThesisEngine(db=self.db)
 
-        self.scheduler = AsyncIOScheduler()
+        # Every cron trigger below passes timezone= explicitly, but the
+        # scheduler's own default was the host's local zone — and that is what
+        # decided when the naive run_date jobs in start() actually fired.
+        # job_defaults is what lifts APScheduler's one-second misfire window off
+        # every job at once; the daily and weekly ones override it wider.
+        self.tz = ZoneInfo(settings.timezone)
+        self.scheduler = AsyncIOScheduler(
+            job_defaults={
+                "misfire_grace_time": settings.job_misfire_grace_seconds,
+                "coalesce": True,
+                "max_instances": 1,
+            },
+            timezone=self.tz,
+        )
         self.is_running = False
+        # Classification now has two triggers — the five-minute job and the tail
+        # of every pipeline cycle — so it needs its own mutual exclusion.
+        # APScheduler's max_instances=1 only stops a job overlapping *itself*.
+        self._classify_lock = asyncio.Lock()
+        # (ticker, horizon_days) → unix time before which not to retry training.
+        # In memory on purpose: the only thing that changes the answer is more
+        # price history arriving, and a worker restart retrying once is cheaper
+        # than another user_config write path.
+        self._training_backoff: dict[tuple[str, int], float] = {}
+        # Seeded here, not only in run_pipeline_cycle. The classify job and the
+        # embed pass both write into it, and the classify job can now fire from
+        # its own interval before any cycle has run.
+        self._cycle_counts = self._new_cycle_counts()
+
+    @staticmethod
+    def _new_cycle_counts() -> dict:
+        return {"fetched": 0, "inserted": 0, "classified": 0,
+                "ranked": 0, "embedded": 0, "alerts": 0, "errors": 0,
+                "llm_calls": 0, "llm_cost": 0.0}
 
     async def run_pipeline_cycle(self) -> None:
         """Executes a single pass of the entire pipeline."""
@@ -131,9 +188,13 @@ class PipelineOrchestrator:
         log.info("orchestrator.cycle_start")
 
         cycle_start = time.time()
-        self._cycle_counts = {"fetched": 0, "inserted": 0, "classified": 0,
-                              "ranked": 0, "embedded": 0, "alerts": 0, "errors": 0,
-                              "llm_calls": 0, "llm_cost": 0.0}
+        self._cycle_counts = self._new_cycle_counts()
+        # llm_calls / llm_cost are a difference of two readings of a
+        # process-wide counter, not a total accumulated here. Every call site
+        # already goes through track_llm; asking each of them to also report
+        # back up to the cycle is how these two fields stayed at zero for the
+        # life of the pipeline_metrics table.
+        usage_before = llm_usage.tally.snapshot()
 
         try:
             # Initialize embedder if not already initialized
@@ -156,12 +217,25 @@ class PipelineOrchestrator:
             self._cycle_counts["fetched"] = len(fetch_result)
             self._cycle_counts["inserted"] = len(fetch_result)
 
+            # Classify what this cycle just ingested rather than waiting out the
+            # interval job: fresh news is the only news worth alerting on, and
+            # the embeds it needs were written by the pass above.
+            status = await self.run_classify_backlog(trigger="cycle")
+            self._cycle_counts["classified"] += int(status.get("classified") or 0)
+
         except Exception as e:
             log.error("orchestrator.cycle_failed", error=str(e))
             self._cycle_counts["errors"] += 1
         finally:
             duration = time.time() - cycle_start
             self.is_running = False
+            # Before the metrics row is written, not after — this is the only
+            # place the two counters are ever filled in.
+            usage_after = llm_usage.tally.snapshot()
+            self._cycle_counts["llm_calls"] = usage_after.calls - usage_before.calls
+            self._cycle_counts["llm_cost"] = round(
+                usage_after.cost - usage_before.cost, 6
+            )
             # Record pipeline metrics
             try:
                 self.db.insert_pipeline_metrics(duration, self._cycle_counts)
@@ -186,7 +260,16 @@ class PipelineOrchestrator:
         log.info("orchestrator.cycle_complete", duration_seconds=round(duration, 2))
 
     async def _process_batch(self) -> None:
-        """Process a batch of articles (Embed -> Classify -> Rank -> Alert)."""
+        """
+        Embed a batch of freshly-ingested articles, prefiltering obvious noise.
+
+        Embedding only. Classification used to run here too, which tied its
+        throughput to the fetch loop: ≤20 rows per pass, serial, no attempt
+        counter, LIFO selection — capacity roughly equal to ingest with no
+        margin, so a single persistently failing batch parked itself at the head
+        of the queue and the backlog grew monotonically. It is now its own job;
+        see `run_classify_backlog`.
+        """
         try:
 
             # Step 2: Embed unembedded articles FIRST (for deduplication).
@@ -250,34 +333,332 @@ class PipelineOrchestrator:
                             # poisoned every cosine comparison it entered.
                             self.db.record_embed_failure(article.id)
 
-            # Step 3: Classify unclassified articles (with Semantic Deduplication)
-            #
-            # Dedup runs as its own pass over the whole batch before any
-            # classification, then the survivors go out in batched calls. Dedup
-            # makes no LLM calls — it reads the article's own embedding and
-            # older persisted rows — so hoisting it costs nothing and still
-            # suppresses duplicates before the model sees them, as before.
-            unclassified_data = self.db.get_unclassified_articles(limit=20)
-            log.info("orchestrator.classify", count=len(unclassified_data))
-            classified_count = 0
-
-            articles = [self.db.row_to_article(r) for r in unclassified_data]
-            needs_llm = [a for a in articles if not self._absorb_duplicate(a)]
-
-            size = settings.classify_batch_size
-            for i in range(0, len(needs_llm), size):
-                chunk = needs_llm[i:i + size]
-                if await self._classify_chunk_with_retry(chunk):
-                    classified_count += self._persist_classifications(chunk)
-
-            self._cycle_counts["classified"] += classified_count
-
-            # Step 4: Rank unranked articles (skip low-signal articles to save LLM calls)
-            await self._rank_pending()
-
         except Exception as e:
             log.error("orchestrator.batch_failed", error=str(e))
             self._cycle_counts["errors"] += 1
+
+    # Bumping the suffix re-runs the requeue on the next deploy. Only do that
+    # alongside a fix that changes which rows end up 'error' — otherwise it just
+    # re-sends the same unclassifiable articles to the same model.
+    ERROR_REQUEUE_MARKER = "classify_error_requeue_v1"
+
+    async def _requeue_error_articles_once(self) -> int:
+        """
+        One-time amnesty for rows the old failure semantics wrote off.
+
+        `_persist_classifications` used to stamp `'error'` on the first failure,
+        so a truncated batch, a parse failure and a genuinely unclassifiable
+        article were all equally permanent — 5,662 rows on the phone, growing at
+        100-400 a day. Those rows are real articles, and now that a failure
+        counts attempts instead, they deserve the retries they never got.
+
+        Guarded by a marker in `user_config` rather than by a schema version: it
+        must run exactly once per deployment, and it has to be idempotent if the
+        worker restarts mid-run.
+        """
+        marker = await asyncio.to_thread(
+            self.db.get_config, self.ERROR_REQUEUE_MARKER, ""
+        )
+        if marker:
+            return 0
+
+        requeued = await asyncio.to_thread(
+            self.db.requeue_error_articles, settings.classify_max_age_days
+        )
+        await asyncio.to_thread(
+            self.db.set_config,
+            self.ERROR_REQUEUE_MARKER,
+            json.dumps({
+                "requeued": requeued,
+                "max_age_days": settings.classify_max_age_days,
+                "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }),
+        )
+        log.info(
+            "orchestrator.classify_error_requeued",
+            count=requeued, max_age_days=settings.classify_max_age_days,
+        )
+        return requeued
+
+    # Same rule as above: bump the suffix only alongside a fix that changes why
+    # rows exhaust their attempts. On its own it just re-parks them.
+    ATTEMPTS_RESET_MARKER = "classify_attempts_reset_v1"
+
+    # How far back to un-write-off 'error' rows in this repair. Short on purpose:
+    # `classify_error_requeue_v1` already gave the whole 30-day window its
+    # amnesty, so anything older than the bad deploy was judged under request
+    # semantics this fix does not change, and re-sending it would be paying twice
+    # for the same verdict.
+    ATTEMPTS_RESET_ERROR_AGE_DAYS = 2
+
+    async def _reset_parked_attempts_once(self) -> dict[str, int]:
+        """
+        One-time amnesty for rows the batch-schema regression parked.
+
+        The request schema marked every field but `id` optional and put no
+        minimum on the items array, so a batch of ten was answered with one
+        near-empty object. Nine rows per batch logged `batch_missing_result`,
+        and three cycles later — fifteen minutes — they had spent all three
+        `classification_attempts` on requests that never asked about them. ~35
+        of 60 candidates per run, every run, for as long as the deploy was up.
+
+        Two repairs, because the regression produced two kinds of casualty:
+        rows parked at max attempts, and rows stamped `'error'` when a whole
+        batch came back unusable. The `'error'` sweep is deliberately narrow —
+        `ATTEMPTS_RESET_ERROR_AGE_DAYS`, not the full classification window —
+        so it catches what this bug wrote off and not what the earlier amnesty
+        already reconsidered.
+
+        Marker-guarded in `user_config` like `_requeue_error_articles_once`: it
+        must run exactly once per deployment, and be idempotent if the worker
+        dies mid-run.
+        """
+        marker = await asyncio.to_thread(
+            self.db.get_config, self.ATTEMPTS_RESET_MARKER, ""
+        )
+        if marker:
+            return {"unparked": 0, "error_requeued": 0}
+
+        unparked = await asyncio.to_thread(
+            self.db.reset_parked_classification_attempts,
+            settings.classify_max_attempts,
+        )
+        error_requeued = await asyncio.to_thread(
+            self.db.requeue_error_articles, self.ATTEMPTS_RESET_ERROR_AGE_DAYS
+        )
+        await asyncio.to_thread(
+            self.db.set_config,
+            self.ATTEMPTS_RESET_MARKER,
+            json.dumps({
+                "unparked": unparked,
+                "error_requeued": error_requeued,
+                "max_attempts": settings.classify_max_attempts,
+                "error_max_age_days": self.ATTEMPTS_RESET_ERROR_AGE_DAYS,
+                "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }),
+        )
+        log.info(
+            "orchestrator.classify_attempts_reset",
+            unparked=unparked, error_requeued=error_requeued,
+            max_attempts=settings.classify_max_attempts,
+            error_max_age_days=self.ATTEMPTS_RESET_ERROR_AGE_DAYS,
+        )
+        return {"unparked": unparked, "error_requeued": error_requeued}
+
+    async def run_classify_backlog(self, trigger: str = "interval") -> dict:
+        """
+        Classify the unclassified backlog, bounded on every axis.
+
+        The job that replaces "classification as a step in the fetch loop". Four
+        bounds, each answering one way the old arrangement went wrong:
+
+        - **Budget** (`classify_per_run_limit`) and **concurrency**
+          (`classify_concurrency`) make throughput independent of how long a
+          fetch takes, so the backlog can be drained faster than it fills.
+        - **Attempts** (`classify_max_attempts`) retire a poison batch instead
+          of letting it re-occupy the head of a LIFO queue forever.
+        - **Age** (`classify_max_age_days`) caps what is worth paying for at
+          all; everything older is marked `'stale'` first.
+
+        Returns the status dict it also persists, so the caller can fold
+        `classified` into its own counters instead of reaching into private
+        state.
+        """
+        if self._classify_lock.locked():
+            log.info(
+                "orchestrator.classify_backlog_skipped",
+                reason="previous run still in progress", trigger=trigger,
+            )
+            return {"skipped": True, "trigger": trigger}
+
+        async with self._classify_lock:
+            started = time.time()
+            status = {
+                "last_run_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "trigger": trigger,
+                "candidates": 0,
+                "classified": 0,
+                "failed": 0,
+                "stale_marked": 0,
+                "error_requeued": 0,
+                "attempts_unparked": 0,
+                "duration_s": 0.0,
+                "configured": True,
+            }
+
+            try:
+                # Cheapest check first. Without it an unconfigured deployment
+                # burns a stale-marking UPDATE and a candidate scan every five
+                # minutes to reach a call it cannot make.
+                if not self.classifier.is_configured():
+                    status["configured"] = False
+                    log.error(
+                        "orchestrator.classify_backlog_unconfigured",
+                        impact="ingest is embedding-only; nothing will be classified",
+                        hint="set MODEL_CLASSIFIER (or MODEL_CLASSIFIER_FALLBACK) "
+                             "in .env and restart the worker",
+                    )
+                    return status
+
+                # Give the rows the old write-off semantics killed one more
+                # chance. Once, ever, guarded by a marker.
+                status["error_requeued"] = await self._requeue_error_articles_once()
+
+                # And the rows the batch-schema regression parked, whose attempts
+                # were spent on requests that never asked about them. Also once,
+                # also marker-guarded, and counted separately because the two
+                # repairs answer different bugs.
+                reset = await self._reset_parked_attempts_once()
+                status["attempts_unparked"] = reset["unparked"]
+                status["error_requeued"] += reset["error_requeued"]
+
+                # Retire what is out of window before selecting candidates, so a
+                # long tail of 2024 rows cannot keep the queue permanently
+                # non-empty. Bounded per run; it converges over a few ticks.
+                status["stale_marked"] = await asyncio.to_thread(
+                    self.db.mark_stale_unclassified, settings.classify_max_age_days
+                )
+
+                rows = await asyncio.to_thread(
+                    self.db.get_classification_candidates,
+                    settings.classify_per_run_limit,
+                    settings.classify_max_attempts,
+                    settings.classify_max_age_days,
+                )
+                status["candidates"] = len(rows)
+                if rows:
+                    await self._classify_candidates(rows, status, trigger)
+                else:
+                    log.info(
+                        "orchestrator.classify_backlog_empty",
+                        trigger=trigger, stale_marked=status["stale_marked"],
+                    )
+
+                # Unconditionally, not only when this run classified something.
+                # An article whose ranking call failed earlier is already
+                # classified, so gating this on *new* candidates would leave it
+                # unranked forever — and unranked means it reaches neither the
+                # brief nor alerts. Costs one SELECT when there is nothing to do.
+                await self._rank_pending()
+
+            except ClassifierNotConfigured as e:
+                # Raised from _call_with_fallback when every slug for the lane is
+                # empty. Reported, never converted into an 'error' verdict.
+                status["configured"] = False
+                log.error("orchestrator.classify_backlog_unconfigured", error=str(e))
+            except Exception as e:
+                log.error("orchestrator.classify_backlog_failed", error=str(e))
+            finally:
+                status["duration_s"] = round(time.time() - started, 2)
+                # Persisted as well as published: the SSE outbox is trimmed to
+                # ten minutes, so a dashboard opened between runs has nothing to
+                # read unless the last run is in user_config. It is also the one
+                # artefact a `sqlite3` session on the phone can check.
+                try:
+                    await asyncio.to_thread(
+                        self.db.set_config,
+                        "classify_backlog_status", json.dumps(status),
+                    )
+                except Exception as e:
+                    log.error("orchestrator.classify_status_write_failed", error=str(e))
+                try:
+                    await event_bus.publish("classification_status", status)
+                except Exception as e:
+                    log.error("orchestrator.classify_status_publish_failed", error=str(e))
+
+            return status
+
+    async def _classify_candidates(
+        self, rows: list[dict], status: dict, trigger: str
+    ) -> None:
+        """
+        Dedup, chunk and classify one run's candidates, updating `status`.
+
+        Split out of `run_classify_backlog` so that the status write, the publish
+        and the ranking pass in its `finally` apply whether or not there was
+        anything to classify.
+        """
+        articles = [self.db.row_to_article(r) for r in rows]
+
+        # Dedup first, as its own pass: it makes no LLM calls — it reads the
+        # article's own embedding against older persisted rows — so an absorbed
+        # duplicate inherits its canonical verdict and never reaches a model.
+        # Each check is blocking SQLite plus numpy, and there are up to
+        # `classify_per_run_limit` of them, which is far too long to hold the
+        # event loop for on a phone.
+        verdicts = await asyncio.gather(
+            *(asyncio.to_thread(self._absorb_duplicate, a) for a in articles),
+            return_exceptions=True,
+        )
+        needs_llm = []
+        for article, verdict in zip(articles, verdicts):
+            if isinstance(verdict, BaseException):
+                # A dedup failure must not cost the classification. The row goes
+                # to the model as if it had no near neighbour.
+                log.warning(
+                    "orchestrator.classify_backlog_dedup_failed",
+                    article_id=article.id, error=str(verdict),
+                )
+                needs_llm.append(article)
+            elif not verdict:
+                needs_llm.append(article)
+
+        size = max(1, settings.classify_batch_size)
+        chunks = [needs_llm[i:i + size] for i in range(0, len(needs_llm), size)]
+        # Bounds how many batches are in flight at once. The provider's rate
+        # limit, not the phone, is what this protects.
+        semaphore = asyncio.Semaphore(max(1, settings.classify_concurrency))
+
+        async def process_chunk(chunk: list) -> tuple[int, int]:
+            async with semaphore:
+                persisted = await self._classify_chunk_with_retry(chunk)
+            if persisted:
+                return self._persist_classifications(chunk), 0
+            # Transient exhaustion: every attempt hit an infrastructure fault.
+            # Count the attempt and leave event_type NULL — a provider outage
+            # must never be written down as a permanent 'error' verdict on the
+            # article.
+            await asyncio.to_thread(
+                self._record_chunk_failure,
+                [a.id for a in chunk],
+                stamp_error_at_cap=False,
+            )
+            return 0, len(chunk)
+
+        # return_exceptions so that every chunk is awaited. A bare gather
+        # propagates the first failure and leaves the remaining tasks running
+        # detached — they would then persist a chunk after the caller had already
+        # written its status, or drop an unretrieved exception at collection time.
+        results = await asyncio.gather(
+            *(process_chunk(chunk) for chunk in chunks),
+            return_exceptions=True,
+        )
+        unconfigured: Optional[ClassifierNotConfigured] = None
+        for result in results:
+            if isinstance(result, ClassifierNotConfigured):
+                unconfigured = result
+            elif isinstance(result, BaseException):
+                # One chunk's write failing is not the whole run failing.
+                log.error("orchestrator.classify_chunk_failed", error=str(result))
+            else:
+                classified, failed = result
+                status["classified"] += classified
+                status["failed"] += failed
+
+        log.info(
+            "orchestrator.classify_backlog",
+            trigger=trigger,
+            candidates=status["candidates"],
+            classified=status["classified"],
+            failed=status["failed"],
+            stale_marked=status["stale_marked"],
+            deduped=len(articles) - len(needs_llm),
+        )
+
+        if unconfigured is not None:
+            # Raised for the caller's handler, which sets configured=False. The
+            # one failure for which stamping anything at all would be wrong.
+            raise unconfigured
 
     async def _classify_chunk_with_retry(self, chunk: list) -> bool:
         """
@@ -292,6 +673,12 @@ class PipelineOrchestrator:
             try:
                 await self.classifier.classify_batch(chunk)
                 return True
+            except ClassifierNotConfigured:
+                # Re-raised, never retried and never counted. The generic handler
+                # below would classify it as non-transient and so return True —
+                # "safe to persist" — which is exactly how an unset
+                # MODEL_CLASSIFIER came to stamp every row in the batch 'error'.
+                raise
             except Exception as e:
                 if not is_transient(e) or attempt == settings.llm_max_retries - 1:
                     log.error(
@@ -378,14 +765,60 @@ class PipelineOrchestrator:
         self.db.mark_duplicate(article.id, best_match_id)
         return True
 
+    def _record_chunk_failure(
+        self, article_ids: list[str], *, stamp_error_at_cap: bool
+    ) -> int:
+        """
+        Count one failed classification attempt per id. Returns how many rows
+        have now used up their attempts.
+
+        The row stays `event_type IS NULL` until the cap, so a later pass can
+        retry it. That is the opposite of what this code used to do: any article
+        the model did not answer for was stamped `'error'` on the spot "so it
+        doesn't infinite loop", which on the phone turned one bad response into
+        5,662 permanently dead rows — 9% of the corpus — with nothing
+        distinguishing a truncated batch from an unclassifiable article.
+
+        `stamp_error_at_cap` is False for a provider outage: the attempt counter
+        already keeps those rows out of the candidate query (they surface as
+        `exhausted`), and an outage is not a property of the article.
+        """
+        if not article_ids:
+            return 0
+
+        attempts = self.db.record_classification_failure(article_ids) or {}
+        exhausted = [
+            article_id for article_id in article_ids
+            if attempts.get(article_id, 0) >= settings.classify_max_attempts
+        ]
+        if exhausted and stamp_error_at_cap:
+            for article_id in exhausted:
+                self.db.update_classification(
+                    article_id=article_id,
+                    event_type="error",
+                    sentiment_score=0.0,
+                    urgency="low",
+                    suggested_direction="neutral",
+                    affected_sectors=[],
+                    affected_tickers=[],
+                    classification_summary=(
+                        f"Classification failed on "
+                        f"{settings.classify_max_attempts} separate attempts."
+                    ),
+                )
+        return len(exhausted)
+
     def _persist_classifications(self, chunk: list) -> int:
         """
         Writes back a classified chunk. Returns how many succeeded.
 
         Articles the model never answered for come back with event_type still
-        unset; those are marked 'error' so they do not requeue forever.
+        unset. Those get an attempt counted and are left NULL for a later pass;
+        only an article that has failed `classify_max_attempts` times is written
+        off as `'error'`.
         """
         succeeded = 0
+        failed_ids: list[str] = []
         for article in chunk:
             if article.event_type:
                 self.db.update_classification(
@@ -407,20 +840,25 @@ class PipelineOrchestrator:
                 )
                 succeeded += 1
             else:
-                # Mark as failed so it doesn't infinite loop
-                self.db.update_classification(
-                    article_id=article.id,
-                    event_type="error",
-                    sentiment_score=0.0,
-                    urgency="low",
-                    suggested_direction="neutral",
-                    affected_sectors=[],
-                    affected_tickers=[],
-                    classification_summary="Classification failed due to parsing error.",
-                )
+                failed_ids.append(article.id)
 
+        if failed_ids:
+            exhausted = self._record_chunk_failure(failed_ids, stamp_error_at_cap=True)
+            log.warning(
+                "orchestrator.classification_unanswered",
+                count=len(failed_ids), written_off=exhausted,
+            )
+
+        # One event per chunk, not per article. A 10-article chunk used to
+        # schedule ten publishes, each a separate INSERT into the sse_events
+        # outbox and a separate SSE frame, for a feed the page prepends to in one
+        # go anyway — the hook already reads `data.articles` as a list.
+        if chunk:
             asyncio.create_task(
-                event_bus.publish("new_articles", {"articles": [article.model_dump()]})
+                event_bus.publish(
+                    "new_articles",
+                    {"articles": [article.model_dump() for article in chunk]},
+                )
             )
 
         return succeeded
@@ -498,7 +936,7 @@ class PipelineOrchestrator:
             return
 
         try:
-            from bot.formatters import EMPTY_BRIEFING_TEXT, chunk_html, render_briefing
+            from bot.formatters import EMPTY_BRIEFING_TEXT, render_briefing
             from data.taxonomy import BRIEFING_MIN_IMPORTANCE, select_briefing_lanes
 
             rows = self.db.get_briefing_candidates(
@@ -509,87 +947,95 @@ class PipelineOrchestrator:
             # and a job that silently died look identical from the chat.
             text = render_briefing(lanes) if lanes else EMPTY_BRIEFING_TEXT
 
-            for chunk in chunk_html(text):
-                await self.alert_manager.bot.send_message(
-                    chat_id=self.alert_manager.chat_id,
-                    text=chunk,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
+            await self.alert_manager.send_html(text)
+
+            # Persisted as well as sent, so the brief survives the chat scrollback
+            # and /api/digests can answer "what did it say on Tuesday?". Failing
+            # to store it must not cost the send that already happened.
+            try:
+                today = datetime.datetime.now(self.tz).date().isoformat()
+                await asyncio.to_thread(
+                    self.db.insert_digest, "daily_briefing", text,
+                    period_start=today, period_end=today,
                 )
+            except Exception as e:
+                log.warning("orchestrator.daily_briefing_persist_failed", error=str(e))
+
             log.info("orchestrator.daily_briefing_sent", articles=sum(len(a) for _, a in lanes))
         except Exception as e:
             log.error("orchestrator.daily_briefing_failed", error=str(e))
 
     async def send_daily_advisor(self):
-        """Sends daily hold/sell advice for tracked tickers."""
+        """Sends the evidence-based morning stance for every tracked ticker.
+
+        The note this replaced read the last 24h of classified headlines and
+        offered the model a choice of only HOLD or SELL, instructing it to fall
+        back to the former. A ticker with no news printed a hardcoded HOLD, and
+        so did an unset MODEL_DAILY_ADVISOR, so every ETF and every
+        misconfiguration rendered as a considered decision to hold.
+        `pipeline/daily_stance.py` builds a full fact sheet per ticker instead,
+        offers all four actions, and names a failure as NO CALL or UNAVAILABLE
+        rather than HOLD.
+
+        The Bull/Bear debate re-runs happen strictly AFTER the message is sent:
+        four reasoning calls per ticker would otherwise delay the note by
+        minutes, and the note is the product. Each debate writes today's
+        `predictions_cache` row, which is the same cache the 08:30
+        `run_daily_predictions` job checks — so a re-run here makes that job
+        skip the ticker rather than paying for a second debate.
+        """
         if not self.alert_manager:
             return
-            
-        try:
-            from bot.formatters import escape_html
-            from data.models import TickerNote, notes_to_dict
 
-            tracked = self.db.get_tracked_tickers()
+        from bot.formatters import render_stance_message
+        from pipeline.daily_stance import DailyStanceEngine
+
+        engine = DailyStanceEngine(self.db)
+        try:
+            tracked = await asyncio.to_thread(self.db.get_tracked_tickers)
             if not tracked:
                 return
-                
-            all_ticker_contexts = {}
-            for t in tracked:
-                summaries = self.db.get_recent_summaries_for_ticker(t, hours=24)
-                if summaries:
-                    all_ticker_contexts[t] = summaries
-            
-            ai_summaries = {}
-            if is_llm_configured() and settings.model_daily_advisor and all_ticker_contexts:
-                prompt = (
-                    "You are a professional Wall Street advisor reviewing your client's portfolio.\n"
-                    "Below are the client's tracked tickers with their recent news from the past 24 hours.\n"
-                    "For EACH ticker, recommend HOLD or SELL for tomorrow based ONLY on the news context.\n"
-                    "Guidelines:\n"
-                    "- HOLD: News is neutral-to-positive, or no significant negative catalyst. Default to HOLD unless there's a clear reason to sell.\n"
-                    "- SELL: Specific negative catalyst in the news (earnings miss, downgrade, regulatory issue, macro headwind directly impacting the ticker).\n"
-                    "Return one entry per ticker in the required response schema. Each "
-                    "summary must read 'HOLD - [1 sentence reason]' or 'SELL - [1 sentence reason]'.\n"
-                    "Plain text only — no markdown, no HTML.\n\n"
-                )
-                for tk, sums in all_ticker_contexts.items():
-                    prompt += f"Ticker: {tk}\nContext:\n" + "\n".join(f"- {s}" for s in sums) + "\n\n"
 
-                with track_llm(self.db, settings.model_daily_advisor,
-                               "daily_advisor_batch",
-                               prompt_text=prompt, store_text=True) as u:
-                    u.response = response = await complete(
-                        model=settings.model_daily_advisor,
-                        prompt=prompt,
-                        schema=list[TickerNote],
-                        reasoning="low",
-                    )
+            batch = await engine.compose(tracked)
+            await asyncio.to_thread(engine.persist, batch)
 
-                if isinstance(response.parsed, list):
-                    ai_summaries = notes_to_dict(response.parsed)
-                else:
-                    ai_summaries = notes_to_dict(parse_structured(response.text, list[TickerNote]))
+            text = render_stance_message(batch.rows, model_slug=batch.model,
+                                         date=batch.date)
+            # Stored before sending so the dashboard and a resend have the note
+            # even if Telegram is the thing that is down.
+            await asyncio.to_thread(lambda: self.db.insert_digest(
+                "daily_advisor", text,
+                facts_json=batch.facts,
+                model=batch.model or None,
+                period_start=batch.date,
+                period_end=batch.date,
+            ))
 
-            text = "<b>🎯 Tracked Tickers Daily Advisor</b>\n\n"
-            text += "Based on today's news flow, here is my outlook for your portfolio tomorrow:\n\n"
-            
-            for t in tracked:
-                if t in all_ticker_contexts:
-                    advice = ai_summaries.get(t.upper(), "HOLD - Unable to generate advice.")
-                    emoji = "🛑" if advice.startswith("SELL") else "✋"
-                    text += f"{emoji} <b>{t}</b>: {escape_html(advice)}\n\n"
-                else:
-                    text += f"✋ <b>{t}</b>: HOLD - No significant news today.\n\n"
-                    
-            await self.alert_manager.bot.send_message(
-                chat_id=self.alert_manager.chat_id,
-                text=text,
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
-            log.info("orchestrator.daily_advisor_sent")
+            await self.alert_manager.send_html(text)
+            log.info("orchestrator.daily_advisor_sent", tickers=len(batch.rows),
+                     model=batch.model or "unset")
         except Exception as e:
-            log.error("orchestrator.daily_advisor_failed", error=str(e))
+            log.error("orchestrator.daily_advisor_failed", error=str(e) or repr(e))
+            return
+
+        try:
+            rerun = engine.material_changes(batch.rows, batch.facts)
+        except Exception as e:
+            log.error("orchestrator.advisor_rerun_select_failed",
+                      error=str(e) or repr(e))
+            return
+
+        # Sequential, and each one isolated: the debates share the LLM budget
+        # with everything else the worker does, and one ticker failing must not
+        # cost the others their re-run.
+        predictor = StockPredictor(self.db)
+        for ticker in rerun:
+            try:
+                await predictor.predict_with_agents(ticker)
+                log.info("orchestrator.advisor_debate_rerun", ticker=ticker)
+            except Exception as e:
+                log.error("orchestrator.advisor_debate_rerun_failed",
+                          ticker=ticker, error=str(e) or repr(e))
 
     async def send_weekly_review(self):
         """Sends the weekly portfolio review every Friday."""
@@ -648,12 +1094,7 @@ class PipelineOrchestrator:
                     if rows:
                         text += f"• <b>{t}</b>: <a href='{escape_html(rows[0]['url'])}'>{escape_html(rows[0]['headline'])}</a>\n"
                         
-            await self.alert_manager.bot.send_message(
-                chat_id=self.alert_manager.chat_id,
-                text=text,
-                parse_mode="HTML",
-                disable_web_page_preview=True
-            )
+            await self.alert_manager.send_html(text)
             log.info("orchestrator.weekly_review_sent")
         except Exception as e:
             log.error("orchestrator.weekly_review_failed", error=str(e))
@@ -663,11 +1104,7 @@ class PipelineOrchestrator:
         try:
             alert_msg = self.db.check_for_api_spikes()
             if alert_msg and self.alert_manager:
-                await self.alert_manager.bot.send_message(
-                    chat_id=self.alert_manager.chat_id,
-                    text=alert_msg,
-                    parse_mode="HTML"
-                )
+                await self.alert_manager.send_html(alert_msg)
                 log.info("orchestrator.api_spike_alert_sent")
         except Exception as e:
             log.error("orchestrator.check_api_usage_spikes_failed", error=str(e))
@@ -680,8 +1117,13 @@ class PipelineOrchestrator:
         backlog converges over time without blocking the pipeline or spiking
         memory on a phone. Converges because every article examined is marked
         ``dedup_checked``, duplicate or not.
+
+        The whole body runs in a worker thread. Nothing in it is awaitable — it
+        is a few hundred blocking SQLite round-trips plus a numpy cosine pass per
+        tick — so on the loop it stalled every other job, the SSE outbox tail
+        included, for its full duration.
         """
-        try:
+        def _run() -> None:
             backlog = self.db.get_dedup_backlog(limit=settings.dedup_backfill_batch)
             if not backlog:
                 return
@@ -714,6 +1156,9 @@ class PipelineOrchestrator:
                 remaining=stats["unchecked"],
                 duplicates_total=stats["duplicates"],
             )
+
+        try:
+            await asyncio.to_thread(_run)
         except Exception as e:
             log.error("orchestrator.dedup_backfill_failed", error=str(e))
 
@@ -723,15 +1168,19 @@ class PipelineOrchestrator:
 
         New articles get countries from the classifier; this covers everything
         ingested before that field existed. It makes no API calls, so the whole
-        archive can be tagged for free.
+        archive can be tagged for free — and for the same reason it is purely
+        blocking work, so it runs in a thread rather than on the loop.
         """
-        try:
+        def _run() -> None:
             tagged = self.geo_tagger.backfill(limit=settings.geo_backfill_batch)
             if tagged:
                 remaining = self.db.get_geo_backlog_count()
                 log.info(
                     "orchestrator.geo_backfill", tagged=tagged, remaining=remaining
                 )
+
+        try:
+            await asyncio.to_thread(_run)
         except Exception as e:
             log.error("orchestrator.geo_backfill_failed", error=str(e))
 
@@ -759,6 +1208,14 @@ class PipelineOrchestrator:
         models, and training them back to back would monopolise this process
         for as long as it took; spread out, the grid fills in over a few hours
         while everything else keeps running.
+
+        A pair that cannot be trained *yet* — `train_model` raises on too little
+        price history — is parked for `TRAINING_RETRY_BACKOFF_SECONDS` instead of
+        being retried on the next tick. Without that, the first such ticker sits
+        at the head of this loop and fails every 20 minutes forever (159 times in
+        one log on the phone), and because the exception escaped to the outer
+        handler it was also the *last* pair attempted each run: every other
+        missing model behind it was never reached.
         """
         try:
             tracked = await asyncio.to_thread(self.db.get_tracked_tickers)
@@ -766,6 +1223,7 @@ class PipelineOrchestrator:
                 return
 
             predictor = StockPredictor(self.db)
+            now = time.time()
             for ticker in tracked:
                 active = await asyncio.to_thread(
                     self.db.get_recent_predictions, ticker, 20, True
@@ -776,15 +1234,36 @@ class PipelineOrchestrator:
                     if horizon_days in covered:
                         continue
 
+                    until = self._training_backoff.get((ticker, horizon_days), 0.0)
+                    if until > now:
+                        continue
+
                     model, _scope = await asyncio.to_thread(
                         predictor._load_model, ticker, horizon_days
                     )
                     if model is None:
                         log.info("orchestrator.training_missing_model",
                                  ticker=ticker, horizon_days=horizon_days)
-                        await predictor.train_model(
-                            ticker, scope="per_ticker", horizon_days=horizon_days
-                        )
+                        try:
+                            await predictor.train_model(
+                                ticker, scope="per_ticker", horizon_days=horizon_days
+                            )
+                        except ValueError as e:
+                            # Not a fault: the ticker simply has too short a
+                            # price history to model yet. info, not error, and
+                            # parked so the loop moves on to the next pair.
+                            self._training_backoff[(ticker, horizon_days)] = (
+                                now + self.TRAINING_RETRY_BACKOFF_SECONDS
+                            )
+                            log.info(
+                                "orchestrator.training_deferred",
+                                ticker=ticker, horizon_days=horizon_days,
+                                reason=str(e),
+                                retry_after_hours=round(
+                                    self.TRAINING_RETRY_BACKOFF_SECONDS / 3600, 1
+                                ),
+                            )
+                            continue
                         model, _scope = await asyncio.to_thread(
                             predictor._load_model, ticker, horizon_days
                         )
@@ -794,7 +1273,12 @@ class PipelineOrchestrator:
                         # too little price history. Stop rather than fall
                         # through to predict(), whose llm_only path would spend
                         # a live LLM call on every cycle for a ticker that
-                        # cannot be modelled.
+                        # cannot be modelled. Backed off for the same reason as
+                        # above: otherwise this pair is retried every 20 minutes
+                        # and every pair behind it is never reached.
+                        self._training_backoff[(ticker, horizon_days)] = (
+                            now + self.TRAINING_RETRY_BACKOFF_SECONDS
+                        )
                         log.warning("orchestrator.missing_model_unfilled",
                                     ticker=ticker, horizon_days=horizon_days)
                         return
@@ -845,6 +1329,80 @@ class PipelineOrchestrator:
         except Exception as e:
             log.error("orchestrator.sse_outbox_trim_failed", error=str(e))
 
+    async def refresh_macro_calendar(self) -> dict:
+        """Monthly top-up of macro_events from the web. Never raises."""
+        try:
+            # refresh_from_web logs its own counts under macro_calendar.refreshed.
+            return await self.macro_calendar.refresh_from_web()
+        except Exception as e:
+            # MacroCalendar.refresh_from_web already swallows its own failures;
+            # this is the belt-and-braces layer so a bug there can never take the
+            # cron job — and therefore the scheduler thread — down with it.
+            log.error("orchestrator.macro_calendar_refresh_failed", error=str(e))
+            return {}
+
+    # ── Weekly tip ───────────────────────────────────────────────────────
+
+    def _seasonality_universe(self) -> list[str]:
+        """Benchmarks plus tracked tickers, the set seasonality is measured on."""
+        universe: list[str] = [
+            t.strip().upper()
+            for t in (settings.seasonality_benchmarks or "").split(",")
+            if t.strip()
+        ]
+        try:
+            for ticker in self.db.get_tracked_tickers() or []:
+                symbol = (ticker or "").strip().upper()
+                if symbol and symbol not in universe:
+                    universe.append(symbol)
+        except Exception as e:
+            log.warning("orchestrator.seasonality_universe_failed", error=str(e))
+        return universe
+
+    async def send_weekly_tip(self) -> None:
+        """
+        Compose, store and send the weekly tip. Never raises.
+
+        Sends whatever the composer produced even when the model is unset or the
+        call failed — the facts-only render is still the week's calendar and
+        seasonal precedents, and a silent Sunday is indistinguishable from a dead
+        worker.
+        """
+        try:
+            composer = WeeklyTipComposer(self.db, self.price_feed)
+            facts = await composer.gather_facts()
+            tips = await composer.compose(facts)
+            body_html = render_weekly_tip(facts, tips)
+            await composer.persist_and_publish(facts, tips, body_html)
+
+            if self.alert_manager:
+                await self.alert_manager.send_html(body_html)
+            log.info("orchestrator.weekly_tip_sent",
+                     tips=len(tips), status=facts.get("tip_status"),
+                     effects=len(facts.get("seasonality") or []))
+        except Exception as e:
+            log.error("orchestrator.weekly_tip_failed", error=str(e))
+
+    async def refresh_seasonality_history(self, limit: Optional[int] = None) -> dict:
+        """
+        Deepen `price_history` for tickers with less than `seasonality_min_years`.
+
+        Monthly, and normally a no-op: a ticker that already holds the history is
+        skipped without a network call, so the job only costs anything when a new
+        name joins the watchlist. `limit` caps how many get pulled in one pass,
+        which is what the startup path uses to keep a cold boot short.
+        """
+        try:
+            universe = self._seasonality_universe()
+            if limit is not None:
+                universe = universe[:limit]
+            return await ensure_deep_history(
+                self.db, self.price_feed, universe, settings.seasonality_min_years
+            )
+        except Exception as e:
+            log.error("orchestrator.seasonality_refresh_failed", error=str(e))
+            return {}
+
     def start(self, interval_minutes: int = 5) -> None:
         """Starts the periodic scheduler."""
         # First cycle is delayed rather than immediate. A full
@@ -854,7 +1412,11 @@ class PipelineOrchestrator:
         self.scheduler.add_job(
             self.run_pipeline_cycle,
             'date',
-            run_date=datetime.datetime.now() + datetime.timedelta(
+            # Timezone-aware on purpose: APScheduler localizes a NAIVE run_date
+            # to the scheduler's timezone, which is no longer the host's. Off a
+            # machine running in settings.timezone, a naive "now + 90s" would be
+            # read as 90 seconds from now *in Seoul* — hours away either way.
+            run_date=datetime.datetime.now(self.tz) + datetime.timedelta(
                 seconds=settings.pipeline_startup_delay_seconds
             )
         )
@@ -864,6 +1426,30 @@ class PipelineOrchestrator:
             'interval',
             minutes=interval_minutes,
             id='pipeline_cycle',
+            replace_existing=True
+        )
+        # Classification is its own job, decoupled from the fetch loop. First run
+        # a minute after the first cycle, so the rows it ingested already have
+        # embeddings for dedup; then on its own cadence, which is what lets
+        # throughput exceed ingest instead of merely matching it.
+        self.scheduler.add_job(
+            self.run_classify_backlog,
+            'date',
+            run_date=datetime.datetime.now(self.tz) + datetime.timedelta(
+                seconds=settings.pipeline_startup_delay_seconds + 60
+            ),
+            id='classify_backlog_warmup',
+            replace_existing=True
+        )
+        self.scheduler.add_job(
+            self.run_classify_backlog,
+            'interval',
+            minutes=settings.classify_backlog_interval_minutes,
+            id='classify_backlog',
+            # Narrower than the scheduler default: a classification run that was
+            # due two minutes ago is still worth doing, one due ten minutes ago
+            # has been superseded by the next tick.
+            misfire_grace_time=120,
             replace_existing=True
         )
         self.scheduler.add_job(
@@ -879,7 +1465,7 @@ class PipelineOrchestrator:
         self.scheduler.add_job(
             self.refresh_prices,
             'date',
-            run_date=datetime.datetime.now() + datetime.timedelta(seconds=5),
+            run_date=datetime.datetime.now(self.tz) + datetime.timedelta(seconds=5),
             id='price_feed_warmup',
             replace_existing=True
         )
@@ -932,17 +1518,16 @@ class PipelineOrchestrator:
             replace_existing=True
         )
         
-        seoul_tz = ZoneInfo("Asia/Seoul")
-
         # Daily Briefing — 5:00 AM KST by default, configurable via .env
         self.scheduler.add_job(
             self.send_daily_briefing,
             CronTrigger(
                 hour=settings.briefing_hour,
                 minute=settings.briefing_minute,
-                timezone=seoul_tz
+                timezone=self.tz
             ),
             id='daily_briefing',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
 
@@ -951,66 +1536,74 @@ class PipelineOrchestrator:
         # BRIEFING_HOUR earlier than 4:30 breaks that ordering.
         self.scheduler.add_job(
             self.retire_stale_ipos,
-            CronTrigger(hour=4, minute=30, timezone=seoul_tz),
+            CronTrigger(hour=4, minute=30, timezone=self.tz),
             id='ipo_retire',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
         
         # 5:05 AM KST Daily Advisor
         self.scheduler.add_job(
             self.send_daily_advisor,
-            CronTrigger(hour=5, minute=5, timezone=seoul_tz),
+            CronTrigger(hour=5, minute=5, timezone=self.tz),
             id='daily_advisor',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
         
         # 8:00 AM KST Daily Earnings Whisper Check
         self.scheduler.add_job(
             self.market_scanner.check_earnings,
-            CronTrigger(hour=8, minute=0, timezone=seoul_tz),
+            CronTrigger(hour=8, minute=0, timezone=self.tz),
             id='earnings_whisper',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
         
         # 8:30 AM KST Daily Predictions
         self.scheduler.add_job(
             run_daily_predictions,
-            CronTrigger(hour=8, minute=30, timezone=seoul_tz),
+            CronTrigger(hour=8, minute=30, timezone=self.tz),
             args=[self.db, self.alert_manager],
             id='daily_predictions',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
         
         # 18:00 KST (6:00 PM) Friday Weekly Review
         self.scheduler.add_job(
             self.send_weekly_review,
-            CronTrigger(day_of_week='fri', hour=18, minute=0, timezone=seoul_tz),
+            CronTrigger(day_of_week='fri', hour=18, minute=0, timezone=self.tz),
             id='weekly_review',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
         
         # 21:00 KST Daily Prediction Resolution
         self.scheduler.add_job(
             self.resolve_predictions,
-            CronTrigger(hour=21, minute=0, timezone=seoul_tz),
+            CronTrigger(hour=21, minute=0, timezone=self.tz),
             id='prediction_resolution',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
         
         # 21:05 KST Daily Reflection Job
         self.scheduler.add_job(
             run_reflection_job,
-            CronTrigger(hour=21, minute=5, timezone=seoul_tz),
+            CronTrigger(hour=21, minute=5, timezone=self.tz),
             args=[self.db, self.alert_manager],
             id='reflection_job',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
         
         # Sunday 22:00 KST Weekly Model Retraining
         self.scheduler.add_job(
             self.retrain_models,
-            CronTrigger(day_of_week='sun', hour=22, minute=0, timezone=seoul_tz),
+            CronTrigger(day_of_week='sun', hour=22, minute=0, timezone=self.tz),
             id='model_retraining',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
 
@@ -1056,13 +1649,14 @@ class PipelineOrchestrator:
                 await self.insider_tracker.sync_all(tickers)
 
         # Passes timezone= explicitly, like every other cron job here. The
-        # scheduler itself is constructed without a default timezone, so the
-        # bare 'cron' form this used to use fired at whatever the host's local
-        # time was — correct on the Termux target only by coincidence.
+        # bare 'cron' form this used to use fired at whatever the scheduler's
+        # default timezone was — back then the host's local time, correct on the
+        # Termux target only by coincidence.
         self.scheduler.add_job(
             run_insider_scan,
-            CronTrigger(hour=7, minute=0, timezone=seoul_tz),
+            CronTrigger(hour=7, minute=0, timezone=self.tz),
             id='insider_scan',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
 
@@ -1075,8 +1669,9 @@ class PipelineOrchestrator:
 
         self.scheduler.add_job(
             run_kr_flow_scan,
-            CronTrigger(hour=18, minute=0, timezone=seoul_tz),
+            CronTrigger(hour=18, minute=0, timezone=self.tz),
             id='kr_flow_scan',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
 
@@ -1094,8 +1689,9 @@ class PipelineOrchestrator:
         # once a day.
         self.scheduler.add_job(
             self.sync_price_history,
-            CronTrigger(hour=7, minute=15, timezone=seoul_tz),
+            CronTrigger(hour=7, minute=15, timezone=self.tz),
             id='price_history_sync',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
 
@@ -1118,8 +1714,9 @@ class PipelineOrchestrator:
         for hour, minute, suffix in ((7, 30, ''), (8, 15, '_retry')):
             self.scheduler.add_job(
                 run_darkpool_scan,
-                CronTrigger(hour=hour, minute=minute, timezone=seoul_tz),
+                CronTrigger(hour=hour, minute=minute, timezone=self.tz),
                 id=f'darkpool_scan{suffix}',
+                misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
                 replace_existing=True
             )
 
@@ -1128,8 +1725,9 @@ class PipelineOrchestrator:
         # follow it and still land before daily_predictions at 08:30.
         self.scheduler.add_job(
             self.market_regime_tracker.sync,
-            CronTrigger(hour=7, minute=45, timezone=seoul_tz),
+            CronTrigger(hour=7, minute=45, timezone=self.tz),
             id='market_regime_scan',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
 
@@ -1150,8 +1748,9 @@ class PipelineOrchestrator:
 
             self.scheduler.add_job(
                 run_options_snapshot,
-                CronTrigger(hour=6, minute=0, timezone=seoul_tz),
+                CronTrigger(hour=6, minute=0, timezone=self.tz),
                 id='options_snapshot',
+                misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
                 replace_existing=True
             )
 
@@ -1169,8 +1768,9 @@ class PipelineOrchestrator:
 
             self.scheduler.add_job(
                 run_analyst_snapshot,
-                CronTrigger(hour=6, minute=45, timezone=seoul_tz),
+                CronTrigger(hour=6, minute=45, timezone=self.tz),
                 id='analyst_snapshot',
+                misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
                 replace_existing=True
             )
 
@@ -1190,8 +1790,9 @@ class PipelineOrchestrator:
 
             self.scheduler.add_job(
                 run_technical_rating,
-                CronTrigger(hour=8, minute=5, timezone=seoul_tz),
+                CronTrigger(hour=8, minute=5, timezone=self.tz),
                 id='technical_rating',
+                misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
                 replace_existing=True
             )
 
@@ -1202,16 +1803,60 @@ class PipelineOrchestrator:
 
         self.scheduler.add_job(
             run_trend_forecasting,
-            CronTrigger(hour='2,6,10,14,18,22', minute=0, timezone=seoul_tz),
+            CronTrigger(hour='2,6,10,14,18,22', minute=0, timezone=self.tz),
             id='trend_forecasting',
+            # Four-hourly, so the daily window is wrong in the other direction:
+            # it would let a backlog fire a run the next schedule supersedes.
+            misfire_grace_time=3600,
             replace_existing=True
         )
 
         # Daily at 00:30 KST: Sector daily snapshot
         self.scheduler.add_job(
             self.sector_analyzer.capture_daily_snapshot,
-            CronTrigger(hour=0, minute=30, timezone=seoul_tz),
+            CronTrigger(hour=0, minute=30, timezone=self.tz),
             id='sector_snapshot',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
+            replace_existing=True
+        )
+
+        # 03:00 KST on the 1st: top up the macro calendar from the web.
+        #
+        # Monthly rather than daily because the seeded schedule covers more than
+        # a year and the agencies publish in annual batches — BLS, BEA and Census
+        # post the following year in the autumn. Without this the calendar runs
+        # dry in whichever January follows the seed's verification date.
+        self.scheduler.add_job(
+            self.refresh_macro_calendar,
+            CronTrigger(day=1, hour=3, minute=0, timezone=self.tz),
+            id='macro_calendar_refresh',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
+            replace_existing=True
+        )
+
+        # Weekly tip — DIGEST_DAY at DIGEST_HOUR, default Sunday 20:00 KST, which
+        # is Sunday morning US Eastern: before the week it is written about opens,
+        # which is the only time it is worth anything.
+        self.scheduler.add_job(
+            self.send_weekly_tip,
+            CronTrigger(day_of_week=settings.digest_day, hour=settings.digest_hour,
+                        minute=0, timezone=self.tz),
+            id='weekly_tip',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
+            replace_existing=True
+        )
+
+        # 02:30 KST on the 1st: deepen price_history for seasonality.
+        #
+        # Monthly because the answer only changes when a ticker joins the
+        # watchlist — everything already deep is skipped without a network call.
+        # Ahead of the macro refresh at 03:00 so the two heavy monthly jobs do
+        # not overlap on the phone.
+        self.scheduler.add_job(
+            self.refresh_seasonality_history,
+            CronTrigger(day=1, hour=2, minute=30, timezone=self.tz),
+            id='seasonality_refresh',
+            misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
             replace_existing=True
         )
 
@@ -1230,7 +1875,7 @@ class PipelineOrchestrator:
                 run_thesis_generation,
                 CronTrigger(hour=THESIS_GENERATION_HOUR,
                             minute=THESIS_GENERATION_MINUTE,
-                            timezone=seoul_tz),
+                            timezone=self.tz),
                 id='thesis_generation',
                 misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
                 replace_existing=True
@@ -1250,7 +1895,7 @@ class PipelineOrchestrator:
 
             self.scheduler.add_job(
                 run_thesis_rescore,
-                CronTrigger(hour=9, minute=10, timezone=seoul_tz),
+                CronTrigger(hour=9, minute=10, timezone=self.tz),
                 id='thesis_rescore',
                 misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
                 replace_existing=True
@@ -1267,7 +1912,7 @@ class PipelineOrchestrator:
 
             self.scheduler.add_job(
                 run_thesis_reflection,
-                CronTrigger(hour=9, minute=40, timezone=seoul_tz),
+                CronTrigger(hour=9, minute=40, timezone=self.tz),
                 id='thesis_reflection',
                 misfire_grace_time=DAILY_MISFIRE_GRACE_SECONDS,
                 replace_existing=True
@@ -1279,12 +1924,22 @@ class PipelineOrchestrator:
         self.scheduler.add_job(
             self._startup_catchup,
             'date',
-            run_date=datetime.datetime.now() + datetime.timedelta(
+            run_date=datetime.datetime.now(self.tz) + datetime.timedelta(
                 seconds=settings.startup_catchup_delay_seconds
             ),
             id='startup_catchup',
             replace_existing=True
         )
+
+        # Before the scheduler, not as a job: /api/calendar, the dashboard card
+        # and /macro all read macro_events directly, so on a fresh database the
+        # calendar has to be populated by the time the API answers its first
+        # request rather than whenever a cron next fires. Costs no network and no
+        # LLM call — it is an upsert of compiled-in data.
+        try:
+            self.macro_calendar.seed()
+        except Exception as e:
+            log.error("orchestrator.macro_seed_failed", error=str(e))
 
         self.scheduler.start()
         log.info("orchestrator.started", interval_minutes=interval_minutes)
@@ -1298,17 +1953,41 @@ class PipelineOrchestrator:
     async def _startup_catchup(self):
         """Check for and run any missed daily prediction generation or resolution jobs."""
         import datetime as dt
-        seoul_tz = ZoneInfo("Asia/Seoul")
-        today_str = dt.datetime.now(seoul_tz).strftime("%Y-%m-%d")
+        today_str = dt.datetime.now(self.tz).strftime("%Y-%m-%d")
 
         # Ahead of the watchlist check below: theme detection reads the article
         # corpus, not tracked tickers, so an empty watchlist must not skip it.
         # Wrapped separately so a thesis failure cannot cost the prediction and
         # resolution catch-ups that follow it.
         try:
-            await self._catchup_thesis(seoul_tz)
+            await self._catchup_thesis()
         except Exception as e:
             log.error("orchestrator.startup_catchup.thesis_error", error=str(e))
+
+        # An empty next-60-days window means the seed has run dry — the compiled
+        # schedule ended before today and the monthly cron has not fired since.
+        # Waiting for the 1st would leave the calendar blank for up to a month,
+        # so the refresh runs once here instead. Also ahead of the watchlist
+        # check below: macro events belong to no ticker.
+        try:
+            if not await asyncio.to_thread(self.macro_calendar.upcoming, 60):
+                log.info("orchestrator.startup_catchup.macro_calendar_empty")
+                await self.refresh_macro_calendar()
+            else:
+                log.info("orchestrator.startup_catchup.macro_calendar_ok")
+        except Exception as e:
+            log.error("orchestrator.startup_catchup.macro_calendar_error", error=str(e))
+
+        # Seasonality needs a decade of bars and refresh_history() stores three
+        # months, so on a fresh database the first weekly tip would have nothing
+        # to measure and would print no precedents at all. Capped at three
+        # tickers: each one is a full-history Yahoo pull, and the monthly job
+        # picks up the rest. Ahead of the watchlist check below because the
+        # benchmarks are configured, not tracked.
+        try:
+            await self.refresh_seasonality_history(limit=STARTUP_DEEP_HISTORY_TICKERS)
+        except Exception as e:
+            log.error("orchestrator.startup_catchup.seasonality_error", error=str(e))
 
         try:
             tracked = self.db.get_tracked_tickers()
@@ -1350,7 +2029,7 @@ class PipelineOrchestrator:
         except Exception as e:
             log.error("orchestrator.startup_catchup_error", error=str(e))
 
-    async def _catchup_thesis(self, seoul_tz) -> None:
+    async def _catchup_thesis(self) -> None:
         """Run the morning thesis if the worker was down when it was due.
 
         misfire_grace_time covers a process that was alive but late. It cannot
@@ -1363,18 +2042,18 @@ class PipelineOrchestrator:
         if not settings.thesis_enabled:
             return
 
-        now_seoul = datetime.datetime.now(seoul_tz)
-        due_today = now_seoul.replace(
+        now_local = datetime.datetime.now(self.tz)
+        due_today = now_local.replace(
             hour=THESIS_GENERATION_HOUR, minute=THESIS_GENERATION_MINUTE,
             second=0, microsecond=0,
         )
-        if now_seoul < due_today:
+        if now_local < due_today:
             # Booted before it was due; the cron job will handle it normally.
             log.info("orchestrator.startup_catchup.thesis_not_due_yet")
             return
 
         midnight_utc = (
-            now_seoul.replace(hour=0, minute=0, second=0, microsecond=0)
+            now_local.replace(hour=0, minute=0, second=0, microsecond=0)
             .astimezone(datetime.timezone.utc)
             # SQLite CURRENT_TIMESTAMP format, not isoformat() — see
             # Database.count_theses_since.
@@ -1584,7 +2263,7 @@ async def run_reflection_job(db, alert_manager=None):
         log.warning("MODEL_REFLECTION is not configured; skipping Reflection Job.")
         return
         
-    today_str = datetime.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+    today_str = datetime.datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d")
 
     # Wrong predictions worth a fresh debate, ranked and capped after the loop.
     pending_corrections: list[dict] = []
@@ -1765,7 +2444,7 @@ async def run_thesis_reflection_job(db):
         log.info("thesis_reflection.nothing_due")
         return
 
-    today_str = datetime.datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y-%m-%d")
+    today_str = datetime.datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d")
     written = 0
 
     for r in rows:

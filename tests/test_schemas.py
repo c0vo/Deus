@@ -8,7 +8,10 @@ from pipeline.classifier import ClassifierResult
 from config.llm import parse_structured, salvage_json_field
 from data.models import TickerNote, notes_to_dict
 from pipeline.agents import TraderAdvisory
+from pipeline.daily_stance import NO_CALL, UNAVAILABLE, Stance, StanceRow
+from pipeline.weekly_tip import Tip
 from pipeline.predictor import LlmPrediction
+from pipeline.grounded_answer import GradeVerdict, MoveExplanation
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -244,3 +247,134 @@ class TestStructuredOutputParsing:
         # `response.parsed` is typed loosely enough that a list schema is not
         # guaranteed to come back as model instances.
         assert notes_to_dict([{"ticker": "aapl", "summary": "x"}]) == {"AAPL": "x"}
+
+
+class TestGroundedAnswerSchemas:
+    """
+    GradeVerdict and MoveExplanation decide whether an alert says something
+    specific or says nothing. Both are parsed with `strict` off on the
+    json_schema, so the fallback path matters as much as the happy one.
+    """
+
+    def test_grade_verdict_parses_fixture(self):
+        data = (FIXTURES_DIR / "grader_response.json").read_text()
+        verdict = parse_structured(data, GradeVerdict)
+        assert verdict.sufficient is True
+        assert verdict.specificity == "specific"
+        assert "2026-09-11" in verdict.reason
+
+    def test_grade_verdict_rejects_unknown_specificity(self):
+        with pytest.raises(ValidationError):
+            parse_structured(
+                '{"sufficient": false, "specificity": "vague", "reason": "x"}',
+                GradeVerdict,
+            )
+
+    def test_grade_verdict_reason_is_optional(self):
+        verdict = parse_structured(
+            '{"sufficient": false, "specificity": "none"}', GradeVerdict
+        )
+        assert verdict.reason == ""
+
+    def test_move_explanation_parses_fixture(self):
+        data = (FIXTURES_DIR / "move_explanation.json").read_text()
+        explanation = parse_structured(data, MoveExplanation)
+        assert explanation.catalyst_found is True
+        assert explanation.catalyst_kind == "company"
+        assert explanation.source_indices == [2, 1]
+
+    def test_move_explanation_defaults_to_uncited_unknown(self):
+        """A bare catalyst_found=false must validate — it is the honest answer."""
+        explanation = parse_structured('{"catalyst_found": false}', MoveExplanation)
+        assert explanation.catalyst_kind == "unknown"
+        assert explanation.source_indices == []
+        assert explanation.cause == ""
+
+    def test_move_explanation_rejects_unknown_catalyst_kind(self):
+        with pytest.raises(ValidationError):
+            parse_structured(
+                '{"catalyst_found": true, "catalyst_kind": "astrology"}',
+                MoveExplanation,
+            )
+
+
+class TestStanceSchema:
+    """
+    The morning stance schema.
+
+    `Stance.action` carries a four-value Literal because that Literal IS the
+    JSON schema the model is handed. NO CALL and UNAVAILABLE are statements
+    about the pipeline, not about the position, so they live on `StanceRow` and
+    are unspellable here — which is what keeps "the model did not answer" from
+    ever being rendered as a considered HOLD.
+    """
+
+    VALID = {
+        "ticker": "NVDA",
+        "action": "TRIM",
+        "conviction": "Medium",
+        "thesis": "Daily rating flipped to Sell with RSI14 at 71.",
+        "key_risk": "Analyst target still implies +14% upside.",
+        "evidence_used": ["rsi", "technical_rating", "analyst_target"],
+        "what_would_change_my_mind": "A daily close back above $185.",
+    }
+
+    def test_valid_stance(self):
+        stance = Stance.model_validate(self.VALID)
+        assert stance.action == "TRIM"
+        assert stance.evidence_used == ["rsi", "technical_rating", "analyst_target"]
+
+    @pytest.mark.parametrize("action", ["BUY/ADD", "HOLD", "TRIM", "SELL"])
+    def test_every_action_is_available(self, action):
+        """All four, not just HOLD and SELL — that menu was the original bug."""
+        assert Stance.model_validate({**self.VALID, "action": action}).action == action
+
+    @pytest.mark.parametrize("action", ["MOON", "BUY", "buy/add", NO_CALL, UNAVAILABLE])
+    def test_rejects_actions_outside_the_literal(self, action):
+        with pytest.raises(ValidationError):
+            Stance.model_validate({**self.VALID, "action": action})
+
+    def test_rejects_conviction_outside_the_literal(self):
+        with pytest.raises(ValidationError):
+            Stance.model_validate({**self.VALID, "conviction": "Very High"})
+
+    def test_evidence_defaults_to_empty(self):
+        payload = {k: v for k, v in self.VALID.items() if k != "evidence_used"}
+        assert Stance.model_validate(payload).evidence_used == []
+
+    def test_parses_from_a_bare_array(self):
+        """What the `parse_structured` fallback in `compose` has to swallow."""
+        raw = json.dumps([self.VALID, {**self.VALID, "ticker": "AMD",
+                                       "action": "BUY/ADD"}])
+        rows = parse_structured(raw, list[Stance])
+        assert [r.action for r in rows] == ["TRIM", "BUY/ADD"]
+
+    def test_stance_row_carries_the_codes_the_schema_cannot(self):
+        for action in (NO_CALL, UNAVAILABLE):
+            row = StanceRow(ticker="QQQ", action=action)
+            assert row.action == action
+
+    def test_stance_row_from_stance_upper_cases_the_ticker(self):
+        row = StanceRow.from_stance(Stance.model_validate({**self.VALID,
+                                                          "ticker": "nvda"}))
+        assert row.ticker == "NVDA"
+        assert row.thesis == self.VALID["thesis"]
+
+
+class TestWeeklyTipSchema:
+    def test_valid_tip_and_severity(self):
+        tip = Tip.model_validate({
+            "title": "FOMC week",
+            "precedent": "Median -1.5% across 34 years.",
+            "evidence": "SPY September statistics.",
+            "action": "Watch the release.",
+            "severity": "warning",
+        })
+        assert tip.severity == "warning"
+
+    def test_invalid_severity_is_rejected(self):
+        with pytest.raises(ValidationError):
+            Tip.model_validate({
+                "title": "x", "precedent": "x", "evidence": "x",
+                "action": "x", "severity": "urgent",
+            })

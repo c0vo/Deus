@@ -185,6 +185,16 @@ export default function Chat() {
                 } else if (parsed.step === "retrieval") {
                   stepName = "🔍 RAG RETRIEVAL";
                   stepDetails = parsed.context ? `Found news context in SQLite-vec.` : `No news context found. Falling back to general knowledge.`;
+                } else if (parsed.step === "grading") {
+                  // The step that decides whether a web search happens. Shown
+                  // because "insufficient -> web search" is the difference
+                  // between a cited answer and a generic one, and it is
+                  // otherwise invisible to whoever is reading the reply.
+                  stepName = "🧪 CONTEXT GRADE";
+                  const verdict = parsed.sufficient
+                    ? "sufficient"
+                    : "insufficient → web search";
+                  stepDetails = `${verdict} (${parsed.specificity || "none"})${parsed.reason ? `: ${parsed.reason}` : ""}`;
                 } else if (parsed.step === "web_search") {
                   stepName = "🌐 WEB SEARCH";
                   stepDetails = parsed.reasoning || "Searching the web for latest information...";

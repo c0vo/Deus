@@ -1,7 +1,7 @@
 """Tests for SSE (Server-Sent Events) streaming format and parsing."""
 
 import json
-from api.server import _sse_event
+from api.server import BRAIN_STREAM_TOPICS, _sse_event
 
 
 class TestSSEEventFormatting:
@@ -224,3 +224,43 @@ class TestEdgeCases:
         raw = _sse_event("data", large_list)
         assert raw.count("\n") > 1
         assert raw.startswith("event: data")
+
+
+class TestBrainStreamTopics:
+    """
+    The dashboard's live-update contract.
+
+    A topic published in the worker but missing from this tuple is delivered to
+    nobody, and nothing anywhere else fails — which is how macro_themes stayed
+    orphaned. Asserting the membership is the only cheap guard against it.
+    """
+
+    def test_macro_themes_is_subscribed(self):
+        assert "macro_themes" in BRAIN_STREAM_TOPICS
+
+    def test_classification_status_is_subscribed(self):
+        """Published at the end of every classify_backlog run."""
+        assert "classification_status" in BRAIN_STREAM_TOPICS
+
+    def test_alert_is_subscribed(self):
+        """Published by the market scanner and by breaking-news alerts.
+
+        Without it the AlertsCard only ever shows what its own page-load fetch
+        returned, and an alert that fired while the tab was open never appears.
+        """
+        assert "alert" in BRAIN_STREAM_TOPICS
+
+    def test_weekly_tip_is_subscribed(self):
+        assert "weekly_tip" in BRAIN_STREAM_TOPICS
+
+    def test_no_duplicate_topics(self):
+        assert len(BRAIN_STREAM_TOPICS) == len(set(BRAIN_STREAM_TOPICS))
+
+    def test_existing_topics_are_all_still_present(self):
+        expected = {
+            "pipeline_status", "new_articles", "sector_heatmap",
+            "rotation_signal", "ipo_alert", "trend_forecast",
+            "hot_tickers", "market_ticker", "sentiment_distribution",
+            "embedding_status", "events_updated", "thesis_update",
+        }
+        assert expected <= set(BRAIN_STREAM_TOPICS)

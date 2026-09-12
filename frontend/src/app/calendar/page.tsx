@@ -18,8 +18,8 @@ interface CalendarPayload {
   from: string;
   to: string;
   items: CalendarItem[];
-  counts: { event: number; ipo: number };
-  sources: { finnhub: boolean };
+  counts: { event: number; ipo: number; macro: number };
+  sources: { finnhub: boolean; macro_seed: boolean };
 }
 
 type ViewMode = "month" | "week" | "list";
@@ -128,8 +128,10 @@ function CalendarContent() {
   };
 
   const total = items.length;
+  const macroCount = data?.counts.macro ?? 0;
   const selectedItems = itemsByDate.get(selected) || [];
   const finnhubMissing = data ? !data.sources.finnhub : false;
+  const macroSeeded = data ? data.sources.macro_seed : false;
 
   return (
     <div className="p-4 md:p-5 flex flex-col gap-4">
@@ -180,6 +182,10 @@ function CalendarContent() {
           <span className="pill">
             <span className="num">{total}</span> scheduled
           </span>
+
+          <span className="pill">
+            <span className="num">{macroCount}</span> macro
+          </span>
         </div>
       </div>
 
@@ -192,9 +198,19 @@ function CalendarContent() {
 
       {finnhubMissing && (
         <div className="px-3.5 py-2.5 rounded border border-border-dim bg-bg-card text-[11px] text-terminal-muted">
-          No calendar sources configured. Set <span className="num">FINNHUB_API_KEY</span>{" "}
-          in <span className="num">.env</span> and restart to pull earnings and IPO
-          dates.
+          No earnings or IPO source configured. Set{" "}
+          <span className="num">FINNHUB_API_KEY</span> in{" "}
+          <span className="num">.env</span> and restart to pull earnings and IPO
+          dates. Macro events are unaffected.
+        </div>
+      )}
+
+      {macroSeeded && (
+        <div className="text-[11px] text-terminal-muted-alt">
+          Macro dates are the official published schedule — Fed, BLS, BEA, Census
+          and NYSE — checked into the repo, topped up monthly from the web. A
+          web-sourced date renders as{" "}
+          <span className="tag tag-warn">Estimated</span>.
         </div>
       )}
 
@@ -266,6 +282,10 @@ function CalendarContent() {
               <span className="inline-flex items-center gap-1.5">
                 <i className="w-1.5 h-1.5 rotate-45 bg-terminal-signal" />
                 IPO
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <i className="w-1.5 h-1.5 rounded-full bg-terminal-signal" />
+                Macro
               </span>
               <span className="inline-flex items-center gap-1.5">
                 <i className="w-1.5 h-1.5 rounded-[1px] bg-terminal-muted-alt" />

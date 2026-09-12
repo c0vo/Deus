@@ -293,62 +293,31 @@ async def ws_news(websocket: WebSocket):
 @app.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket):
     """Interactive chat with the ChatOrchestrator (RAG-powered)."""
-    from pipeline.chat_orchestrator import ChatOrchestrator, build_chat_prompt
-    from config.llm import response_cost, stream_complete
-    from config.usage import track_llm
+    from pipeline.chat_orchestrator import ChatOrchestrator
 
     await websocket.accept()
     try:
         while True:
             user_msg = await websocket.receive_text()
 
+            # Was a hand-rolled copy of the router -> rag -> stream sequence,
+            # the third one in the codebase. It drifted: this path never graded
+            # its context and never searched the web at all, so the legacy
+            # client got a different answer from the dashboard for the same
+            # question. iter_events is now the only implementation.
             orchestrator = ChatOrchestrator(db)
-            state = {"query": user_msg, "context": "", "routing_decision": "", "final_answer": ""}
-
-            # Router
-            router_res = await orchestrator.router_node(state)
-            decision = router_res.get("routing_decision", "shallow")
-            state["routing_decision"] = decision
-
-            await websocket.send_json({
-                "type": "status",
-                "intent": decision,
-                "reasoning": f"Routed to {decision} agent"
-            })
-
-            # RAG
-            rag_res = await orchestrator.rag_node(state)
-            context = rag_res.get("context", "")
-            state["context"] = context
-
-            # Generation. Two things are fixed here beyond the provider swap:
-            # this used to iterate a SYNCHRONOUS stream with a plain `for`
-            # inside an async handler, blocking the event loop — and with it
-            # every SSE endpoint and the sse_events outbox tail — for the whole
-            # response; and it recorded nothing in llm_usage_log, so a chat
-            # session was free as far as the cost dashboard was concerned.
-            model = (
-                settings.model_chat_shallow if decision == "shallow"
-                else settings.model_chat_complex
-            )
-            prompt = build_chat_prompt(user_msg, context)
-
-            collected: list[str] = []
-            with track_llm(db, model, "ws_chat_stream") as usage:
-                async for chunk in stream_complete(
-                    model=model,
-                    prompt=prompt,
-                    max_tokens=2048,
-                    reasoning=None if decision == "shallow" else "medium",
-                ):
-                    if chunk.text:
-                        collected.append(chunk.text)
-                        await websocket.send_json({"type": "token", "text": chunk.text})
-                    if chunk.usage is not None:
-                        usage.prompt_tokens = getattr(chunk.usage, "prompt_tokens", None)
-                        usage.candidate_tokens = getattr(chunk.usage, "completion_tokens", None)
-                        usage.cost = response_cost(chunk.usage)
-                usage.response_text = "".join(collected)
+            async for event, data in orchestrator.iter_events(user_msg):
+                if event == "token":
+                    await websocket.send_json(
+                        {"type": "token", "text": str(data.get("text", ""))}
+                    )
+                elif event == "step":
+                    await websocket.send_json({"type": "status", **data})
+                elif event == "error":
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": data if isinstance(data, str) else str(data),
+                    })
 
             await websocket.send_json({"type": "done"})
 

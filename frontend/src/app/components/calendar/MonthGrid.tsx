@@ -5,7 +5,7 @@ import { KindMark } from "./EventChrome";
 
 export interface CalendarItem {
   id: string;
-  kind: "event" | "ipo";
+  kind: "event" | "ipo" | "macro";
   date: string;
   ticker: string | null;
   title: string;
@@ -14,6 +14,8 @@ export interface CalendarItem {
   source: string | null;
   sector: string | null;
   detail: string;
+  /** 1-3, macro rows only. Absent on ticker events and IPOs. */
+  importance?: number;
   raw_id: number;
 }
 

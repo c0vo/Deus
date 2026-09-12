@@ -16,15 +16,42 @@ import json
 from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 
+from config.cache import TTLCache
 from config.llm import complete, is_llm_configured
 from config.logging_config import get_logger
 from config.settings import settings
 from config.usage import track_llm
 
 log = get_logger(__name__)
+
+# Tavily is billed per search, and the chat lane paid for one on every complex
+# turn — including the three rephrasings of the same question a user asks in a
+# row, and every reconnect of a stream they abandoned. Keyed on the normalised
+# query plus the result count, so two differently-cased spellings of one
+# question share an entry.
+#
+# Lives at module scope because the orchestrator is constructed per request; a
+# per-instance cache would never see a second hit.
+_chat_search_cache = TTLCache(
+    ttl_seconds=settings.web_search_cache_seconds, max_entries=128
+)
+
+
+class _NoSearchResults(Exception):
+    """
+    Raised inside the cache factory so an empty result is never stored.
+
+    TTLCache only caches what the factory returns, so raising is how a search
+    that found nothing — a Tavily outage, a rate limit, a query with no hits —
+    stays retryable instead of pinning "no web context" for the whole TTL.
+    """
+
+
+def _search_cache_key(query: str, max_results: int) -> tuple[str, int]:
+    return (" ".join((query or "").lower().split()), max_results)
 
 
 @dataclass
@@ -148,6 +175,31 @@ def build_ticker_search_query(ticker: str) -> str:
     # The natural-language framing steers Tavily toward news articles about
     # actual events rather than static data-aggregator pages.
     return f"what is happening with {ticker} stock {month_str} news catalysts"
+
+
+def build_move_search_query(
+    ticker: str, pct: float, day: Optional[date | datetime] = None
+) -> str:
+    """Build the query a human would type when a stock moves without warning.
+
+    Phrased as the question itself ("why is NVDA stock down 4% today
+    September 12, 2026") rather than as keywords: Tavily ranks news explainers
+    above data-aggregator pages for that shape, and the explainers are the only
+    results that carry a dated catalyst worth citing.
+
+    The date is spelled out because "today" alone means nothing to a search
+    index — without it the top hits are whichever down-day article happened to
+    earn the most links, which is how an alert ends up citing last quarter.
+    """
+    when = day or datetime.now(timezone.utc).date()
+    if isinstance(when, datetime):
+        when = when.date()
+    direction = "up" if pct >= 0 else "down"
+    # %-d / %#d differ between platforms; build the day number by hand.
+    spelled = f"{when.strftime('%B')} {when.day}, {when.year}"
+    return (
+        f"why is {ticker} stock {direction} {abs(pct):.1f}% today {spelled}"
+    )
 
 
 def build_bottleneck_search_query(bottleneck: str, bottleneck_type: str = "") -> str:
@@ -349,8 +401,18 @@ async def enrich_chat_context(
 
     await _emit("research_start", {"query": query})
 
+    async def _search() -> list[WebSearchResult]:
+        hits = await provider.search(query, max_results=max_results)
+        if not hits:
+            raise _NoSearchResults
+        return hits
+
     try:
-        raw_results = await provider.search(query, max_results=max_results)
+        raw_results = await _chat_search_cache.get_or_build(
+            _search_cache_key(query, max_results), _search
+        )
+    except _NoSearchResults:
+        raw_results = []
     except Exception:
         log.warning("web_search.chat_enrich_failed", query=query[:80], exc_info=True)
         await _emit("research_complete", {"sources_found": 0})

@@ -54,6 +54,10 @@ FINNHUB_IPO_STATUS = {
     "withdrawn": "withdrawn",
 }
 
+# Statuses that record something that has already happened. Only the Finnhub
+# calendar may revise one — see _store_ipo.
+TERMINAL_IPO_STATUSES = frozenset({"listed", "withdrawn"})
+
 
 class IPODetector:
     """Detects IPO mentions in news and tracks upcoming/public offerings."""
@@ -377,7 +381,22 @@ class IPODetector:
         return None
 
     def _store_ipo(self, data: dict) -> None:
-        """Store or update an IPO record in the database."""
+        """
+        Store or update an IPO record in the database.
+
+        An unknown listing date is stored as NULL, never as ``''``: the empty
+        string is not NULL and sorts below every real date, so a ``''`` row
+        fails every ``ipo_date >= …`` filter while satisfying every
+        ``ipo_date < …`` one — it disappears from the watchlist and gets
+        deleted by ``retire_stale``'s backdate rule instead of rendering as TBA.
+
+        Updates are also one-way on two fields: a known ``ipo_date`` is never
+        replaced by an unknown one, and a terminal status is never downgraded
+        by a non-Finnhub writer.
+        """
+        # normalize_date() returns '' for an unparseable or absent date.
+        ipo_date = data.get("expected_date") or None
+
         with self.db.connection() as conn:
             existing = self._match_existing(conn, data["company_name"])
 
@@ -401,17 +420,33 @@ class IPODetector:
                     )
                     return
 
+                # 'listed' and 'withdrawn' record something that has already
+                # happened, so an LLM reading a retrospective article must not
+                # walk one back to 'upcoming' — that would undo retire_stale's
+                # flip on the next scan and put the row back on the watchlist
+                # claiming to be a future event. Finnhub may still correct it.
+                status = data.get("status") or existing["status"]
+                if (
+                    (existing["status"] or "").lower() in TERMINAL_IPO_STATUSES
+                    and data.get("source") != "finnhub"
+                ):
+                    status = existing["status"]
+
+                # COALESCE on ipo_date: a re-extraction that could not read a
+                # date must not erase one we already know. The previous version
+                # wrote '' straight over a confirmed listing date.
                 conn.execute(
                     """
-                    UPDATE ipo_tracker SET ticker = ?, status = ?, ipo_date = ?,
+                    UPDATE ipo_tracker SET ticker = ?, status = ?,
+                        ipo_date = COALESCE(NULLIF(?, ''), ipo_date),
                         offering_price = ?, sector = ?, estimated_valuation = ?,
                         notes = ?, metadata_json = COALESCE(?, metadata_json),
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (
-                        data.get("ticker"), data.get("status"),
-                        data.get("expected_date"), data.get("expected_price"),
+                        data.get("ticker"), status,
+                        ipo_date, data.get("expected_price"),
                         data.get("sector"), data.get("estimated_valuation"),
                         data.get("notes", ""), data.get("metadata_json"),
                         existing["id"],
@@ -430,7 +465,7 @@ class IPODetector:
                     """,
                     (
                         data["company_name"], data.get("ticker"),
-                        data.get("status", "rumored"), data.get("expected_date"),
+                        data.get("status", "rumored"), ipo_date,
                         data.get("expected_price"), data.get("sector"),
                         data.get("estimated_valuation"), source_id,
                         data.get("notes", ""), data.get("metadata_json"),
@@ -473,12 +508,21 @@ class IPODetector:
 
     def retire_stale(self, listed_retention_days: int = 30) -> int:
         """
-        Remove IPOs that have finished being news.
+        Age IPO rows forward and drop the ones that have finished being news.
 
-        Three cases: a listing that completed more than ``listed_retention_days``
-        ago, a withdrawn offering, and an entry whose IPO date is far enough in
-        the past that it was almost certainly an established company misread as
-        a new issue. Returns the number of rows removed.
+        Three passes, in order:
+
+        1. Normalise ``''`` dates to NULL, so the rest of this method and the
+           watchlist query see one shape for "no date known".
+        2. Flip an ``upcoming``/``priced`` offering whose date has passed to
+           ``listed``. Without this a stale ``upcoming`` row keeps claiming to
+           be a future event forever.
+        3. Delete: a listing that completed more than ``listed_retention_days``
+           ago, a withdrawn offering, and an entry whose IPO date is far enough
+           in the past that it was almost certainly an established company
+           misread as a new issue.
+
+        Returns the number of rows removed by pass 3.
         """
         cutoff = (
             datetime.now(timezone.utc) - timedelta(days=listed_retention_days)
@@ -489,6 +533,33 @@ class IPODetector:
         ).date().isoformat()
 
         with self.db.connection() as conn:
+            # Pass 1. '' is neither NULL nor comparable to a real date, so a
+            # ''-dated row used to fail the watchlist filter and be deleted by
+            # the backdate rule below instead of surviving as TBA.
+            conn.execute(
+                """
+                UPDATE ipo_tracker
+                SET ipo_date = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE ipo_date IS NOT NULL AND TRIM(ipo_date) = ''
+                """
+            )
+
+            # Pass 2. SQLite's date('now') is UTC, which rolls over at 09:00
+            # KST / 20:00 ET — after the US close — so a US offering is only
+            # flipped once its own trading day has finished.
+            flipped = conn.execute(
+                """
+                UPDATE ipo_tracker
+                SET status = 'listed', updated_at = CURRENT_TIMESTAMP
+                WHERE status IN ('upcoming', 'priced')
+                  AND ipo_date IS NOT NULL
+                  AND ipo_date < date('now')
+                """
+            ).rowcount or 0
+            if flipped:
+                log.info("ipo_detector.retired_to_listed", count=flipped)
+
+            # Pass 3.
             cursor = conn.execute(
                 """
                 DELETE FROM ipo_tracker
@@ -505,31 +576,56 @@ class IPODetector:
         Return tracked IPOs that are still forward-looking.
 
         Filters at read time as well as in ``retire_stale`` so a stale row never
-        reaches the dashboard in the window before the daily job next runs.
+        reaches the dashboard in the window before the daily job next runs. The
+        old 90-day ``ipo_max_backdate_days`` cutoff was far too loose for this:
+        it kept three months of finished offerings on the watchlist, and sorting
+        by status first let one of them outrank a genuinely upcoming listing.
+
+        Undated rows are kept deliberately — both the dashboard card and
+        ``/ipos`` render them as TBA, which is the honest answer for an IPO
+        whose date has not been announced.
+
+        Rows sort into three buckets, because the complaint that prompted all
+        of this was clutter from dates that had already passed:
+
+        0. dated today or later — the actual watchlist
+        1. undated (TBA) — not announced, so still ahead of us
+        2. dated in the past but inside the grace window — a completed event,
+           kept for ``ipo_show_listed_days`` as a receipt and nothing more
+
+        Within a bucket: soonest date first, then
+        ``priced > upcoming > listed > rumored``, then newest detection.
         """
-        backdate_cutoff = (
-            datetime.now(timezone.utc)
-            - timedelta(days=settings.ipo_max_backdate_days)
-        ).date().isoformat()
+        # date('now') is UTC in SQLite, so both this cutoff and the bucket
+        # boundary below roll over at 09:00 KST / 20:00 ET — after the US
+        # close. Correct for US listings: a company that lists today stays in
+        # bucket 0 for the whole of its own session.
+        cutoff = f"-{int(settings.ipo_show_listed_days)} days"
 
         with self.db.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM ipo_tracker
                 WHERE status != 'withdrawn'
-                  AND (ipo_date IS NULL OR ipo_date >= ?)
+                  AND (NULLIF(TRIM(ipo_date), '') IS NULL
+                       OR ipo_date >= date('now', ?))
                 ORDER BY
+                    CASE
+                        WHEN NULLIF(TRIM(ipo_date), '') IS NULL THEN 1
+                        WHEN ipo_date >= date('now') THEN 0
+                        ELSE 2
+                    END,
+                    NULLIF(TRIM(ipo_date), '') ASC,
                     CASE status
-                        WHEN 'upcoming' THEN 1
-                        WHEN 'priced' THEN 2
+                        WHEN 'priced' THEN 1
+                        WHEN 'upcoming' THEN 2
                         WHEN 'listed' THEN 3
                         WHEN 'rumored' THEN 4
                         ELSE 5
                     END,
-                    ipo_date ASC NULLS LAST,
                     detected_at DESC
                 LIMIT ?
                 """,
-                (backdate_cutoff, limit),
+                (cutoff, limit),
             ).fetchall()
             return [dict(row) for row in rows]

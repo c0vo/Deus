@@ -273,6 +273,49 @@ def _decode_json_stream(text: str) -> list:
     return values
 
 
+def salvage_json_array(text: str, *, key: str | None = None) -> list:
+    """
+    Recover the whole elements of a JSON array whose tail is truncated.
+
+    Written for one observed failure: a model asked to echo short ids degenerated
+    into repeating one (`"id": "a1a1a1a1a1…`) until it hit the output cap, so the
+    response ended mid-string and `json.loads` rejected all of it. Every complete
+    object before the runaway one was perfectly good, paid-for work, and
+    discarding the lot cost the whole batch.
+
+    `key` names the envelope field holding the array (`items` for the schema
+    path); without it the first `[` in the text is taken as the start. Returns
+    `[]` when nothing whole can be read, which callers treat exactly as a parse
+    failure.
+    """
+    cleaned = strip_code_fence(text)
+
+    start = -1
+    if key:
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*\[', cleaned)
+        if match:
+            start = match.end() - 1
+    if start < 0:
+        start = cleaned.find("[")
+    if start < 0:
+        return []
+
+    decoder = json.JSONDecoder(strict=False)
+    values: list = []
+    idx, end = start + 1, len(cleaned)
+    while idx < end:
+        while idx < end and cleaned[idx] in " \t\r\n,":
+            idx += 1
+        if idx >= end or cleaned[idx] == "]":
+            break
+        try:
+            value, idx = decoder.raw_decode(cleaned, idx)
+        except json.JSONDecodeError:
+            break  # the truncated tail; everything before it stands
+        values.append(value)
+    return values
+
+
 def parse_structured(text: str, schema: type[T] | Any) -> T:
     """
     Validate raw LLM text against `schema` — a Pydantic model, or a container
@@ -386,28 +429,47 @@ def _inline_defs(schema: dict) -> dict:
     return walk(schema)
 
 
-def _json_schema_for(schema: Any) -> tuple[dict, bool]:
+def _json_schema_for(schema: Any, exact_items: Optional[int] = None) -> tuple[dict, bool]:
     """
     Returns (json_schema_body, is_enveloped).
 
     A bare Pydantic model maps straight across. `list[Model]` cannot: a JSON
     Schema root has to be an object, so it goes inside `{"items": [...]}` and
     `_unwrap_envelope` takes it back out.
+
+    `exact_items` pins that array to a known length with `minItems`/`maxItems`,
+    for the callers that send N inputs and need N results back. A Python type
+    cannot express it — `list[Model]` says "an array of these", never "exactly
+    ten of these" — so it is a request-level argument rather than part of the
+    schema object. It is the only thing that stopped the batch classifier being
+    answered with a single item: a length the decoder can count is enforceable
+    in a way that "one object per input article" in prose is not.
     """
     if _is_list_schema(schema):
         (inner,) = get_args(schema)
+        items_schema: dict[str, Any] = {
+            "type": "array",
+            "items": _inline_defs(TypeAdapter(inner).json_schema()),
+        }
+        if exact_items is not None and exact_items > 0:
+            items_schema["minItems"] = int(exact_items)
+            items_schema["maxItems"] = int(exact_items)
         return (
             {
                 "type": "object",
-                "properties": {
-                    _LIST_ENVELOPE_KEY: {
-                        "type": "array",
-                        "items": _inline_defs(TypeAdapter(inner).json_schema()),
-                    }
-                },
+                "properties": {_LIST_ENVELOPE_KEY: items_schema},
                 "required": [_LIST_ENVELOPE_KEY],
             },
             True,
+        )
+
+    if exact_items is not None:
+        # Only the list envelope has an array to constrain. Silently ignoring
+        # this would make a caller think it had asked for a length.
+        log.warning(
+            "llm.exact_items_ignored",
+            schema=_schema_name(schema),
+            reason="exact_items applies to list[Model] schemas only",
         )
 
     return _inline_defs(TypeAdapter(schema).json_schema()), False
@@ -420,7 +482,9 @@ def _schema_name(schema: Any) -> str:
     return getattr(schema, "__name__", "response")
 
 
-def _build_response_format(schema: Any, json_mode: bool) -> tuple[Optional[dict], bool]:
+def _build_response_format(
+    schema: Any, json_mode: bool, exact_items: Optional[int] = None
+) -> tuple[Optional[dict], bool]:
     """
     Returns (response_format, is_enveloped).
 
@@ -431,9 +495,12 @@ def _build_response_format(schema: Any, json_mode: bool) -> tuple[Optional[dict]
     call site in this project already falls back to `parse_structured`, so the
     schema is worth more as strong guidance across all providers than as a hard
     constraint across few.
+
+    `exact_items` is passed through to `_json_schema_for`; see it for why a
+    length lives on the request rather than in the schema type.
     """
     if schema is not None:
-        body, enveloped = _json_schema_for(schema)
+        body, enveloped = _json_schema_for(schema, exact_items)
         return (
             {
                 "type": "json_schema",
@@ -504,8 +571,9 @@ def _build_kwargs(
     reasoning: Optional[str],
     temperature: Optional[float],
     max_tokens: Optional[int],
+    exact_items: Optional[int] = None,
 ) -> tuple[dict, bool]:
-    response_format, enveloped = _build_response_format(schema, json_mode)
+    response_format, enveloped = _build_response_format(schema, json_mode, exact_items)
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -575,6 +643,7 @@ async def complete(
     reasoning: Optional[str] = None,
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    exact_items: Optional[int] = None,
 ) -> LLMResponse:
     """
     One non-streaming completion.
@@ -582,6 +651,9 @@ async def complete(
     Raises if the client is unconfigured or the model name is empty, rather
     than returning a sentinel — an unset `MODEL_<FUNCTION>` is a configuration
     error, and the retry loops upstream classify it as non-transient and stop.
+
+    `exact_items` requires a `list[Model]` schema and pins the returned array to
+    that many entries. Use it whenever the answer has one entry per input.
     """
     client = get_llm_client()
     if client is None:
@@ -593,6 +665,7 @@ async def complete(
         model=model, prompt=prompt, messages=messages, system=system,
         schema=schema, json_mode=json_mode, reasoning=reasoning,
         temperature=temperature, max_tokens=max_tokens,
+        exact_items=exact_items,
     )
 
     response = await client.chat.completions.create(**kwargs)

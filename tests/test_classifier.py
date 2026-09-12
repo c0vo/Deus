@@ -327,6 +327,284 @@ class TestClassifyBatch:
         }
 
     @pytest.mark.asyncio
+    async def test_batch_schema_pins_id_to_this_batch_s_labels(self, classifier):
+        """The request must carry the allowed ids as an enum, not as prose.
+
+        A model told in prose to "echo the id" fell into repeating one
+        (`"id": "item_1item_1item_1…`) until it hit the output cap, truncating
+        the JSON and costing the whole batch.
+        """
+        from pydantic import TypeAdapter
+        from pipeline.classifier import _batch_schema, batch_label
+
+        labels = [batch_label(i) for i in range(1, 4)]
+        schema = TypeAdapter(_batch_schema(labels)).json_schema()
+        item = (
+            list(schema["$defs"].values())[0]
+            if "$defs" in schema
+            else schema["items"]
+        )
+        assert item["properties"]["id"]["enum"] == labels
+        assert "id" in item["required"]
+
+    @pytest.mark.asyncio
+    async def test_batch_schema_demands_every_field_not_just_the_id(self, classifier):
+        """Optional fields are omitted fields.
+
+        With `required: ["id"]` the model answered a batch of ten with
+        `{"id": "item_1", "urgency": "medium"}` — 41 output tokens, schema-valid,
+        and no classification at all. Every property the pipeline reads has to be
+        demanded on the request, not merely offered.
+        """
+        from pydantic import TypeAdapter
+        from pipeline.classifier import ClassifierResult, _batch_schema, batch_label
+
+        labels = [batch_label(i) for i in range(1, 4)]
+        schema = TypeAdapter(_batch_schema(labels)).json_schema()
+        item = (
+            list(schema["$defs"].values())[0]
+            if "$defs" in schema
+            else schema["items"]
+        )
+        expected = {"id", *ClassifierResult.model_fields}
+        assert set(item["required"]) == expected
+        # The field constraints have to survive the rewrite, or `urgency` becomes
+        # free text on the request and the per-item validator starts rejecting it.
+        assert item["properties"]["urgency"]["pattern"] == "^(low|medium|high|critical)$"
+        assert item["properties"]["sentiment_score"]["minimum"] == -1.0
+        assert item["properties"]["sentiment_score"]["maximum"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_request_pins_the_item_count_to_the_batch_size(self, classifier):
+        """`exact_items` is the half of this that no Python type can express.
+
+        Nothing in `list[Model]` says how many, so one object satisfied the
+        schema and one object is what came back: `sent=10 matched=1`.
+        """
+        from config.llm import _build_response_format
+        from pipeline.classifier import _batch_schema, batch_label
+
+        classifier.complete.return_value = make_response("[]")
+        await classifier.classify_batch(self._articles())
+
+        assert classifier.complete.await_args.kwargs["exact_items"] == 3
+
+        labels = [batch_label(i) for i in range(1, 4)]
+        response_format, enveloped = _build_response_format(
+            _batch_schema(labels), False, 3
+        )
+        items = response_format["json_schema"]["schema"]["properties"]["items"]
+        assert enveloped is True
+        assert items["minItems"] == 3
+        assert items["maxItems"] == 3
+
+    @pytest.mark.asyncio
+    async def test_batch_prompt_states_how_many_objects_to_return(self, classifier):
+        """The prompt said "one object per input article" but never how many.
+
+        Schema-level exactness is what actually fixed this, and the A/B found
+        stating N does not fix it alone. It is in the prompt because the two
+        together cost nothing and disagree about nothing.
+        """
+        mock_call = AsyncMock(return_value="[]")
+        with patch.object(classifier, "_call_with_fallback", mock_call):
+            await classifier.classify_batch(self._articles())
+
+        prompt = mock_call.await_args.args[0]
+        assert "There are 3 articles above" in prompt
+        assert "item_1 through item_3" in prompt
+        assert "Return 3 objects" in prompt
+
+    def test_batch_result_id_is_required(self):
+        """An optional `id` is omitted from the JSON schema's `required` list."""
+        from pydantic import ValidationError
+        from pipeline.classifier import BatchClassifierResult
+
+        assert BatchClassifierResult.model_json_schema()["required"] == ["id"]
+        with pytest.raises(ValidationError):
+            BatchClassifierResult.model_validate({"event_type": "macro"})
+
+    def test_parsing_model_stays_lenient_while_the_request_is_strict(self):
+        """The two halves of the same class serve opposite purposes.
+
+        The request demands every field so the model cannot answer with an empty
+        object. The parser must still accept one, because a salvaged response is
+        truncated by definition and one thin item must cost one article rather
+        than the batch.
+        """
+        from pipeline.classifier import ClassifierResult
+
+        parsed = ClassifierResult.model_validate({"event_type": "macro"})
+        assert parsed.event_type == "macro"
+        assert parsed.urgency == "low"
+        assert parsed.classification_summary == ""
+
+    @pytest.mark.asyncio
+    async def test_one_item_response_leaves_the_rest_unmatched(self, classifier):
+        """The regression's exact response shape, reproduced.
+
+        Ten articles, one near-empty object back. The nine unanswered rows must
+        come out untouched — `event_type is None`, so the backlog retries them —
+        and the call must not raise, because an exception here is what turns one
+        bad response into a whole failed cycle.
+        """
+        articles = [
+            NewsArticle(
+                id=f"one_item_{i}",
+                headline=f"Company {i} beats earnings estimates",
+                summary=f"Revenue and EPS ahead of consensus for company {i}.",
+                source_name="reuters",
+                source_type="rss",
+                url=f"https://example.com/one/{i}",
+                published_at=datetime.now(timezone.utc),
+            )
+            for i in range(10)
+        ]
+        degenerate = json.dumps(
+            {"items": [{"id": "item_1", "sentiment_score": -0.2, "urgency": "medium"}]}
+        )
+        with patch.object(
+            classifier, "_call_with_fallback", AsyncMock(return_value=degenerate),
+        ):
+            result = await classifier.classify_batch(articles)
+
+        assert len(result) == 10
+        # item_1 matched, so its (thin) result is applied via the lenient parser.
+        assert result[0].event_type == "unknown"
+        assert result[0].sentiment_score == -0.2
+        # The other nine are untouched and therefore retryable.
+        assert [a.event_type for a in result[1:]] == [None] * 9
+
+    @pytest.mark.asyncio
+    async def test_positional_fallback_when_no_ids_and_equal_lengths(self, classifier):
+        """Zero ids plus one result per article is the one safe case for position."""
+        articles = self._articles()
+        payload = [
+            {k: v for k, v in self._result("ignored", score).items() if k != "id"}
+            for score in (0.1, 0.2, 0.3)
+        ]
+        with patch.object(
+            classifier, "_call_with_fallback",
+            AsyncMock(return_value=json.dumps({"items": payload})),
+        ):
+            result = await classifier.classify_batch(articles)
+
+        by_id = {a.id: a for a in result}
+        assert by_id["batch_0"].sentiment_score == 0.1
+        assert by_id["batch_1"].sentiment_score == 0.2
+        assert by_id["batch_2"].sentiment_score == 0.3
+
+    @pytest.mark.asyncio
+    async def test_no_positional_fallback_when_lengths_differ(self, classifier):
+        articles = self._articles()
+        payload = [
+            {k: v for k, v in self._result("ignored", 0.1).items() if k != "id"}
+        ]
+        with patch.object(
+            classifier, "_call_with_fallback",
+            AsyncMock(return_value=json.dumps({"items": payload})),
+        ):
+            result = await classifier.classify_batch(articles)
+
+        assert all(a.event_type is None for a in result)
+
+    @pytest.mark.asyncio
+    async def test_partial_ids_never_map_by_position(self, classifier):
+        """A response with *some* ids is the dangerous shape.
+
+        It means the model was tracking identity and dropped or merged items, so
+        its ordering is precisely what cannot be trusted. Only the matched id is
+        applied; the rest stay NULL for a retry.
+        """
+        articles = self._articles()
+        payload = [
+            self._result("item_2", 0.7),
+            {k: v for k, v in self._result("x", -0.7).items() if k != "id"},
+            {k: v for k, v in self._result("x", -0.7).items() if k != "id"},
+        ]
+        with patch.object(
+            classifier, "_call_with_fallback",
+            AsyncMock(return_value=json.dumps({"items": payload})),
+        ):
+            result = await classifier.classify_batch(articles)
+
+        by_id = {a.id: a for a in result}
+        assert by_id["batch_1"].sentiment_score == 0.7
+        assert by_id["batch_0"].event_type is None
+        assert by_id["batch_2"].event_type is None
+
+    @pytest.mark.asyncio
+    async def test_degenerate_id_response_salvages_whole_items(self, classifier):
+        """Regression: a runaway repeated id truncated the JSON mid-string.
+
+        Observed on the phone 305 times in a day. Every complete object before
+        the runaway one is good, paid-for work; the batch used to discard all of
+        it. The fixture is the real response head.
+        """
+        from pathlib import Path
+
+        fixture = Path(__file__).parent / "fixtures" / "classifier_degenerate_ids.json"
+        truncated = fixture.read_text(encoding="utf-8")
+
+        articles = self._articles()
+        with patch.object(
+            classifier, "_call_with_fallback",
+            AsyncMock(return_value=truncated),
+        ):
+            result = await classifier.classify_batch(articles)
+
+        by_id = {a.id: a for a in result}
+        # The two whole items ahead of the truncation land; the third stays NULL
+        # so the attempts counter can retry it.
+        assert by_id["batch_0"].event_type == "earnings"
+        assert by_id["batch_1"].event_type == "macro"
+        assert by_id["batch_2"].event_type is None
+
+    @pytest.mark.asyncio
+    async def test_salvaged_response_never_maps_by_position(self, classifier):
+        """A salvaged response is missing its tail, so lengths cannot be trusted."""
+        # Two whole id-less objects, then a truncation. len(results) would equal
+        # len(articles) if the tail had been read, which it was not.
+        truncated = (
+            '{"items": [{"event_type": "earnings", "sentiment_score": 0.4},'
+            ' {"event_type": "macro", "sentiment_score": 0.1},'
+            ' {"event_type": "merg'
+        )
+        articles = self._articles()[:2]
+        with patch.object(
+            classifier, "_call_with_fallback",
+            AsyncMock(return_value=truncated),
+        ):
+            result = await classifier.classify_batch(articles)
+
+        assert all(a.event_type is None for a in result)
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_models_raise_rather_than_return_none(self, classifier, monkeypatch):
+        """No slug at all must not look like an unparseable response.
+
+        Returning None made `_persist_classifications` stamp every row
+        `event_type='error'` — 5,662 permanently dead rows on the phone.
+        """
+        from pipeline.classifier import ClassifierNotConfigured
+
+        monkeypatch.setattr("pipeline.classifier.settings.model_classifier", "")
+        monkeypatch.setattr("pipeline.classifier.settings.model_classifier_fallback", "")
+        classifier.model_name = ""
+
+        assert classifier.is_configured() is False
+        with pytest.raises(ClassifierNotConfigured):
+            await classifier.classify_batch(self._articles())
+        classifier.complete.assert_not_awaited()
+
+    def test_is_configured_needs_only_one_slug(self, classifier, monkeypatch):
+        monkeypatch.setattr("pipeline.classifier.settings.model_classifier", "")
+        monkeypatch.setattr(
+            "pipeline.classifier.settings.model_classifier_fallback", "test/fallback"
+        )
+        assert classifier.is_configured() is True
+
+    @pytest.mark.asyncio
     async def test_results_map_by_label_not_position(self, classifier):
         """A reordered response must still land on the right articles.
 
@@ -336,12 +614,12 @@ class TestClassifyBatch:
         back, so a reordered response still lands correctly.
         """
         articles = self._articles()
-        # a1/a2/a3 correspond to batch_0/batch_1/batch_2, deliberately
-        # reversed relative to the input order.
+        # item_1/item_2/item_3 correspond to batch_0/batch_1/batch_2,
+        # deliberately reversed relative to the input order.
         payload = [
-            self._result("a3", 0.2),
-            self._result("a1", 0.9),
-            self._result("a2", -0.5),
+            self._result("item_3", 0.2),
+            self._result("item_1", 0.9),
+            self._result("item_2", -0.5),
         ]
         with patch.object(
             classifier, "_call_with_fallback",
@@ -353,15 +631,15 @@ class TestClassifyBatch:
         assert by_id["batch_0"].sentiment_score == 0.9
         assert by_id["batch_1"].sentiment_score == -0.5
         assert by_id["batch_2"].sentiment_score == 0.2
-        assert by_id["batch_0"].classification_summary == "Summary for a1"
+        assert by_id["batch_0"].classification_summary == "Summary for item_1"
 
     @pytest.mark.asyncio
     async def test_one_malformed_item_does_not_lose_the_others(self, classifier):
         articles = self._articles()
         payload = [
-            self._result("a1", 0.4),
-            {"id": "a2", "sentiment_score": "not-a-number", "urgency": "nope"},
-            self._result("a3", -0.3),
+            self._result("item_1", 0.4),
+            {"id": "item_2", "sentiment_score": "not-a-number", "urgency": "nope"},
+            self._result("item_3", -0.3),
         ]
         with patch.object(
             classifier, "_call_with_fallback",
@@ -378,7 +656,7 @@ class TestClassifyBatch:
     @pytest.mark.asyncio
     async def test_missing_result_leaves_article_untouched(self, classifier):
         articles = self._articles()
-        payload = [self._result("a1", 0.4)]
+        payload = [self._result("item_1", 0.4)]
         with patch.object(
             classifier, "_call_with_fallback",
             AsyncMock(return_value=json.dumps(payload)),
@@ -404,8 +682,8 @@ class TestClassifyBatch:
             await classifier.classify_batch(articles)
 
         prompt = mock_call.await_args.args[0]
-        assert '"id": "a1"' in prompt
-        assert '"id": "a3"' in prompt
+        assert '"id": "item_1"' in prompt
+        assert '"id": "item_3"' in prompt
         for article in articles:
             assert article.id not in prompt
 

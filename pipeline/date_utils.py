@@ -61,11 +61,22 @@ _ABBR_MONTH_NUM = {
     "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
 }
 
+# Placeholders that mean "no date is known", not "this date failed to parse".
+# Matched case-insensitively: models write every casing of these, and the old
+# case-sensitive tuple let "TBD", "N/A" and "Unknown" fall through to
+# dateparser — which happily reads "unknown" as today and stamps a fabricated
+# listing date onto an undated IPO.
+_NO_DATE_SENTINELS = frozenset({
+    "", "null", "none", "tba", "tbd", "n/a", "na", "unknown",
+})
+
 
 def normalize_date(raw_date: str) -> str:
     """Parse a raw date string into ISO 8601 ``YYYY-MM-DD``.
 
-    Tries, in order:
+    A no-date sentinel (``TBA``, ``TBD``, ``N/A``, ``unknown``, … in any
+    casing) short-circuits to ``""`` before any parsing is attempted.
+    Otherwise tries, in order:
     1. Python ``datetime.fromisoformat()`` (handles ISO-8601 dates)
     2. ``dateparser.parse()`` (handles natural-language dates)
     3. Regex patterns: Q1-Q4, "Month DD, YYYY", "Mon DD, YYYY"
@@ -81,7 +92,7 @@ def normalize_date(raw_date: str) -> str:
     str
         ``YYYY-MM-DD`` if parseable, otherwise ``""``.
     """
-    if not raw_date or raw_date.strip() in ("", "null", "None", "TBA", "tbd"):
+    if not raw_date or raw_date.strip().lower() in _NO_DATE_SENTINELS:
         return ""
 
     raw = raw_date.strip()

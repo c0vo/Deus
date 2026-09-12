@@ -11,11 +11,17 @@ import SmartMoneyPanel from "./components/SmartMoneyPanel";
 import DarkPoolPanel from "./components/DarkPoolPanel";
 import EventsCalendar from "./components/EventsCalendar";
 import MacroThemesCard from "./components/MacroThemesCard";
+import WeeklyTipCard, { WeeklyTipDigest } from "./components/WeeklyTipCard";
 import ThesisPanel from "./components/ThesisPanel";
 import TrendForecaster from "./components/TrendForecaster";
 import IPOWatchlist from "./components/IPOWatchlist";
+import AlertsCard, { AlertRow, normalizeAlert } from "./components/AlertsCard";
 import PipelineTelemetry from "./components/PipelineTelemetry";
-import { useBrainSSE, BrainSnapshot } from "./brain/hooks/useBrainSSE";
+import {
+  useBrainSSE,
+  BrainSnapshot,
+  ClassificationStatus,
+} from "./brain/hooks/useBrainSSE";
 import { AlertCircle } from "lucide-react";
 
 function DashboardContent() {
@@ -30,6 +36,11 @@ function DashboardContent() {
   const [isRunning, setIsRunning] = useState(false);
   const [sseConnected, setSseConnected] = useState(false);
   const [thesisTransitions, setThesisTransitions] = useState<any[]>([]);
+  const [alerts, setAlerts] = useState<AlertRow[]>([]);
+  const [weeklyTip, setWeeklyTip] = useState<WeeklyTipDigest | null>(null);
+  const [weeklyTipLoading, setWeeklyTipLoading] = useState(true);
+  const [classification, setClassification] =
+    useState<ClassificationStatus | null>(null);
 
   const { status, getDbSizeStr } = useSystemStatus();
 
@@ -38,8 +49,15 @@ function DashboardContent() {
     setSnapshot(data);
     setPipelineMetrics(data.pipeline_metrics || []);
     setLiveArticles(data.articles || []);
+    setClassification(data.classification_status ?? null);
     setSseConnected(true);
     setError(null);
+  }, []);
+
+  // Published at the end of every backlog run, so the Unclassified cell drops
+  // live rather than waiting for the next full snapshot.
+  const onClassificationStatus = useCallback((data: ClassificationStatus) => {
+    setClassification(data);
   }, []);
 
   const onNewArticles = useCallback((data: any) => {
@@ -57,10 +75,19 @@ function DashboardContent() {
     setSnapshot((prev) => (prev ? { ...prev, sector_heatmap: data } : prev));
   }, []);
 
+  // A pushed alert prepends rather than triggering a refetch: the row on the
+  // wire is the stored row, so there is nothing extra to go and fetch.
+  const onAlert = useCallback((data: unknown) => {
+    const row = normalizeAlert(data);
+    if (!row) return;
+    setAlerts((prev) => [row, ...prev.filter((a) => a.id !== row.id)].slice(0, 10));
+  }, []);
+
   const { connect } = useBrainSSE({
     onSnapshot,
     onNewArticles,
     onPipelineStatus,
+    onClassificationStatus,
     onSectorHeatmap,
     // The event tracker publishes on its own 6-hourly schedule, so the card
     // refreshes on the push rather than waiting out the 5-minute poll.
@@ -68,6 +95,17 @@ function DashboardContent() {
     // The nightly re-score publishes any EARLY -> BUILDING -> CROWDED moves;
     // that transition is the trade timing, so it lands without a poll.
     onThesisUpdate: (data) => setThesisTransitions(data?.transitions || []),
+    // The 4-hourly trend job publishes the regenerated themes, and the card
+    // renders them straight from this state. Refetching instead would be worse
+    // than useless: /api/brain/macro-themes checks an in-memory cache that
+    // lives in the WORKER process, so in the API process it is always cold and
+    // the "cheap" refetch pays for a whole fresh LLM generation.
+    onMacroThemes: (data) => setThemes(Array.isArray(data) ? data : []),
+    onAlert,
+    // The publish payload is a notification, not the digest — the tips and the
+    // seasonality lines live in the digests row, so the card refetches rather
+    // than rendering whatever the event happened to carry.
+    onWeeklyTip: () => fetchWeeklyTip(),
     onError: (msg) => {
       setError(msg);
       setSseConnected(false);
@@ -145,6 +183,24 @@ function DashboardContent() {
   useEffect(() => {
     fetchThemes();
   }, [fetchThemes]);
+
+  // Weekly tip. Page-load state comes from the digests table rather than the SSE
+  // outbox, which is trimmed to ten minutes — a tab opened on Monday still has
+  // to see Sunday's tip.
+  const fetchWeeklyTip = useCallback(async () => {
+    setWeeklyTipLoading(true);
+    try {
+      const json = await fetchJson<{ data?: WeeklyTipDigest | null }>(
+        "/api/digests/latest?kind=weekly_tip"
+      );
+      setWeeklyTip(json.data ?? null);
+    } catch {}
+    setWeeklyTipLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchWeeklyTip();
+  }, [fetchWeeklyTip]);
 
   const handleFetchForecast = useCallback(async (sector: string) => {
     const res = await fetch(
@@ -264,12 +320,17 @@ function DashboardContent() {
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
           <EventsCalendar events={events} onRemove={handleRemoveEvent} />
           <IPOWatchlist ipos={ipos} onRemove={handleRemoveIpo} />
+          {/* What was actually pushed to Telegram, and what it cited. Before
+              this, an alert that fired while the phone was asleep existed only
+              in the chat history. */}
+          <AlertsCard alerts={alerts} onLoaded={setAlerts} />
           <ThesisPanel transitions={thesisTransitions} />
           <MacroThemesCard
             themes={themes}
             loading={themesLoading}
             onRefresh={() => fetchThemes(true)}
           />
+          <WeeklyTipCard digest={weeklyTip} loading={weeklyTipLoading} />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4">
@@ -283,6 +344,7 @@ function DashboardContent() {
             <PipelineTelemetry
               pipelineMetrics={pipelineMetrics}
               embeddingStatus={snapshot?.embedding_status}
+              classificationStatus={classification ?? undefined}
               sentimentDistribution={snapshot?.sentiment_distribution}
               dbSizeLabel={getDbSizeStr(status.db_size_bytes)}
               totalArticles={status.total_articles}

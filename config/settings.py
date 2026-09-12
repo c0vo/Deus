@@ -82,6 +82,13 @@ class Settings(BaseSettings):
     model_trending: str = ""
     model_daily_advisor: str = ""
     model_trend_outlook: str = ""
+    # Grades whether the context we retrieved actually answers the question.
+    # Two callers, one decision: the chat graph's "search the web?" and the
+    # price alert's "do we have a real catalyst, or a generic one?". Falls back
+    # to model_router when unset, since it is the same size of job as routing.
+    model_grader: str = ""
+    # The weekly tip digest — seasonal precedents plus the coming week's events.
+    model_weekly_tip: str = ""
     # The Bull/Bear debate is configured separately from the trend forecaster,
     # which is the other consumer of a reasoning-tier model, so the two can be
     # dialled independently.
@@ -151,6 +158,9 @@ class Settings(BaseSettings):
     tavily_api_key: str = ""
     web_search_provider: str = "tavily"
     web_search_max_results: int = 5
+    # Identical chat turns re-billed Tavily on every ask. Short enough that a
+    # breaking story is not served stale, long enough to cover a conversation.
+    web_search_cache_seconds: int = 900
 
     # ── Thesis Engine (causal chains, second-order beneficiaries) ────────
     # Finds an emerging theme, decomposes it into the bottlenecks it creates,
@@ -171,7 +181,7 @@ class Settings(BaseSettings):
     # mechanism and falsifier, and the thinking that precedes it routinely ran
     # the budget to zero, so decompose returned empty content and the run ended
     # with nothing persisted.
-    thesis_max_output_tokens: int = 12000
+    thesis_max_output_tokens: int = 24000
     thesis_expiry_days: int = 45
     # Grounding each hop against our own corpus. Free — the embeddings are
     # already paid for by ingest — so unlike the web search this runs for every
@@ -281,6 +291,47 @@ class Settings(BaseSettings):
     # When the prioritized daily brief goes out, in the configured timezone.
     briefing_hour: int = 5
     briefing_minute: int = 0
+    # When the weekly digest goes out, same timezone. Sunday evening: late
+    # enough that the week is unambiguously over, early enough to be read
+    # before Monday's US open.
+    digest_day: str = "sun"
+    digest_hour: int = 20
+    # Default misfire window for every scheduled job. APScheduler's own default
+    # is ONE SECOND, so a job whose fire time passes while the event loop is
+    # busy is dropped rather than run late — the normal case on a phone that
+    # Android Doze keeps suspending. Daily and weekly jobs override this with a
+    # far wider window; see DAILY_MISFIRE_GRACE_SECONDS in
+    # orchestrator/scheduler.py.
+    job_misfire_grace_seconds: int = 300
+
+    # ── Price alerts (market scanner) ─────────────────────────────────────
+    # Asymmetric on purpose: a tracked position falling is actionable at a
+    # smaller move than anything else the scanner watches, so a tracked drop
+    # alerts at 3% while every other move — either direction, tracked or not —
+    # keeps the original 5% rule.
+    alert_drop_pct_tracked: float = 3.0
+    alert_move_pct: float = 5.0
+    # Re-alert step. One alert per ticker per day, then again only once the move
+    # has deepened by this much: -3% then -6%, not -3.0, -3.1, -3.2.
+    alert_escalation_step_pct: float = 3.0
+    # Volume alert threshold, as a multiple of the 20-session average volume.
+    alert_volume_multiple: float = 3.0
+    # Web results pulled when our own corpus cannot explain a tracked drop.
+    # Separate from web_search_max_results because this one fires unattended.
+    alert_web_search_max_results: int = 5
+
+    # ── Seasonality & daily advisory ──────────────────────────────────────
+    # Benchmarks the weekly tip computes its precedents against, and the minimum
+    # depth of price history before a seasonal statistic is claimed at all — a
+    # "September is historically weak" line drawn from four years is noise
+    # dressed up as a precedent.
+    seasonality_benchmarks: str = "SPY,QQQ"
+    seasonality_min_years: int = 10
+    # The daily stance note is one cheap batched call, but a material change can
+    # justify re-running the full Bull/Bear debate for a ticker. These bound
+    # that: how many debates a day, and how important the news has to be.
+    advisor_rerun_max_per_day: int = 2
+    advisor_rerun_min_importance: float = 8.0
 
     # ── Classification ───────────────────────────────────────────────────
     # Articles per classify_batch call. The ~1.1k-token guidance preamble is
@@ -292,6 +343,19 @@ class Settings(BaseSettings):
     # classification object is ~150 tokens; the headroom is because JSON mode
     # truncates into unparseable output rather than degrading gracefully.
     classify_max_output_tokens_per_article: int = 400
+
+    # Backlog draining. Classification used to run only inside the fetch-bound
+    # pipeline cycle, which pinned its capacity to ingest with no margin and let
+    # one persistently failing batch sit at the head of the queue indefinitely.
+    # These bound a dedicated pass instead: how often it runs, how many rows it
+    # may take per run, how many chunks may be in flight at once, how many times
+    # a single row may fail before it is left alone, and how far back it reaches
+    # at all — older rows are marked stale rather than paid for.
+    classify_backlog_interval_minutes: int = 5
+    classify_per_run_limit: int = 60
+    classify_concurrency: int = 2
+    classify_max_attempts: int = 3
+    classify_max_age_days: int = 30
 
     # Ranking returns only {"id", "importance_score"} per article.
     rank_max_output_tokens_per_article: int = 80
@@ -345,6 +409,9 @@ class Settings(BaseSettings):
     # ipo_max_backdate_days or retire_stale deletes what this just ingested.
     ipo_scan_days_back: int = 30
     ipo_scan_days_ahead: int = 90
+    # How long after its date a listed IPO still shows on the watchlist, so
+    # yesterday's listing reads as a completed event rather than vanishing.
+    ipo_show_listed_days: int = 1
 
     # ── Geo tagging ──────────────────────────────────────────────────────
     geo_backfill_batch: int = 500
@@ -492,6 +559,9 @@ _MODEL_FEATURES: dict[str, str] = {
     "model_trending": "trending ticker summaries",
     "model_daily_advisor": "the daily advisor batch note",
     "model_trend_outlook": "sector outlook and macro themes",
+    "model_grader": "context sufficiency grading for chat and price alerts "
+                    "(falls back to MODEL_ROUTER)",
+    "model_weekly_tip": "weekly tip digest",
     "model_chat_shallow": "fast dashboard chat replies",
     "model_chat_complex": "reasoning-tier dashboard chat replies",
     "model_debate": "Bull/Bear debate",

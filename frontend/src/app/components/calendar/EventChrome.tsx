@@ -30,7 +30,16 @@ export function DateChip({ date }: { date: string }) {
 /**
  * Shape carries kind, colour carries confidence — so the grid stays inside the
  * one-accent rule instead of inventing a hue per event type.
+ *
+ * Three shapes: square for a ticker event, diamond for an IPO, circle for a
+ * macro event. Importance is deliberately NOT encoded here; it would need a
+ * fourth visual variable in a 6px mark.
  */
+const KIND_SHAPES: Record<string, string> = {
+  ipo: "rotate-45",
+  macro: "rounded-full",
+};
+
 export function KindMark({
   kind,
   confidence,
@@ -38,7 +47,7 @@ export function KindMark({
   kind: string;
   confidence: string;
 }) {
-  const shape = kind === "ipo" ? "rotate-45" : "rounded-[1px]";
+  const shape = KIND_SHAPES[kind] ?? "rounded-[1px]";
   const tone =
     confidence === "confirmed" ? "bg-terminal-signal" : "bg-terminal-muted-alt";
   return <i className={`w-1.5 h-1.5 shrink-0 ${shape} ${tone}`} />;

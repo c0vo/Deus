@@ -129,6 +129,33 @@ CREATE TABLE IF NOT EXISTS price_alerts (
     PRIMARY KEY (ticker, alert_date)
 );
 
+-- Alert CONTENT, as opposed to the two tables above.
+--
+-- sent_alerts and price_alerts are dedup ledgers: keys only, written so the
+-- same alert is not pushed twice. Nothing recorded what an alert actually said,
+-- so a push that went out while the phone was asleep existed only in Telegram
+-- history. This is the row the dashboard card and /api/alerts read back, and
+-- what the re-alert rule measures "has the move deepened?" against.
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker TEXT,
+    -- price_drop | price_move | volume | earnings_whisper | breaking
+    kind TEXT NOT NULL,
+    pct REAL,
+    price REAL,
+    severity TEXT,
+    title TEXT NOT NULL,
+    summary TEXT,
+    body_html TEXT,
+    sources_json TEXT DEFAULT '[]',
+    -- Where the explanation came from: db | web | none. 'none' is a real
+    -- answer — it means no dated catalyst was found and none was invented.
+    grounded_by TEXT DEFAULT 'none',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_ticker_day ON alerts(ticker, created_at);
+
 -- Token and Cost tracking
 CREATE TABLE IF NOT EXISTS llm_usage_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -318,6 +345,7 @@ CREATE TABLE IF NOT EXISTS ipo_tracker (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     metadata_json TEXT DEFAULT '{}'
 );
+CREATE INDEX IF NOT EXISTS idx_ipo_tracker_date ON ipo_tracker(ipo_date);
 
 -- Upcoming ticker events (earnings, product launches, etc.)
 CREATE TABLE IF NOT EXISTS ticker_events (
@@ -625,6 +653,10 @@ CREATE TABLE IF NOT EXISTS latest_prices (
     price REAL NOT NULL,
     previous_close REAL,
     daily_change_pct REAL,
+    -- The live session's running volume off the same bar as `price`. REAL, not
+    -- INTEGER: a crypto pair's daily volume overflows nothing but reads more
+    -- naturally as a float, and the anomalous-volume ratio divides it anyway.
+    volume REAL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -798,6 +830,83 @@ CREATE TABLE IF NOT EXISTS company_resolution (
     us_proxy TEXT,
     resolved_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Generated long-form pushes: the daily brief, the weekly tip, the daily
+-- advisory note.
+--
+-- All of them were Telegram-only and kept nothing, so the dashboard could not
+-- show what was sent, a failed push could not be resent, and there was no way
+-- to check a claim against the facts it was generated from. facts_json is that
+-- audit trail: every number in the rendered body should be traceable to it.
+CREATE TABLE IF NOT EXISTS digests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    period_start DATE,
+    period_end DATE,
+    body_html TEXT NOT NULL,
+    body_text TEXT,
+    facts_json TEXT,
+    model TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_digests_kind_created ON digests(kind, created_at DESC);
+
+-- Scheduled macro events: FOMC, CPI, NFP, PCE, GDP, expirations, market
+-- holidays. Separate from ticker_events because that table's `ticker` column is
+-- NOT NULL and a CPI print belongs to no ticker.
+--
+-- `source` is the authority ranking, not a label: 'seed' is the schedule read
+-- off federalreserve.gov / bls.gov / bea.gov / census.gov / nyse.com and checked
+-- into data/macro_calendar.py, 'manual' is a hand-entered correction, and 'web'
+-- is the monthly Tavily/LLM top-up. upsert_macro_event refuses to let a 'web'
+-- row overwrite either of the first two, because an LLM paraphrasing a
+-- third-party calendar is exactly how a wrong FOMC date would get in.
+--
+-- Uniqueness is on (date, kind, name) rather than (date, kind): BEA co-releases
+-- GDP and PCE, so 2026-09-30 carries gdp, pce AND quarter_end rows, all real.
+CREATE TABLE IF NOT EXISTS macro_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date DATE NOT NULL,
+    time_et TEXT,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    importance INTEGER DEFAULT 1,
+    source TEXT NOT NULL DEFAULT 'seed',
+    notes TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(date, kind, name)
+);
+CREATE INDEX IF NOT EXISTS idx_macro_events_date ON macro_events(date);
+
+-- One evidence-based stance per tracked ticker per day: the morning call, the
+-- facts it was built from, and what would falsify it.
+--
+-- Keyed (ticker, date) so a re-run the same morning replaces the row rather
+-- than appending a second call for the same session. `prev_action` is written
+-- here, at persist time, from the previous stored row — it is the only reason
+-- the message can say "downgraded from BUY/ADD" without asking the model what
+-- it said yesterday, which it has no way to know.
+--
+-- facts_json is the fact sheet the call was made from, kept for the same reason
+-- digests.facts_json is: a stance whose numbers cannot be traced back to the
+-- inputs is indistinguishable from an invented one.
+CREATE TABLE IF NOT EXISTS stances (
+    ticker TEXT NOT NULL,
+    date DATE NOT NULL,
+    action TEXT NOT NULL,
+    conviction TEXT,
+    thesis TEXT,
+    key_risk TEXT,
+    what_would_change TEXT,
+    evidence_json TEXT,
+    facts_json TEXT,
+    prev_action TEXT,
+    model TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticker, date)
+);
+CREATE INDEX IF NOT EXISTS idx_stances_date ON stances(date DESC);
 """
 
 
@@ -844,6 +953,12 @@ class Database:
                 # text, say) would otherwise sit in the `embedding IS NULL` queue
                 # forever, occupying a slot in every batch.
                 "ALTER TABLE articles ADD COLUMN embed_attempts INTEGER DEFAULT 0",
+                # The same bound for classification. Without it a batch that
+                # fails transiently leaves its rows NULL, the LIFO
+                # `ORDER BY published_at DESC` re-selects exactly those rows on
+                # the next pass, and the head of the queue blocks forever — the
+                # stall that left 17k articles unclassified on the phone.
+                "ALTER TABLE articles ADD COLUMN classification_attempts INTEGER DEFAULT 0",
                 # Which provider supplied a KR flow row, and in what unit. Naver
                 # reports share counts, the KRX Open API reports KRW; summing the
                 # two without conversion would silently corrupt the feature.
@@ -915,6 +1030,14 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_articles_dedup_checked "
                 "ON articles(dedup_checked) WHERE embedding IS NOT NULL"
             )
+            # Partial index over exactly the classification backlog. The
+            # candidate query orders by published_at over a predicate that
+            # matches a small fraction of a 40k-row table, which without this is
+            # a full scan on every five-minute tick.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_articles_unclassified "
+                "ON articles(published_at) WHERE event_type IS NULL"
+            )
 
             # Migration: mark which producer put a row in hot_tickers.
             # sector_analyzer re-upserts every 15 minutes and rewrites
@@ -943,6 +1066,31 @@ class Database:
                 "DELETE FROM ticker_events "
                 "WHERE event_date IS NULL OR TRIM(event_date) = ''"
             )
+
+            # Migration: normalise empty ipo_tracker dates to NULL. LLM
+            # extractions stored '' for an unannounced listing date, and ''
+            # is neither NULL nor comparable to a real date — so an undated
+            # IPO failed the watchlist's `ipo_date >= cutoff` filter while
+            # satisfying retire_stale's `ipo_date < backdate_cutoff` delete.
+            # Undated rows are meant to render as TBA, not disappear. Both
+            # write paths now store NULL, so this is a one-time cleanup.
+            conn.execute(
+                "UPDATE ipo_tracker SET ipo_date = NULL "
+                "WHERE ipo_date IS NOT NULL AND TRIM(ipo_date) = ''"
+            )
+
+            # Migration: the live session's volume alongside the quote.
+            # The anomalous-volume alert used to read volume straight out of a
+            # Yahoo `range=2d` response, which yields at most two bars against a
+            # `len(volumes) >= 20` guard — so it could never fire. The average
+            # now comes from price_history and the current figure from here.
+            for col_sql in [
+                "ALTER TABLE latest_prices ADD COLUMN volume REAL",
+            ]:
+                try:
+                    conn.execute(col_sql)
+                except sqlite3.OperationalError:
+                    pass  # Column likely already exists
 
         log.info("database.initialized", path=self.db_path)
 
@@ -1135,7 +1283,12 @@ class Database:
             return [dict(row) for row in rows]
 
     def get_unclassified_articles(self, limit: int = 50) -> list[dict]:
-        """Fetch articles that haven't been classified by the LLM yet."""
+        """Fetch articles that haven't been classified by the LLM yet.
+
+        The unbounded view of the queue — no age, attempt or duplicate filter.
+        The pipeline uses `get_classification_candidates` instead; this stays as
+        the plain "what is unclassified" accessor for ad-hoc and test use.
+        """
         with self.connection() as conn:
             rows = conn.execute(
                 """
@@ -1146,7 +1299,244 @@ class Database:
                 (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
-            
+
+    def get_classification_candidates(
+        self,
+        limit: int = 60,
+        max_attempts: int = 3,
+        max_age_days: int = 30,
+    ) -> list[dict]:
+        """
+        Rows the dedicated classify job should spend LLM calls on.
+
+        Three bounds that `get_unclassified_articles` has none of, each one a
+        way the backlog used to become unbounded:
+
+        - ``classification_attempts < max_attempts`` — a row that has failed
+          three times is poison, and retrying it forever blocks the head of a
+          LIFO queue. Exhausted rows are visible in
+          ``get_classification_stats()['exhausted']`` rather than silently
+          dropped.
+        - ``published_at >= now - max_age_days`` — anything older has no
+          trading value, and paying to classify a 2024 archive is what made the
+          backlog look unclearable. `mark_stale_unclassified` retires those.
+        - ``duplicate_of IS NULL`` — a flagged duplicate already inherited its
+          canonical row's verdict.
+        """
+        cutoff = f"-{int(max_age_days)} days"
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM articles
+                WHERE event_type IS NULL
+                  AND duplicate_of IS NULL
+                  AND COALESCE(classification_attempts, 0) < ?
+                  AND published_at >= datetime('now', ?)
+                ORDER BY published_at DESC LIMIT ?
+                """,
+                (int(max_attempts), cutoff, int(limit)),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def record_classification_failure(self, article_ids: list[str]) -> dict[str, int]:
+        """
+        Count one failed classification attempt per id.
+
+        Returns the *new* attempt count per id, so the caller can decide whether
+        a row has run out of chances without a second round-trip. The rows stay
+        `event_type IS NULL` either way — the counter is what makes "retry later"
+        bounded: after ``classify_max_attempts`` they drop out of the candidate
+        query instead of being re-sent every five minutes forever.
+        """
+        if not article_ids:
+            return {}
+        with self.connection() as conn:
+            conn.executemany(
+                "UPDATE articles "
+                "SET classification_attempts = COALESCE(classification_attempts, 0) + 1 "
+                "WHERE id = ?",
+                [(article_id,) for article_id in article_ids],
+            )
+            placeholders = ",".join("?" for _ in article_ids)
+            rows = conn.execute(
+                f"SELECT id, COALESCE(classification_attempts, 0) AS n "
+                f"FROM articles WHERE id IN ({placeholders})",
+                list(article_ids),
+            ).fetchall()
+            return {row["id"]: row["n"] for row in rows}
+
+    def requeue_error_articles(self, max_age_days: int = 30) -> int:
+        """
+        Clear the `'error'` verdict off recent rows so they can be retried.
+
+        A one-shot repair, not a routine job. `event_type='error'` used to be
+        written on the *first* failed classification, so a truncated batch
+        response or a momentary parse failure was as permanent as a genuinely
+        unclassifiable article — 9% of the corpus on the phone. Those rows are
+        real articles with real headlines; once a failure counts attempts
+        instead of stamping a verdict, they deserve the retries they never had.
+
+        Attempts are reset too: these rows never consumed their budget in the
+        first place, so carrying a count over would retire them immediately.
+        """
+        cutoff = f"-{int(max_age_days)} days"
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE articles SET
+                    event_type = NULL,
+                    classification_summary = NULL,
+                    classification_attempts = 0
+                WHERE event_type = 'error'
+                  AND published_at >= datetime('now', ?)
+                """,
+                (cutoff,),
+            )
+            return cursor.rowcount or 0
+
+    def reset_parked_classification_attempts(self, max_attempts: int = 3) -> int:
+        """
+        Give back the retries a broken request shape spent, and nothing else.
+
+        `classification_attempts` is what keeps retrying bounded, and it works:
+        three failures and a row drops out of `get_classification_candidates`
+        for good. It cannot tell a genuinely unclassifiable article from one the
+        classifier never actually asked about — and for a fortnight it never
+        asked. The batch schema demanded only `id`, so ten articles came back as
+        one near-empty object; nine of every ten rows took a `batch_missing_result`
+        and exhausted their three attempts inside fifteen minutes, having cost
+        nothing and taught nobody anything.
+
+        Only rows still `event_type IS NULL` are touched: a row that reached a
+        verdict keeps it, so this cannot undo classification work. Like
+        `requeue_error_articles` this is a one-shot repair rather than a routine
+        job — run automatically it would simply re-park the same poison rows
+        every cycle, which is the unbounded backlog the counter exists to stop.
+        """
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE articles SET classification_attempts = 0
+                WHERE event_type IS NULL
+                  AND COALESCE(classification_attempts, 0) >= ?
+                """,
+                (int(max_attempts),),
+            )
+            return cursor.rowcount or 0
+
+    def mark_stale_unclassified(self, max_age_days: int = 30, limit: int = 2000) -> int:
+        """
+        Retire unclassified rows older than the classification window.
+
+        Returns how many rows were marked. `event_type='stale'` is a terminal
+        verdict like 'noise': excluded from ranking, from the brief and from the
+        candidate query, but distinguishable from a real classification and from
+        'error' when reading the table later.
+
+        Bounded by `limit` on purpose. An UPDATE across tens of thousands of
+        rows holds SQLite's write lock for its whole duration, and the API
+        process shares this file — on the phone that is a visibly frozen
+        dashboard. A few thousand per run converges in a handful of ticks.
+        """
+        cutoff = f"-{int(max_age_days)} days"
+        summary = f"Skipped: older than {int(max_age_days)} days when the classifier reached it."
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE articles SET
+                    event_type = 'stale',
+                    sentiment_score = 0.0,
+                    urgency = 'low',
+                    suggested_direction = 'neutral',
+                    classification_summary = ?
+                WHERE id IN (
+                    SELECT id FROM articles
+                    WHERE event_type IS NULL
+                      AND published_at < datetime('now', ?)
+                    ORDER BY published_at ASC
+                    LIMIT ?
+                )
+                """,
+                (summary, cutoff, int(limit)),
+            )
+            return cursor.rowcount or 0
+
+    def get_classification_stats(self, max_age_days: int = 30, max_attempts: int = 3) -> dict:
+        """
+        The real state of the classification and embedding queues.
+
+        Every number the dashboard used to show about "pending" was
+        `total - embedded`, which counts every pre-filtered noise row forever
+        and says nothing at all about classification. These are the counts a
+        stall is actually visible in.
+        """
+        cutoff = f"-{int(max_age_days)} days"
+        with self.connection() as conn:
+            def count(sql: str, params: tuple = ()) -> int:
+                return conn.execute(sql, params).fetchone()["c"]
+
+            pending = count(
+                "SELECT COUNT(*) AS c FROM articles "
+                "WHERE event_type IS NULL AND duplicate_of IS NULL"
+            )
+            pending_in_window = count(
+                "SELECT COUNT(*) AS c FROM articles "
+                "WHERE event_type IS NULL AND duplicate_of IS NULL "
+                "  AND COALESCE(classification_attempts, 0) < ? "
+                "  AND published_at >= datetime('now', ?)",
+                (int(max_attempts), cutoff),
+            )
+            exhausted = count(
+                "SELECT COUNT(*) AS c FROM articles "
+                "WHERE event_type IS NULL "
+                "  AND COALESCE(classification_attempts, 0) >= ?",
+                (int(max_attempts),),
+            )
+            stale = count(
+                "SELECT COUNT(*) AS c FROM articles WHERE event_type = 'stale'"
+            )
+            error = count(
+                "SELECT COUNT(*) AS c FROM articles WHERE event_type = 'error'"
+            )
+            noise = count(
+                "SELECT COUNT(*) AS c FROM articles WHERE event_type = 'noise'"
+            )
+            classified = count(
+                "SELECT COUNT(*) AS c FROM articles "
+                "WHERE event_type IS NOT NULL "
+                "  AND event_type NOT IN ('noise', 'error', 'stale')"
+            )
+            # The embedding backlog as _process_batch actually selects it —
+            # noise excluded, attempts bounded.
+            embedding_pending = count(
+                "SELECT COUNT(*) AS c FROM articles "
+                "WHERE embedding IS NULL "
+                "  AND (event_type IS NULL OR event_type != 'noise') "
+                "  AND COALESCE(embed_attempts, 0) < 3"
+            )
+            embedding_exhausted = count(
+                "SELECT COUNT(*) AS c FROM articles "
+                "WHERE embedding IS NULL AND COALESCE(embed_attempts, 0) >= 3"
+            )
+            embedding_skipped_noise = count(
+                "SELECT COUNT(*) AS c FROM articles "
+                "WHERE embedding IS NULL AND event_type = 'noise'"
+            )
+
+        return {
+            "pending": pending,
+            "pending_in_window": pending_in_window,
+            "exhausted": exhausted,
+            "stale": stale,
+            "error": error,
+            "noise": noise,
+            "classified": classified,
+            "embedding_pending": embedding_pending,
+            "embedding_exhausted": embedding_exhausted,
+            "embedding_skipped_noise": embedding_skipped_noise,
+        }
+
+
     def get_recent_summaries_for_ticker(self, ticker: str, hours: int = 24) -> list[str]:
         """Get top-ranked classification summaries for articles mentioning a ticker recently."""
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
@@ -1185,13 +1575,20 @@ class Database:
             return [dict(row) for row in rows]
 
     def get_unranked_articles(self, limit: int = 50) -> list[dict]:
-        """Fetch classified but unranked articles."""
+        """
+        Fetch classified but unranked articles.
+
+        The three terminal non-verdicts are excluded. 'noise' always was;
+        'error' and 'stale' were not, so every row the classifier gave up on was
+        paid for a second time by the ranker — and an 'error' row that gets
+        importance 0.0 is indistinguishable from a genuinely unimportant story.
+        """
         with self.connection() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM articles
-                WHERE event_type IS NOT NULL 
-                  AND event_type != 'noise'
+                WHERE event_type IS NOT NULL
+                  AND event_type NOT IN ('noise', 'error', 'stale')
                   AND importance_score IS NULL
                 ORDER BY published_at DESC LIMIT ?
                 """,
@@ -1995,22 +2392,13 @@ class Database:
             ).fetchone()
             return bool(row)
 
-    def record_price_alert(self, ticker: str) -> None:
-        """Record that a price alert was sent for a ticker today."""
-        with self.connection() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO price_alerts (ticker, alert_date) VALUES (?, date('now', 'localtime'))",
-                (ticker,)
-            )
-
-    def was_price_alert_sent_today(self, ticker: str) -> bool:
-        """Check if a price alert was already sent for this ticker today."""
-        with self.connection() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM price_alerts WHERE ticker = ? AND alert_date = date('now', 'localtime')",
-                (ticker,)
-            ).fetchone()
-            return row is not None
+    # record_price_alert / was_price_alert_sent_today used to be the scanner's
+    # dedup: one price alert per ticker per day, full stop. They are gone along
+    # with that rule — a drop that deepens has to re-alert, which is a question
+    # about *how far* the last alert said the move had gone, not whether one was
+    # sent. get_last_alert_abs_pct_today answers that off the alerts table. The
+    # price_alerts table is left in the schema so an existing database is not
+    # rewritten on upgrade; nothing reads it.
 
     def record_alert(self, article_id: str, alert_type: str) -> None:
         """Record that an alert was sent."""
@@ -2023,6 +2411,356 @@ class Database:
             except sqlite3.IntegrityError:
                 pass  # Already recorded
 
+
+    def insert_alert(self, row: dict) -> int:
+        """Store one pushed alert and return its row id."""
+        sources = row.get("sources_json", "[]")
+        if not isinstance(sources, str):
+            sources = json.dumps(sources)
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO alerts
+                    (ticker, kind, pct, price, severity, title, summary,
+                     body_html, sources_json, grounded_by)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row.get("ticker"),
+                    row["kind"],
+                    row.get("pct"),
+                    row.get("price"),
+                    row.get("severity"),
+                    row.get("title", ""),
+                    row.get("summary"),
+                    row.get("body_html"),
+                    sources,
+                    row.get("grounded_by", "none"),
+                )
+            )
+            return int(cur.lastrowid)
+
+    @staticmethod
+    def _decode_alert(row) -> dict:
+        """
+        One alert row with its citations decoded into a `sources` list.
+
+        `sources_json` stays on the row as stored — the dashboard card wants a
+        list, and everything reading it as text still gets text. Both readers go
+        through here so the row the SSE `alert` event carries is the same shape
+        as the one /api/alerts returns; the card prepends live events straight
+        into the list it fetched, and a different shape there renders as blanks.
+        """
+        out = dict(row)
+        raw = out.get("sources_json") or "[]"
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            parsed = []
+        out["sources"] = parsed if isinstance(parsed, list) else []
+        return out
+
+    def get_recent_alerts(self, limit: int = 20, kind: str | None = None) -> list[dict]:
+        """Recent alerts newest-first, for /api/alerts and the dashboard card."""
+        sql = "SELECT * FROM alerts"
+        params: list[Any] = []
+        if kind:
+            sql += " WHERE kind = ?"
+            params.append(kind)
+        # id breaks the tie: CURRENT_TIMESTAMP has one-second resolution, so two
+        # alerts from the same scan would otherwise come back in any order.
+        sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+        with self.connection() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [self._decode_alert(r) for r in rows]
+
+    def get_alert(self, alert_id: int) -> dict | None:
+        """One stored alert by id — what a publisher pushes onto the SSE bus."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM alerts WHERE id = ?", (alert_id,)
+            ).fetchone()
+        return self._decode_alert(row) if row else None
+
+    def get_last_alert_abs_pct_today(self, ticker: str, kinds: tuple[str, ...]) -> float | None:
+        """
+        Largest move already alerted for this ticker today, as abs(pct).
+
+        What the escalation rule compares against: alert once per day, then
+        again only when the move has deepened past the step. Returns None when
+        nothing was sent today, which is not the same as 0.0.
+        """
+        if not kinds:
+            return None
+        placeholders = ",".join("?" for _ in kinds)
+        with self.connection() as conn:
+            row = conn.execute(
+                f"""
+                SELECT MAX(ABS(pct)) AS m FROM alerts
+                WHERE ticker = ?
+                  AND kind IN ({placeholders})
+                  AND date(created_at, 'localtime') = date('now', 'localtime')
+                """,
+                (ticker, *kinds)
+            ).fetchone()
+        # created_at defaults to CURRENT_TIMESTAMP, which is UTC, so the stored
+        # side needs 'localtime' too — comparing a UTC date against a local one
+        # is wrong for the nine hours of every KST day that straddle midnight.
+        return None if row is None or row["m"] is None else float(row["m"])
+
+    # ── Digests ──────────────────────────────────────────────────────────
+
+    def insert_digest(self, kind: str, body_html: str, *, body_text: str | None = None,
+                      facts_json=None, model: str | None = None,
+                      period_start: str | None = None,
+                      period_end: str | None = None) -> int:
+        """Store one generated digest (brief, weekly tip, advisory) by kind."""
+        if facts_json is not None and not isinstance(facts_json, str):
+            facts_json = json.dumps(facts_json, default=str)
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO digests
+                    (kind, period_start, period_end, body_html, body_text,
+                     facts_json, model)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (kind, period_start, period_end, body_html, body_text,
+                 facts_json, model)
+            )
+            return int(cur.lastrowid)
+
+    def get_latest_digest(self, kind: str) -> dict | None:
+        """Most recent digest of a kind, for /tip and the dashboard card."""
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM digests WHERE kind = ?
+                ORDER BY created_at DESC, id DESC LIMIT 1
+                """,
+                (kind,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_digests(self, kind: str, limit: int = 10) -> list[dict]:
+        """History for one kind of digest, newest first."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM digests WHERE kind = ?
+                ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (kind, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Macro calendar ───────────────────────────────────────────────────
+
+    # Ordered importance-first within a day so a caller that truncates ("the
+    # next five macro events") drops a month-end marker rather than a CPI print.
+    _MACRO_ORDER = "ORDER BY date ASC, importance DESC, kind ASC, name ASC"
+
+    # Sources whose rows the monthly web refresh must not overwrite.
+    AUTHORITATIVE_MACRO_SOURCES = ("seed", "manual")
+
+    def get_macro_events(self, start: str, end: str) -> list[dict]:
+        """Macro events in an inclusive [start, end] date window."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM macro_events
+                WHERE date >= ? AND date <= ?
+                {self._MACRO_ORDER}
+                """,
+                (start, end),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_macro_events_on(self, date: str) -> list[dict]:
+        """
+        Macro events on one day. Several kinds can share a date — a BEA release
+        date carries both gdp and pce, and may also be a quarter end.
+
+        The point-query half of the pair: `get_macro_events` answers "what is
+        coming up", this answers "does something scheduled explain today", which
+        is what a price-drop alert and the daily stance ask.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM macro_events WHERE date = ? {self._MACRO_ORDER}",
+                (date,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_macro_event(self, row: dict, allow_override_seed: bool = False) -> str:
+        """
+        Insert or update one macro event. Returns "inserted", "updated" or
+        "skipped" so a caller can report real counts.
+
+        Matching is on the unique key (date, kind, name), but the *refusal* is
+        checked on (date, kind): a web-extracted row for a day that already has
+        an authoritative row of that kind is skipped even when its name differs,
+        because it almost always will ("CPI report" vs "CPI (September 2026)")
+        and inserting it would put two CPI rows on one day rather than
+        overwriting anything.
+
+        Seed and manual rows are never blocked — re-seeding is how a corrected
+        schedule lands, and seed outranks a web row at the same key.
+        """
+        date = row["date"]
+        kind = row["kind"]
+        name = row["name"]
+        source = row.get("source") or "seed"
+        params = (
+            row.get("time_et"),
+            name,
+            kind,
+            int(row.get("importance") or 1),
+            source,
+            row.get("notes"),
+        )
+
+        with self.connection() as conn:
+            if source not in self.AUTHORITATIVE_MACRO_SOURCES and not allow_override_seed:
+                placeholders = ",".join("?" for _ in self.AUTHORITATIVE_MACRO_SOURCES)
+                clash = conn.execute(
+                    f"""
+                    SELECT 1 FROM macro_events
+                    WHERE date = ? AND kind = ? AND source IN ({placeholders})
+                    LIMIT 1
+                    """,
+                    (date, kind, *self.AUTHORITATIVE_MACRO_SOURCES),
+                ).fetchone()
+                if clash is not None:
+                    return "skipped"
+
+            existing = conn.execute(
+                "SELECT id FROM macro_events WHERE date = ? AND kind = ? AND name = ?",
+                (date, kind, name),
+            ).fetchone()
+
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO macro_events
+                        (date, time_et, name, kind, importance, source, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (date, *params),
+                )
+                return "inserted"
+
+            # updated_at needs setting explicitly — a column DEFAULT only fires
+            # on INSERT, so without this every row's updated_at stays at the
+            # moment it was first seeded.
+            conn.execute(
+                """
+                UPDATE macro_events
+                   SET time_et = ?, name = ?, kind = ?, importance = ?,
+                       source = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?
+                """,
+                (*params, existing["id"]),
+            )
+            return "updated"
+
+    # ── Daily stances ────────────────────────────────────────────────────
+
+    def upsert_stance(self, ticker: str, date: str, action: str, *,
+                      conviction: str | None = None, thesis: str | None = None,
+                      key_risk: str | None = None,
+                      what_would_change: str | None = None,
+                      evidence_json=None, facts_json=None,
+                      prev_action: str | None = None,
+                      model: str | None = None) -> None:
+        """Store (or replace) one ticker's stance for one session date.
+
+        Replaces rather than appends so re-running the advisor the same morning
+        corrects the row instead of leaving two contradictory calls for one day.
+        """
+        if evidence_json is not None and not isinstance(evidence_json, str):
+            evidence_json = json.dumps(evidence_json, default=str)
+        if facts_json is not None and not isinstance(facts_json, str):
+            facts_json = json.dumps(facts_json, default=str)
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO stances
+                    (ticker, date, action, conviction, thesis, key_risk,
+                     what_would_change, evidence_json, facts_json, prev_action,
+                     model)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ticker, date) DO UPDATE SET
+                    action = excluded.action,
+                    conviction = excluded.conviction,
+                    thesis = excluded.thesis,
+                    key_risk = excluded.key_risk,
+                    what_would_change = excluded.what_would_change,
+                    evidence_json = excluded.evidence_json,
+                    facts_json = excluded.facts_json,
+                    prev_action = excluded.prev_action,
+                    model = excluded.model
+                """,
+                (ticker.upper(), date, action, conviction, thesis, key_risk,
+                 what_would_change, evidence_json, facts_json, prev_action,
+                 model),
+            )
+
+    def get_latest_stance(self, ticker: str,
+                          before: str | None = None) -> dict | None:
+        """Newest stance for one ticker, optionally strictly before a date.
+
+        `before` is what makes the arrow in the morning message honest: passing
+        today's date asks for *yesterday's* call, so a re-run that has already
+        written today's row does not compare the row against itself and report
+        every stance as unchanged.
+        """
+        sql = "SELECT * FROM stances WHERE ticker = ?"
+        params: list = [ticker.upper()]
+        if before:
+            sql += " AND date < ?"
+            params.append(before)
+        sql += " ORDER BY date DESC LIMIT 1"
+        with self.connection() as conn:
+            row = conn.execute(sql, tuple(params)).fetchone()
+        return dict(row) if row else None
+
+    def get_latest_stances(self) -> dict[str, dict]:
+        """The current stance per ticker, keyed by ticker, for /api/stances.
+
+        One scan with a window function rather than a query per ticker: the
+        markets grid asks for this on every poll.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT ticker, date, action, conviction, thesis, key_risk,
+                       what_would_change, evidence_json, prev_action, model,
+                       created_at
+                FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY ticker ORDER BY date DESC
+                    ) AS rn
+                    FROM stances
+                )
+                WHERE rn = 1
+                """
+            ).fetchall()
+
+        out: dict[str, dict] = {}
+        for row in rows:
+            rec = dict(row)
+            # Decoded here rather than at each call site: the API hands this
+            # straight to JSON, and a nested JSON string would reach the
+            # browser as text needing a second parse.
+            try:
+                rec["evidence_used"] = json.loads(rec.pop("evidence_json") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                rec["evidence_used"] = []
+            out[rec["ticker"]] = rec
+        return out
+
     # ── Stats ────────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
@@ -2034,6 +2772,18 @@ class Database:
             ).fetchone()["c"]
             noise = conn.execute(
                 "SELECT COUNT(*) as c FROM articles WHERE event_type = 'noise'"
+            ).fetchone()["c"]
+            # The classification backlog, which nothing reported anywhere — the
+            # one number that would have made the stall visible on /status.
+            unclassified = conn.execute(
+                "SELECT COUNT(*) as c FROM articles "
+                "WHERE event_type IS NULL AND duplicate_of IS NULL"
+            ).fetchone()["c"]
+            stale = conn.execute(
+                "SELECT COUNT(*) as c FROM articles WHERE event_type = 'stale'"
+            ).fetchone()["c"]
+            errored = conn.execute(
+                "SELECT COUNT(*) as c FROM articles WHERE event_type = 'error'"
             ).fetchone()["c"]
             embedded = conn.execute(
                 "SELECT COUNT(*) as c FROM articles WHERE embedding IS NOT NULL"
@@ -2054,6 +2804,9 @@ class Database:
                 "total_articles": total,
                 "classified_articles": classified,
                 "noise_articles": noise,
+                "unclassified_articles": unclassified,
+                "stale_articles": stale,
+                "error_articles": errored,
                 "embedded_articles": embedded,
                 "duplicate_articles": duplicates,
                 "db_size_mb": round(db_size_bytes / (1024 * 1024), 2),
@@ -2423,6 +3176,32 @@ class Database:
         with self.connection() as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [dict(r) for r in reversed(rows)]
+
+    def get_price_history_starts(self, tickers: list[str]) -> dict[str, str]:
+        """
+        Earliest stored bar date per ticker, for the tickers asked about.
+
+        One query rather than one per ticker: the caller is
+        `seasonality.ensure_deep_history`, which asks about the whole watchlist
+        to decide which few names need an expensive full-history pull. Tickers
+        with no bars at all are simply absent from the result, which the caller
+        reads the same way as "too shallow".
+        """
+        symbols = [t.strip().upper() for t in (tickers or []) if t and t.strip()]
+        if not symbols:
+            return {}
+        placeholders = ",".join("?" for _ in symbols)
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT ticker, MIN(date) AS first_date
+                FROM price_history
+                WHERE ticker IN ({placeholders})
+                GROUP BY ticker
+                """,
+                tuple(symbols),
+            ).fetchall()
+        return {r["ticker"]: r["first_date"] for r in rows if r["first_date"]}
 
     # ── Sentiment Features ───────────────────────────────────────────────
 
@@ -3256,12 +4035,17 @@ class Database:
             conn.executemany(
                 """
                 INSERT INTO latest_prices (
-                    ticker, price, previous_close, daily_change_pct, updated_at
-                ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ticker, price, previous_close, daily_change_pct, volume,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(ticker) DO UPDATE SET
                     price = excluded.price,
                     previous_close = excluded.previous_close,
                     daily_change_pct = excluded.daily_change_pct,
+                    -- COALESCE, not a plain overwrite: a refresh that could not
+                    -- read the volume must leave the last good figure alone
+                    -- rather than blank the anomalous-volume check for the day.
+                    volume = COALESCE(excluded.volume, latest_prices.volume),
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 [
@@ -3270,11 +4054,43 @@ class Database:
                         q["price"],
                         q.get("previous_close"),
                         q.get("daily_change_pct"),
+                        q.get("volume"),
                     )
                     for q in quotes
                 ],
             )
         return len(quotes)
+
+    def get_avg_volume(self, ticker: str, sessions: int = 20) -> Optional[float]:
+        """
+        Average daily volume over the last `sessions` completed sessions.
+
+        Excludes today: the in-progress session's volume is partial, and
+        including it drags the baseline down by exactly the amount a spike is
+        being measured against.
+
+        Returns None rather than a number when there is too little history to
+        mean anything. The old inline version averaged whatever it had, which on
+        two bars made "3x the average" a coin flip.
+        """
+        minimum = min(sessions, 10)
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT AVG(volume) AS v, COUNT(*) AS n FROM (
+                    SELECT volume FROM price_history
+                    WHERE ticker = ?
+                      AND volume IS NOT NULL AND volume > 0
+                      AND date < date('now')
+                    ORDER BY date DESC
+                    LIMIT ?
+                )
+                """,
+                (ticker, sessions),
+            ).fetchone()
+        if row is None or row["v"] is None or (row["n"] or 0) < minimum:
+            return None
+        return float(row["v"])
 
     def get_latest_prices(self, tickers: Optional[list[str]] = None) -> dict[str, dict]:
         """Last known quote per ticker, keyed by ticker."""

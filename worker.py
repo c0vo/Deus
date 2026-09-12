@@ -66,6 +66,45 @@ async def _start_telegram(bot: DeusBot) -> bool:
     return False
 
 
+CLASSIFIER_DISABLED_ALERT = (
+    "⚠️ Classifier model not configured — ingest is embedding-only "
+    "until MODEL_CLASSIFIER is set"
+)
+
+
+async def _warn_if_ingest_lane_disabled(bot: DeusBot, unset: list[str]) -> None:
+    """
+    Say out loud that nothing will be classified.
+
+    `preflight_models()` has always logged each unset model, but its return value
+    was discarded — and a warning in a log nobody tails is how an unconfigured
+    classifier ran for weeks while the dashboard showed articles arriving. A
+    Telegram push is the one channel that reaches the operator.
+    """
+    if not {"model_classifier", "model_classifier_fallback"} <= set(unset):
+        return
+
+    log.error(
+        "worker.ingest_lane_disabled",
+        settings=["MODEL_CLASSIFIER", "MODEL_CLASSIFIER_FALLBACK"],
+        impact="articles will be fetched and embedded but never classified, so "
+               "nothing reaches ranking, the brief, or alerts",
+        hint="set a slug from https://openrouter.ai/models and restart",
+    )
+
+    # Guarded rather than assumed: Telegram may be unconfigured, or may have
+    # failed every connection attempt, and neither may take the worker down.
+    # send_html leaves the "is there a bot and a chat at all" check to its
+    # callers, so it is made here.
+    alert_manager = getattr(bot, "alert_manager", None)
+    if not (alert_manager and alert_manager.bot and alert_manager.chat_id):
+        return
+    try:
+        await alert_manager.send_html(CLASSIFIER_DISABLED_ALERT)
+    except Exception as e:
+        log.warning("worker.ingest_lane_alert_failed", error=str(e))
+
+
 async def _shutdown(bot: DeusBot, orchestrator: PipelineOrchestrator,
                     telegram_running: bool) -> None:
     """Stop everything that actually started."""
@@ -89,8 +128,9 @@ async def main() -> None:
     log.info("worker.starting", version="2.0.0")
 
     # Report LLM misconfiguration once, here, rather than as a wall of
-    # identical failures on the first pipeline cycle 90 seconds from now.
-    preflight_models()
+    # identical failures on the first pipeline cycle 90 seconds from now. The
+    # return value is acted on below, once Telegram is up.
+    unset_models = preflight_models()
 
     db = Database()
     db.initialize()
@@ -116,6 +156,10 @@ async def main() -> None:
             signal.signal(sig, lambda *_: stop_event.set())
 
     telegram_running = await _start_telegram(bot)
+    # After Telegram, before the scheduler: the push needs a running bot, and the
+    # operator should have the warning in hand before the first cycle's results
+    # start arriving.
+    await _warn_if_ingest_lane_disabled(bot, unset_models)
     orchestrator.start(interval_minutes=settings.pipeline_interval_minutes)
     log.info("worker.ready", telegram=telegram_running,
              pipeline_interval_minutes=settings.pipeline_interval_minutes)

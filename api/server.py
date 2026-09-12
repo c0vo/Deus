@@ -24,14 +24,15 @@ from config.cache import TTLCache
 from config.logging_config import get_logger
 from config.settings import settings
 from data.database import Database
+from data.macro_calendar import VERIFIED_AGAINST as MACRO_SEED_VERIFIED_AGAINST
 from pipeline.predictor import StockPredictor, HORIZON_LABELS
-from pipeline.chat_orchestrator import ChatOrchestrator, build_chat_prompt
-from pipeline.web_search import enrich_chat_context
+from pipeline.chat_orchestrator import ChatOrchestrator
 from pipeline.embedder import Embedder
 from pipeline.sector_analyzer import SectorAnalyzer
 from pipeline.ipo_detector import IPODetector
 from pipeline.geo_tagger import country_name
 from pipeline.event_tracker import EventTracker
+from pipeline.macro_calendar import MacroCalendar
 from pipeline.trend_forecaster import TrendForecaster
 from pipeline.trending import get_trending_with_summaries
 from pipeline.darkpool import DarkPoolTracker
@@ -39,8 +40,6 @@ from pipeline.market_regime import (
     METRIC_DIX, METRIC_GEX, METRIC_PUT_CALL, MarketRegimeTracker,
 )
 from api.sse_manager import event_bus
-from config.llm import is_llm_configured, response_cost, stream_complete
-from config.usage import track_llm
 
 router = APIRouter()
 
@@ -73,6 +72,9 @@ _markets_cache = TTLCache(ttl_seconds=15)
 # connect, which means on every page load and every SSE reconnect.
 _status_cache = TTLCache(ttl_seconds=15)
 _brain_snapshot_cache = TTLCache(ttl_seconds=15)
+# /api/brain without a search query. Polled by every open dashboard tab, and the
+# build behind it is a dozen aggregates over the whole articles table.
+_brain_cache = TTLCache(ttl_seconds=15)
 
 # Off-exchange data lands once a day and the dashboard panel polls every 10
 # minutes, so this holds far longer than the 15s grid caches. The window is a
@@ -90,6 +92,25 @@ _analyst_cache = TTLCache(ttl_seconds=300)
 # longer than the price-driven grids.
 _thesis_cache = TTLCache(ttl_seconds=120)
 
+# The macro calendar changes once a month (the web top-up) or on a deploy (the
+# seed), so five minutes is if anything conservative. The dashboard card fetches
+# this on every page load from every open tab.
+_macro_events_cache = TTLCache(ttl_seconds=300)
+
+# Alerts are written by the scanner at most every ten minutes and arrive live on
+# the `alert` SSE topic anyway, so this only has to absorb the page-load fetch
+# from however many tabs are open at once.
+_alerts_cache = TTLCache(ttl_seconds=15)
+
+# Digests are written once a week (the tip) or once a day (the brief), so this is
+# short only because the dashboard card refetches on the SSE push and a stale
+# answer a second after that push would read as the card being broken.
+_digests_cache = TTLCache(ttl_seconds=60)
+
+# One stance per ticker per day, written once by the worker's morning job. A
+# minute is short only so a manually triggered re-run shows up without a wait.
+_stances_cache = TTLCache(ttl_seconds=60)
+
 # Generation runs a reasoning call plus several web searches, and this endpoint
 # lives in the read-mostly API process. One at a time, so two open tabs cannot
 # start two runs.
@@ -102,6 +123,64 @@ _thesis_stream_lock = asyncio.Semaphore(1)
 # budget was 4000 and no longer leaves room; a timeout here reads to the user
 # as another silent stall.
 THESIS_STREAM_TIMEOUT_SECONDS = 1200
+
+# Topics /api/brain/stream subscribes to.
+#
+# Module-level because the chain a live dashboard update depends on — publisher
+# in the worker, this tuple, the switch in useBrainSSE.ts, a consumer on the
+# page — is only auditable if the middle link sits somewhere a test can assert
+# against. "macro_themes" is the cautionary tale: the trend job has published it
+# every four hours for months with nobody subscribed, so the card only ever saw
+# what its own fetch returned.
+BRAIN_STREAM_TOPICS: tuple[str, ...] = (
+    "pipeline_status", "new_articles", "sector_heatmap",
+    "rotation_signal", "ipo_alert", "trend_forecast",
+    "hot_tickers", "market_ticker", "sentiment_distribution",
+    "embedding_status", "events_updated", "thesis_update",
+    "macro_themes", "classification_status", "alert", "weekly_tip",
+)
+
+
+def _classification_status(db: Database) -> dict:
+    """
+    What the classification queue is actually doing — corpus counts, the last
+    backlog run, and whether a model is configured at all.
+
+    Synchronous: every read is blocking SQLite, so callers run it in a thread.
+
+    The numbers the dashboard used to show about "pending" were
+    `total_articles - embedded_articles`, which counts every pre-filtered noise
+    row forever and says nothing whatsoever about classification. That is why a
+    healthy pipeline read as "17,551 pending" on the phone, and why a real stall
+    would have read the same.
+    """
+    status = db.get_classification_stats(
+        max_age_days=settings.classify_max_age_days,
+        max_attempts=settings.classify_max_attempts,
+    )
+
+    try:
+        last_run = json.loads(db.get_config("classify_backlog_status", "{}")) or {}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        last_run = {}
+    if not isinstance(last_run, dict):
+        last_run = {}
+
+    # Merged flat, with one rename: the run's `classified` means "classified by
+    # the last run" and the corpus stat of the same name means "classified ever".
+    # Letting the run's value win would make the dashboard's total collapse to a
+    # two-digit number every five minutes.
+    run = dict(last_run)
+    if run:
+        status["last_run_classified"] = run.pop("classified", 0)
+    status.update(run)
+
+    # `configured` above (when present) is the classifier's state as of the last
+    # run; this is its state right now, which is what the page warns on.
+    status["classifier_configured"] = bool(
+        settings.model_classifier or settings.model_classifier_fallback
+    )
+    return status
 
 
 def _prediction_to_badge(pred: dict | None) -> dict | None:
@@ -651,9 +730,19 @@ def _load_quotes(db: Database, tickers: list[str]) -> dict[str, dict]:
     return quotes
 
 
+def _load_grid_context(db: Database, tickers: list[str]) -> tuple[dict, dict]:
+    """Quotes and current daily stances in one executor hop.
+
+    The stances come from a single indexed scan keyed by ticker rather than a
+    lookup per row: this endpoint is polled by every open tab, so an extra
+    query per ticker is paid forever.
+    """
+    return _load_quotes(db, tickers), db.get_latest_stances()
+
+
 async def _build_markets_payload(db: Database, tickers: list[str]) -> dict:
     """Assemble the market grid from state the worker has already computed."""
-    quotes = await asyncio.to_thread(_load_quotes, db, tickers)
+    quotes, stances = await asyncio.to_thread(_load_grid_context, db, tickers)
 
     def load_ticker_rows(ticker: str):
         # Grouped into one executor hop: three separate to_thread calls would
@@ -702,10 +791,42 @@ async def _build_markets_payload(db: Database, tickers: list[str]) -> dict:
             "cached_prediction": recent_preds[0] if recent_preds else None,
             "cached_advisory": cached_advisory,
             "cached_debate": cached_advisory,
+            # This morning's evidence-based call. Distinct from cached_advisory:
+            # that is the 5-day Bull/Bear debate, this is today's stance.
+            "daily_stance": stances.get(ticker),
         }
 
     data = await asyncio.gather(*(process_ticker(t) for t in tickers))
     return {"data": data}
+
+
+def _build_stances_payload(db: Database) -> dict:
+    """The current stance per ticker. Synchronous — one SQLite round-trip."""
+    stances = db.get_latest_stances()
+    return {
+        "data": stances,
+        "count": len(stances),
+        # The newest stance date present, so a caller can tell "today's note"
+        # from a note that has not been regenerated since the job last failed.
+        "latest_date": max((s.get("date") or "" for s in stances.values()),
+                           default=None),
+    }
+
+
+@router.get("/api/stances")
+async def get_stances(request: Request):
+    """
+    This morning's evidence-based stance per tracked ticker.
+
+    One row per ticker: the action, conviction, thesis, key risk, the trigger
+    that would flip it, and the previous action on record. Read-only — the
+    stances are written by the worker's daily advisor job.
+    """
+    db = getattr(request.app.state, "db", None) or Database()
+
+    return await _stances_cache.get_or_build(
+        "latest", lambda: asyncio.to_thread(_build_stances_payload, db)
+    )
 
 
 @router.get("/api/news/general")
@@ -1016,115 +1137,41 @@ async def chat_stream(request: Request, payload: ChatRequest):
                     await asyncio.sleep(0.02)
                 return
 
+            # The whole turn — routing, retrieval, grading, the conditional web
+            # search and the token stream — is ChatOrchestrator.iter_events.
+            # This endpoint used to re-implement that sequence by hand, which is
+            # how it ended up being the only path that ever searched the web,
+            # and only when the router happened to say "complex".
+            #
+            # `rag_count` offsets the research counters so the citations panel
+            # counts DB sources alongside web ones. It is filled in from the
+            # retrieval step, which is always yielded before any search runs.
+            rag_count = 0
+
+            async def _chat_research_callback(event_type: str, data: dict):
+                if event_type == "research_source":
+                    data["total"] = data.get("total", 0) + rag_count
+                    data["index"] = data.get("index", 0) + rag_count
+                elif event_type == "research_complete":
+                    data["sources_found"] = data.get("sources_found", 0) + rag_count
+                elif event_type == "research_start":
+                    data["total"] = settings.web_search_max_results + rag_count
+
+                await queue.put({"event": event_type, "data": json.dumps(data)})
+
             orchestrator = ChatOrchestrator(db)
-            state = {"query": message, "context": "", "routing_decision": "", "final_answer": ""}
-
-            router_res = await orchestrator.router_node(state)
-            decision = router_res.get("routing_decision", "shallow")
-            state["routing_decision"] = decision
-
-            await queue.put({
-                "event": "step",
-                "data": json.dumps({"step": "classification", "intent": decision, "reasoning": f"Routed to {decision} agent"})
-            })
-
-            rag_res = await orchestrator.rag_node(state)
-            context = rag_res.get("context", "")
-            top_articles = rag_res.get("top_articles", [])
-            state["context"] = context
-
-            await queue.put({
-                "event": "step",
-                "data": json.dumps({"step": "retrieval", "context": context})
-            })
-
-            web_sources = []
-            # ── Web search enrichment for complex queries ──
-            if decision == "complex":
+            async for event, data in orchestrator.iter_events(
+                message, research_callback=_chat_research_callback
+            ):
+                if event == "step" and data.get("step") == "retrieval":
+                    rag_count = int(data.get("count") or 0)
+                if event == "done":
+                    # The `finally` below emits the wire-format done event.
+                    continue
                 await queue.put({
-                    "event": "step",
-                    "data": json.dumps({
-                        "step": "web_search",
-                        "intent": "searching",
-                        "reasoning": "Running live web search for latest news..."
-                    })
+                    "event": event,
+                    "data": data if isinstance(data, str) else json.dumps(data),
                 })
-
-                rag_count = len(top_articles)
-
-                async def _chat_research_callback(event_type: str, data: dict):
-                    if event_type == "research_source":
-                        data["total"] = data.get("total", 0) + rag_count
-                        data["index"] = data.get("index", 0) + rag_count
-                    elif event_type == "research_complete":
-                        data["sources_found"] = data.get("sources_found", 0) + rag_count
-                    elif event_type == "research_start":
-                        data["total"] = settings.web_search_max_results + rag_count
-
-                    await queue.put({
-                        "event": event_type,
-                        "data": json.dumps(data)
-                    })
-
-                enriched, web_sources = await enrich_chat_context(
-                    query=message,
-                    db_context=context,
-                    max_results=settings.web_search_max_results,
-                    research_callback=_chat_research_callback,
-                )
-                if enriched != context:
-                    context = enriched
-                    state["context"] = context
-                    await queue.put({
-                        "event": "step",
-                        "data": json.dumps({
-                            "step": "web_search",
-                            "intent": "merged",
-                            "reasoning": f"Merged {len(web_sources)} web search source(s) into context"
-                        })
-                    })
-
-            # Emit combined sources (RAG DB top_articles + Web Search sources)
-            all_articles = list(top_articles) + web_sources
-            if all_articles:
-                await queue.put({
-                    "event": "sources",
-                    "data": json.dumps({"articles": all_articles})
-                })
-
-            # Was: a hardcoded pair of slugs shadowing the settings whenever
-            # they happened to be empty, so the configured chat models were
-            # never actually reached. The settings are the only source now.
-            model = (
-                settings.model_chat_shallow if decision == "shallow"
-                else settings.model_chat_complex
-            )
-            if not is_llm_configured() or not model:
-                await queue.put({"event": "error", "data": "❌ LLM not configured."})
-                return
-
-            prompt = build_chat_prompt(message, context)
-
-            # This is the primary user-facing chat path and it recorded nothing
-            # at all until it was instrumented. Streamed responses carry usage
-            # on a trailing chunk, so keep the last one seen and log it after
-            # the stream drains.
-            with track_llm(db, model, "chat_stream") as usage:
-                collected = []
-                async for chunk in stream_complete(
-                    model=model,
-                    prompt=prompt,
-                    reasoning=None if decision == "shallow" else "medium",
-                ):
-                    if chunk.text:
-                        collected.append(chunk.text)
-                        await queue.put({"event": "token", "data": json.dumps({"text": chunk.text})})
-                    if chunk.usage is not None:
-                        usage.prompt_tokens = getattr(chunk.usage, "prompt_tokens", None)
-                        usage.candidate_tokens = getattr(chunk.usage, "completion_tokens", None)
-                        usage.cost = response_cost(chunk.usage)
-
-                usage.response_text = "".join(collected)
 
         except asyncio.CancelledError:
             pass  # cancelled due to client disconnect
@@ -1158,6 +1205,30 @@ async def chat_stream(request: Request, payload: ChatRequest):
                 background_task.cancel()
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ── Pushed alerts ────────────────────────────────────────────────────
+
+
+@router.get("/api/alerts")
+async def get_alerts(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    kind: Optional[str] = None,
+):
+    """Recent pushed alerts, newest first.
+
+    The page-load half of the `alert` SSE topic: the outbox is trimmed to ten
+    minutes, so everything pushed before the dashboard was opened is only
+    reachable through this endpoint. Rows carry `sources` decoded from
+    `sources_json` so a live event and a fetched row are the same shape.
+    """
+    db = getattr(request.app.state, "db", None) or Database()
+    data = await _alerts_cache.get_or_build(
+        ("alerts", limit, kind),
+        lambda: asyncio.to_thread(db.get_recent_alerts, limit, kind),
+    )
+    return {"data": data}
 
 
 # ── News Geography ───────────────────────────────────────────────────
@@ -1441,32 +1512,43 @@ async def get_usage(request: Request):
     return usage
 
 
-@router.get("/api/brain")
-async def get_brain_dashboard(request: Request, q: Optional[str] = None):
-    """Provides backend telemetry for Bloomberg /brain dashboard, including semantic search."""
-    db = getattr(request.app.state, "db", None) or Database()
-    
+def _build_brain_payload(db: Database) -> dict:
+    """
+    The query-independent half of /api/brain: article list, embedding and
+    classification status, sentiment distribution.
+
+    Synchronous on purpose — it is a dozen blocking aggregates over a 40k-row
+    table. It used to run inline in the handler, i.e. on the event loop, which is
+    exactly what makes the dashboard's own telemetry endpoint the thing that
+    freezes the dashboard.
+    """
     # 1. Ingested articles (recent 20)
     with db.connection() as conn:
         articles_rows = conn.execute(
             """
-            SELECT id, headline, source_name, published_at, importance_score, event_type, sentiment_score 
-            FROM articles 
+            SELECT id, headline, source_name, published_at, importance_score, event_type, sentiment_score
+            FROM articles
             ORDER BY published_at DESC LIMIT 20
             """
         ).fetchall()
         articles = [dict(row) for row in articles_rows]
 
+    classification_status = _classification_status(db)
+
     # 2. Embedding status/logs
     with db.connection() as conn:
         total = conn.execute("SELECT COUNT(*) AS c FROM articles").fetchone()["c"]
         embedded = conn.execute("SELECT COUNT(*) AS c FROM articles WHERE embedding IS NOT NULL").fetchone()["c"]
-        pending = total - embedded
     dedup = db.get_dedup_stats()
     embedding_status = {
         "total_articles": total,
         "embedded_articles": embedded,
-        "pending_articles": pending,
+        # The real backlog — rows the embed pass will actually select — not
+        # `total - embedded`, which counted every noise row the embed query
+        # deliberately skips. 99.8% of the "17,551 pending" on the phone was
+        # noise that is never going to be embedded, by design.
+        "pending_articles": classification_status["embedding_pending"],
+        "embedding_skipped_noise": classification_status["embedding_skipped_noise"],
         "success_rate_pct": (embedded / total * 100) if total > 0 else 100.0,
         "duplicate_articles": dedup["duplicates"],
         "unique_articles": total - dedup["duplicates"],
@@ -1485,6 +1567,28 @@ async def get_brain_dashboard(request: Request, q: Optional[str] = None):
             "neutral": neutral,
             "total": total_sent
         }
+
+    return {
+        "articles": articles,
+        "embedding_status": embedding_status,
+        "classification_status": classification_status,
+        "sentiment_distribution": sentiment_distribution,
+    }
+
+
+@router.get("/api/brain")
+async def get_brain_dashboard(request: Request, q: Optional[str] = None):
+    """Provides backend telemetry for Bloomberg /brain dashboard, including semantic search."""
+    db = getattr(request.app.state, "db", None) or Database()
+
+    # Cached and single-flighted for the default query only: every dashboard tab
+    # polls this, and a semantic search is a different build anyway.
+    if q:
+        payload = await asyncio.to_thread(_build_brain_payload, db)
+    else:
+        payload = await _brain_cache.get_or_build(
+            "brain", lambda: asyncio.to_thread(_build_brain_payload, db)
+        )
 
     # 4. Semantic search results (if q is provided)
     semantic_results = []
@@ -1542,12 +1646,9 @@ async def get_brain_dashboard(request: Request, q: Optional[str] = None):
             except Exception as e:
                 log.error("api.semantic_search_failed", error=str(e))
 
-    return {
-        "articles": articles,
-        "embedding_status": embedding_status,
-        "sentiment_distribution": sentiment_distribution,
-        "semantic_results": semantic_results
-    }
+    # A new dict, never a mutation: `payload` may be the cached object shared
+    # with every other caller in this 15-second window.
+    return {**payload, "semantic_results": semantic_results}
 
 
 # ── THE_BRAIN Intelligence Endpoints ─────────────────────────────────
@@ -1700,6 +1801,33 @@ def _event_to_calendar_item(event: dict) -> dict:
     }
 
 
+def _macro_to_calendar_item(row: dict) -> dict:
+    """
+    Shape one macro_events row like the event and IPO items beside it.
+
+    `ticker` is None on purpose rather than a placeholder — a CPI print belongs
+    to no symbol, and MonthGrid already falls back to the title when the ticker
+    is null. `confidence` is derived from provenance: a seeded or hand-entered
+    date came off an official page and is confirmed, whereas a web-extracted one
+    is an LLM reading a third-party calendar, which is exactly "estimated".
+    """
+    source = row.get("source") or "seed"
+    return {
+        "id": f"macro:{row['id']}",
+        "kind": "macro",
+        "date": row.get("date"),
+        "ticker": None,
+        "title": row.get("name") or "",
+        "event_type": row.get("kind"),
+        "confidence": "confirmed" if source in ("seed", "manual") else "estimated",
+        "source": source,
+        "sector": None,
+        "detail": row.get("time_et") or "",
+        "importance": row.get("importance") or 1,
+        "raw_id": row["id"],
+    }
+
+
 @router.get("/api/calendar")
 async def get_calendar(
     request: Request,
@@ -1737,6 +1865,11 @@ async def get_calendar(
         ).fetchall()
     items.extend(_ipo_to_calendar_item(dict(r)) for r in ipo_rows)
 
+    items.extend(
+        _macro_to_calendar_item(row)
+        for row in db.get_macro_events(from_date, to_date)
+    )
+
     # Sorted server-side so the client never re-sorts.
     items.sort(key=lambda i: (i["date"] or "", i["kind"], i["ticker"] or ""))
 
@@ -1748,8 +1881,17 @@ async def get_calendar(
             "counts": {
                 "event": sum(1 for i in items if i["kind"] == "event"),
                 "ipo": sum(1 for i in items if i["kind"] == "ipo"),
+                "macro": sum(1 for i in items if i["kind"] == "macro"),
             },
-            "sources": {"finnhub": bool(settings.finnhub_api_key)},
+            # macro_seed is unconditionally true, unlike finnhub: the official
+            # schedule is compiled into data/macro_calendar.py rather than sitting
+            # behind an API key, so there is no configuration for it to be
+            # missing. The flag is what lets the page say where macro dates came
+            # from instead of implying they need a key.
+            "sources": {
+                "finnhub": bool(settings.finnhub_api_key),
+                "macro_seed": True,
+            },
         }
     }
 
@@ -1786,6 +1928,120 @@ async def refresh_calendar(request: Request):
             "duration_ms": int((time.monotonic() - started) * 1000),
         }
     }
+
+
+def _build_macro_events_payload(db: Database, days_ahead: int) -> dict:
+    """Assemble the macro-events payload. Synchronous by design — one SQLite
+    round-trip, so it runs in a single worker-thread hop."""
+    calendar = MacroCalendar(db)
+    rows = calendar.upcoming(days=days_ahead)
+    return {
+        "data": rows,
+        "days_ahead": days_ahead,
+        "count": len(rows),
+        "verified_against": MACRO_SEED_VERIFIED_AGAINST,
+    }
+
+
+@router.get("/api/brain/macro-events")
+async def get_macro_events(
+    request: Request,
+    days_ahead: int = Query(14, ge=1, le=400),
+):
+    """
+    Scheduled macro events from today forward: FOMC, CPI, NFP, PCE, GDP,
+    expirations, market holidays.
+
+    Read-only and cached like every other panel endpoint — the dashboard card
+    fetches it on each page load and the table changes monthly at most.
+    """
+    db = getattr(request.app.state, "db", None) or Database()
+
+    return await _macro_events_cache.get_or_build(
+        days_ahead,
+        lambda: asyncio.to_thread(_build_macro_events_payload, db, days_ahead),
+    )
+
+
+def _digest_row(row: dict | None) -> dict | None:
+    """
+    Shape one `digests` row for the API.
+
+    `facts_json` is parsed rather than passed through as a string so the card can
+    read the seasonality lines and the tips without re-parsing, and `tips` is
+    lifted out of it because that is the only part the card always needs. A row
+    whose facts failed to parse still returns its body — the message is the
+    product, the facts are the receipt.
+    """
+    if not row:
+        return None
+
+    facts = None
+    raw = row.get("facts_json")
+    if raw:
+        try:
+            facts = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            facts = None
+
+    return {
+        "id": row.get("id"),
+        "kind": row.get("kind"),
+        "period_start": row.get("period_start"),
+        "period_end": row.get("period_end"),
+        "model": row.get("model"),
+        "created_at": row.get("created_at"),
+        "body_html": row.get("body_html"),
+        "body_text": row.get("body_text"),
+        "facts": facts,
+        "tips": (facts or {}).get("tips") or [],
+        "tip_status": (facts or {}).get("tip_status"),
+    }
+
+
+def _build_latest_digest_payload(db: Database, kind: str) -> dict:
+    """Synchronous by design — one SQLite round-trip, one worker-thread hop."""
+    return {"data": _digest_row(db.get_latest_digest(kind)), "kind": kind}
+
+
+def _build_digests_payload(db: Database, kind: str, limit: int) -> dict:
+    rows = [_digest_row(r) for r in db.get_digests(kind, limit=limit)]
+    return {"data": rows, "kind": kind, "count": len(rows)}
+
+
+@router.get("/api/digests/latest")
+async def get_latest_digest(
+    request: Request,
+    kind: str = Query("weekly_tip", min_length=1, max_length=64),
+):
+    """
+    The most recent generated digest of a kind — the weekly tip, the daily brief.
+
+    What the WeeklyTipCard loads on page open, and what it refetches when the
+    worker publishes `weekly_tip`: the SSE outbox is trimmed to ten minutes, so a
+    tab opened on Monday has to get Sunday's tip from here.
+    """
+    db = getattr(request.app.state, "db", None) or Database()
+
+    return await _digests_cache.get_or_build(
+        ("latest", kind),
+        lambda: asyncio.to_thread(_build_latest_digest_payload, db, kind),
+    )
+
+
+@router.get("/api/digests")
+async def get_digests(
+    request: Request,
+    kind: str = Query("weekly_tip", min_length=1, max_length=64),
+    limit: int = Query(10, ge=1, le=50),
+):
+    """History for one kind of digest, newest first."""
+    db = getattr(request.app.state, "db", None) or Database()
+
+    return await _digests_cache.get_or_build(
+        ("list", kind, limit),
+        lambda: asyncio.to_thread(_build_digests_payload, db, kind, limit),
+    )
 
 
 @router.get("/api/brain/macro-themes")
@@ -1852,13 +2108,7 @@ async def brain_stream(request: Request):
     """
     db = getattr(request.app.state, "db", None) or Database()
 
-    topics = [
-        "pipeline_status", "new_articles", "sector_heatmap",
-        "rotation_signal", "ipo_alert", "trend_forecast",
-        "hot_tickers", "market_ticker", "sentiment_distribution",
-        "embedding_status", "events_updated", "thesis_update",
-    ]
-    subscriber = event_bus.subscribe(topics)
+    subscriber = event_bus.subscribe(list(BRAIN_STREAM_TOPICS))
 
     def _build_brain_snapshot():
         """
@@ -1896,16 +2146,24 @@ async def brain_stream(request: Request):
         sector_data = analyzer._compute_sector_snapshot(hours=24)
 
         metrics = db.get_recent_pipeline_metrics(limit=10)
+        # Page-load state for the classification_status topic: the SSE outbox is
+        # trimmed to ten minutes, so without this a dashboard opened between
+        # backlog runs would render the cell empty.
+        classification_status = _classification_status(db)
 
         return {
             "articles": [dict(r) for r in articles],
             "embedding_status": {
                 "total_articles": total,
                 "embedded_articles": embedded,
-                "pending_articles": total - embedded,
+                # The rows the embed pass will actually select, not
+                # `total - embedded` — see _build_brain_payload.
+                "pending_articles": classification_status["embedding_pending"],
+                "embedding_skipped_noise": classification_status["embedding_skipped_noise"],
                 "success_rate_pct": (embedded / total * 100) if total > 0 else 100.0,
                 "duplicate_articles": db.get_dedup_stats()["duplicates"],
             },
+            "classification_status": classification_status,
             "sentiment_distribution": {
                 "bullish": bullish,
                 "bearish": bearish,

@@ -30,6 +30,43 @@ log = get_logger(__name__)
 
 
 @dataclass
+class UsageTally:
+    """
+    Process-wide running totals for every tracked LLM call.
+
+    `llm_usage_log` already holds the per-call truth, but a caller that wants
+    "how many calls did *this* pipeline cycle make" would have to query the
+    table by timestamp and hope no other lane wrote in the same window. A
+    monotonic counter makes it a subtraction instead: snapshot before, snapshot
+    after, diff.
+
+    That is what `pipeline_metrics.llm_calls_count` needed — the orchestrator
+    initialised the field and nothing ever incremented it, so every cycle
+    recorded 0 calls and $0.00 and the dashboard's LLM-calls cell was a
+    permanent zero.
+
+    Deliberately not thread-safe beyond CPython's per-bytecode atomicity: these
+    are telemetry counters, and a lost increment under a race costs one call in
+    a cycle count, not correctness anywhere.
+    """
+
+    calls: int = 0
+    errors: int = 0
+    cost: float = 0.0
+
+    def snapshot(self) -> "UsageTally":
+        """A detached copy, for diffing against a later state."""
+        return UsageTally(calls=self.calls, errors=self.errors, cost=self.cost)
+
+
+# The module-level instance every `track_llm` increments. Imported as
+# `from config.usage import tally` — rebinding the name in a caller's module
+# would detach it from the one track_llm writes to, so read it through the
+# module (`config.usage.tally`) anywhere the value matters at call time.
+tally = UsageTally()
+
+
+@dataclass
 class UsageRecord:
     """Caller assigns `.response`; everything else is derived from it."""
     response: Any = None
@@ -113,6 +150,8 @@ def track_llm(
     try:
         yield rec
     except Exception as e:
+        tally.calls += 1
+        tally.errors += 1
         try:
             db.log_llm_usage(
                 model_name=model_name,
@@ -129,6 +168,10 @@ def track_llm(
         raise
     else:
         prompt_tokens, candidate_tokens, response_text, cost = _extract_usage(rec)
+        # Counted here rather than in Database.log_llm_usage so that a failure to
+        # write the row cannot also lose the count.
+        tally.calls += 1
+        tally.cost += float(cost or 0.0)
         try:
             db.log_llm_usage(
                 model_name=model_name,
