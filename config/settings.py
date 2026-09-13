@@ -93,7 +93,6 @@ class Settings(BaseSettings):
     model_trader: str = ""
     model_predictor_narrative: str = ""
     model_market_scanner: str = ""
-    model_sector_analyzer: str = ""
 
     # The one model that is NOT free to change. Stored vectors are 3072-dim and
     # compared directly against new ones, so a model of any other width
@@ -561,7 +560,6 @@ _MODEL_FEATURES: dict[str, str] = {
     "model_trader": "trader synthesis at the end of a debate",
     "model_predictor_narrative": "plain-English rationale on ML predictions",
     "model_market_scanner": "price-swing and earnings-whisper alerts",
-    "model_sector_analyzer": "sector rationales",
     "model_thesis_reasoner": "thesis causal-chain decomposition",
     "model_thesis_extract": "company extraction from thesis searches",
     "model_embedding": "embeddings — without it dedup, RAG and thesis grounding all stop",

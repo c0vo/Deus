@@ -350,6 +350,47 @@ class TestUserConfig:
         assert value is None
 
 
+# ── Hot Tickers Tests ───────────────────────────────────────────────────────
+
+class TestHotTickers:
+    """The sector analyzer's upsert against the thesis engine's promotion."""
+
+    @staticmethod
+    def _row(db, ticker):
+        with db.connection() as conn:
+            return dict(conn.execute(
+                "SELECT * FROM hot_tickers WHERE ticker = ?", (ticker,)
+            ).fetchone())
+
+    @staticmethod
+    def _discovered(ticker, mentions, sentiment=0.42):
+        """The dict SectorAnalyzer._discover_hot_tickers produces."""
+        return {"ticker": ticker, "mention_count": mentions,
+                "avg_sentiment": sentiment, "sectors": ["Technology"]}
+
+    def test_analyzer_upsert_keeps_a_thesis_rationale(self, db):
+        db.promote_thesis_ticker("SMCI", "thesis-1", "[Thesis] AI power: cooling")
+
+        db.upsert_hot_ticker(self._discovered("SMCI", 7))
+
+        row = self._row(db, "SMCI")
+        assert row["rationale"] == "[Thesis] AI power: cooling"
+        assert row["source"] == "thesis"
+        assert row["thesis_id"] == "thesis-1"
+        # The analyzer's own columns are still refreshed.
+        assert row["mention_count"] == 7
+        assert row["avg_sentiment"] == pytest.approx(0.42)
+        assert json.loads(row["sectors_json"]) == ["Technology"]
+
+    def test_analyzer_insert_writes_no_rationale(self, db):
+        db.upsert_hot_ticker(self._discovered("IONQ", 3))
+
+        row = self._row(db, "IONQ")
+        assert row["rationale"] == ""
+        assert row["source"] == "sector_analyzer"
+        assert row["mention_count"] == 3
+
+
 # ── Briefing Candidate Tests ────────────────────────────────────────────────
 
 class TestBriefingCandidates:

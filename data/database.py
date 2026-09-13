@@ -1844,7 +1844,13 @@ class Database:
             return [dict(row) for row in rows]
 
     def upsert_hot_ticker(self, data: dict) -> None:
-        """Insert or update a hot ticker discovered by the analyzer."""
+        """Insert or update a hot ticker discovered by the analyzer.
+
+        Never writes `rationale`. The analyzer no longer produces one, and
+        setting the column from a payload without it would blank the rationale
+        promote_thesis_ticker() stored on a thesis-promoted row — every 15
+        minutes, for as long as the name stays hot.
+        """
         now = datetime.now(timezone.utc).isoformat()
         with self.connection() as conn:
             existing = conn.execute(
@@ -1852,28 +1858,26 @@ class Database:
                 (data["ticker"],)
             ).fetchone()
             if existing:
-                rationale = data.get("rationale", "")
                 conn.execute(
                     """
                     UPDATE hot_tickers SET mention_count = ?, avg_sentiment = ?,
-                        sectors_json = ?, rationale = ?, last_detected_at = ?
+                        sectors_json = ?, last_detected_at = ?
                     WHERE ticker = ?
                     """,
                     (data["mention_count"], data["avg_sentiment"],
                      json.dumps(data.get("sectors", [])),
-                     rationale, now, data["ticker"])
+                     now, data["ticker"])
                 )
             else:
-                rationale = data.get("rationale", "")
                 conn.execute(
                     """
                     INSERT INTO hot_tickers (ticker, mention_count, avg_sentiment,
-                        sectors_json, rationale, first_detected_at, last_detected_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                        sectors_json, first_detected_at, last_detected_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (data["ticker"], data["mention_count"], data["avg_sentiment"],
                      json.dumps(data.get("sectors", [])),
-                     rationale, now, now)
+                     now, now)
                 )
 
     def get_hot_tickers(self, limit: int = 20, exclude_watchlist: bool = True) -> list[dict]:
@@ -4797,10 +4801,9 @@ class Database:
         """Mark a thesis-discovered ticker as hot so ingest starts tracking it.
 
         Deliberately NOT upsert_hot_ticker(): that method rewrites
-        mention_count, avg_sentiment and rationale wholesale, and
-        SectorAnalyzer re-runs it every 15 minutes — a thesis rationale written
-        through it would be clobbered within the quarter-hour. This writes only
-        the columns the thesis engine owns and leaves the analyzer's fields
+        mention_count, avg_sentiment and sectors_json wholesale, SectorAnalyzer
+        re-runs it every 15 minutes, and it records no provenance. This writes
+        only the columns the thesis engine owns and leaves the analyzer's fields
         untouched on conflict.
         """
         now = datetime.now(timezone.utc).isoformat()

@@ -1,6 +1,6 @@
 # Deus model routing
 
-Three ranked picks for all 21 `MODEL_*` settings in `.env`, priced per million tokens and weighted by
+Three ranked picks for all 20 `MODEL_*` settings in `.env`, priced per million tokens and weighted by
 what each function actually needs.
 
 Every model listed here was called through this project's own `config/llm.py` against a real schema
@@ -8,7 +8,7 @@ before it earned a place. Prices are OpenRouter's published per-million rates as
 
 | | |
 |---|---|
-| Routable functions | 21 |
+| Routable functions | 20 |
 | Models verified working | 14 |
 | Models rejected on test | 4 |
 | Spent verifying | $0.011 |
@@ -211,16 +211,6 @@ Prose explanation attached to a ≥5% swing or an earnings whisper. Fires only o
 | 2 | `openai/gpt-5.6-luna` | 0.10 | 0.60 | Better at the HTML-formatted, no-emoji house style this prompt asks for. |
 | 3 | `google/gemini-3.7-flash` | 0.375 | 1.875 | Alerts are rare enough that the price never shows up on the dashboard. |
 
-### `MODEL_SECTOR_ANALYZER` — balanced
-
-A JSON map of ticker → one-sentence rationale for hot names.
-
-| # | Model | $/M in | $/M out | Why |
-|---|---|---:|---:|---|
-| **1** | `nvidia/nemotron-3.5-lightning` | 0.10 | 0.25 | The fallback string is "Surge in news mentions detected." — almost anything beats that, so buy cheap. |
-| 2 | `deepseek/deepseek-v4-flash-0731` | 0.14 | 0.28 | More specific rationales for barely more money. |
-| 3 | `google/gemini-3.5-flash-lite` | 0.30 | 2.50 | Your current default; no reason to keep it here. |
-
 ### `MODEL_TREND_OUTLOOK` — balanced
 
 Sector outlook and macro themes — two JSON calls at `reasoning="low"`.
@@ -339,7 +329,6 @@ MODEL_CHAT_COMPLEX=deepseek/deepseek-v4-pro-0813
 MODEL_TRENDING=nvidia/nemotron-3.5-lightning
 MODEL_DAILY_ADVISOR=deepseek/deepseek-v4-flash-0731
 MODEL_MARKET_SCANNER=deepseek/deepseek-v4-flash-0731
-MODEL_SECTOR_ANALYZER=nvidia/nemotron-3.5-lightning
 MODEL_TREND_OUTLOOK=deepseek/deepseek-v4-flash-0731
 MODEL_PREDICTOR_NARRATIVE=deepseek/deepseek-v4-flash-0731
 MODEL_REFLECTION=deepseek/deepseek-v4-flash-0731
@@ -372,7 +361,6 @@ MODEL_CHAT_COMPLEX=deepseek/deepseek-v4-pro-0813
 MODEL_TRENDING=deepseek/deepseek-v4-flash-0731
 MODEL_DAILY_ADVISOR=google/gemini-3.7-flash
 MODEL_MARKET_SCANNER=deepseek/deepseek-v4-flash-0731
-MODEL_SECTOR_ANALYZER=nvidia/nemotron-3.5-lightning
 MODEL_TREND_OUTLOOK=deepseek/deepseek-v4-flash-0731
 MODEL_PREDICTOR_NARRATIVE=deepseek/deepseek-v4-flash-0731
 MODEL_REFLECTION=deepseek/deepseek-v4-flash-0731
@@ -405,7 +393,6 @@ MODEL_CHAT_COMPLEX=anthropic/claude-sonnet-5
 MODEL_TRENDING=google/gemini-3.7-flash
 MODEL_DAILY_ADVISOR=google/gemini-3.7-flash
 MODEL_MARKET_SCANNER=google/gemini-3.7-flash
-MODEL_SECTOR_ANALYZER=deepseek/deepseek-v4-flash-0731
 MODEL_TREND_OUTLOOK=google/gemini-3.7-flash
 MODEL_PREDICTOR_NARRATIVE=google/gemini-3.7-flash
 MODEL_REFLECTION=deepseek/deepseek-v4-pro-0813

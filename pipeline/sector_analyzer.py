@@ -16,9 +16,6 @@ import time
 from datetime import datetime, timezone, timedelta
 
 from config.logging_config import get_logger
-from config.settings import settings
-from config.usage import track_llm
-from config.llm import complete, is_llm_configured, strip_code_fence
 from data.database import Database
 from api.sse_manager import event_bus
 
@@ -55,14 +52,12 @@ class SectorAnalyzer:
         for rot in rotations:
             self.db.insert_rotation_signal(rot)
 
-        # 3. Discover hot tickers not on user watchlist
+        # 3. Discover hot tickers not on user watchlist. No rationale: this run
+        # used to ask a model to explain each name from its general knowledge,
+        # every 15 minutes, and nothing ever read the answer.
         hot_tickers = self._discover_hot_tickers(hours=6)
         results["hot_tickers_found"] = len(hot_tickers)
-        if hot_tickers:
-            # Generate LLM rationales for why these tickers are surging
-            hot_tickers = await self.generate_hot_ticker_rationales(hot_tickers)
         for ht in hot_tickers:
-            # upsert_hot_ticker now stores rationale along with other fields
             self.db.upsert_hot_ticker(ht)
 
         if rotations or hot_tickers:
@@ -342,43 +337,3 @@ class SectorAnalyzer:
             })
 
         return results
-
-    async def generate_hot_ticker_rationales(self, hot_tickers: list[dict]) -> list[dict]:
-        """
-        Batch LLM call to generate one-sentence "why this is moving" for hot tickers.
-        """
-        if not hot_tickers:
-            return hot_tickers
-
-        if not is_llm_configured() or not settings.model_sector_analyzer:
-            return hot_tickers
-
-        ticker_list = ", ".join([h["ticker"] for h in hot_tickers])
-        prompt = (
-            f"You are a Professional Wall Street analyst. "
-            f"The following tickers are surging in news mentions today:\n"
-            f"{ticker_list}\n\n"
-            f"For EACH ticker, write exactly ONE sentence explaining why it might be trending "
-            f"based solely on recent market events. Base this on your general knowledge.\n"
-            f"Format your response as a valid JSON object where keys are tickers and values "
-            f"are the one-sentence explanations. Do NOT use markdown or HTML.\n"
-        )
-
-        try:
-            with track_llm(self.db, settings.model_sector_analyzer, "sector_rationales") as u:
-                u.response = response = await complete(
-                    model=settings.model_sector_analyzer,
-                    prompt=prompt,
-                    json_mode=True,
-                    reasoning="low",
-                )
-
-            rationales = json.loads(strip_code_fence(response.text))
-            for ht in hot_tickers:
-                ht["rationale"] = rationales.get(ht["ticker"], "Surge in news mentions detected.")
-        except Exception as e:
-            log.warning("sector_analyzer.rationale_failed", error=str(e))
-            for ht in hot_tickers:
-                ht["rationale"] = "Surge in news mentions detected."
-
-        return hot_tickers
