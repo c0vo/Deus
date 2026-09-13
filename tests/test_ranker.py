@@ -55,11 +55,11 @@ class TestRankBatch:
     async def test_rank_batch_sets_importance_scores(self, ranker, articles):
         """Valid Gemini response should set importance_score on each article."""
         scores = [
-            {"id": "a1", "importance_score": 8.5},
-            {"id": "a2", "importance_score": 9.0},
-            {"id": "a3", "importance_score": 6.2},
-            {"id": "a4", "importance_score": 4.1},
-            {"id": "a5", "importance_score": 7.0},
+            {"id": "item_1", "importance_score": 8.5},
+            {"id": "item_2", "importance_score": 9.0},
+            {"id": "item_3", "importance_score": 6.2},
+            {"id": "item_4", "importance_score": 4.1},
+            {"id": "item_5", "importance_score": 7.0},
         ]
         ranker.complete.return_value = make_response(json.dumps(scores))
 
@@ -106,9 +106,9 @@ class TestRankBatch:
     async def test_rank_batch_partial_mapping(self, ranker, articles):
         """If Gemini returns scores for only a subset of articles, only those get scores."""
         scores = [
-            {"id": "a1", "importance_score": 8.0},
-            # a2 is missing
-            {"id": "a3", "importance_score": 5.0},
+            {"id": "item_1", "importance_score": 8.0},
+            # a2 (item_2) is missing
+            {"id": "item_3", "importance_score": 5.0},
         ]
         ranker.complete.return_value = make_response(json.dumps(scores))
 
@@ -125,9 +125,9 @@ class TestRankBatch:
     async def test_rank_batch_scores_in_range(self, ranker, articles):
         """Importance scores must be in 0.0–10.0 range."""
         scores = [
-            {"id": "a1", "importance_score": 10.0},
-            {"id": "a2", "importance_score": 0.0},
-            {"id": "a3", "importance_score": 5.5},
+            {"id": "item_1", "importance_score": 10.0},
+            {"id": "item_2", "importance_score": 0.0},
+            {"id": "item_3", "importance_score": 5.5},
         ]
         ranker.complete.return_value = make_response(json.dumps(scores))
 
@@ -157,8 +157,8 @@ class TestRankBatch:
         await ranker.rank_batch(articles)
 
         contents = ranker.complete.await_args.kwargs["prompt"]
-        # The prompt should contain article identifiers
-        assert "a1" in contents
+        # The prompt should contain the batch labels standing in for article ids
+        assert "item_1" in contents
         assert articles[0].headline in contents
 
     @pytest.mark.asyncio
@@ -170,7 +170,7 @@ class TestRankBatch:
             published_at=datetime.now(timezone.utc),
             event_type="macro", sentiment_score=0.0, urgency="high",
         )
-        scores = [{"id": "single", "importance_score": 9.5}]
+        scores = [{"id": "item_1", "importance_score": 9.5}]
         ranker.complete.return_value = make_response(json.dumps(scores))
 
         result = await ranker.rank_batch([article])
