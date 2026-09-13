@@ -3,7 +3,7 @@ Trend Forecaster Component
 
 LLM-powered forward-looking analysis of current market trends.
 Generates "If this trend continues..." scenario analysis for
-trending tickers and sectors.
+sectors.
 
 Runs every 4 hours as a background job.
 """
@@ -42,29 +42,17 @@ class TrendForecaster:
     def __init__(self, db: Database):
         self.db = db
 
-    async def generate_forecasts(self, max_tickers: int = 5, max_sectors: int = 3) -> list[dict]:
+    async def generate_forecasts(self, max_sectors: int = 3) -> list[dict]:
         """
-        Generate trend forecasts for top trending tickers and sectors.
+        Generate outlooks for the most-covered sectors.
         Called every 4 hours by the scheduler.
+
+        Sectors only. The job used to open with a scenario set per trending
+        ticker on the reasoning model at high effort, and nothing ever read
+        those rows: every reader of trend_forecasts asks for a sector.
         """
         all_forecasts = []
 
-        # 1. Get top trending tickers from last 24h
-        trending = self.db.get_top_trending_tickers(hours=24, limit=max_tickers)
-        ticker_contexts = {}
-        for t in trending:
-            ticker = t["ticker"]
-            summaries = self.db.get_recent_summaries_for_ticker(ticker, hours=48)
-            if summaries:
-                ticker_contexts[ticker] = summaries
-
-        if ticker_contexts:
-            forecasts = await self._batch_generate_ticker_forecasts(ticker_contexts)
-            for f in forecasts:
-                self._store_forecast(f)
-            all_forecasts.extend(forecasts)
-
-        # 2. Generate sector-level outlooks
         sector_data = self._get_top_sectors(hours=24, limit=max_sectors)
         for sd in sector_data:
             forecast = await self.get_sector_outlook(sd["sector"])
@@ -108,71 +96,6 @@ class TrendForecaster:
 
         sorted_sectors = sorted(sector_counts.items(), key=lambda x: x[1], reverse=True)
         return [{"sector": s, "article_count": c} for s, c in sorted_sectors[:limit]]
-
-    async def _batch_generate_ticker_forecasts(self, ticker_contexts: dict) -> list[dict]:
-        """
-        Batch LLM call to generate forecasts for multiple tickers at once.
-        Runs on MODEL_REASONER, at high reasoning effort.
-        """
-        if not is_llm_configured() or not settings.model_reasoner:
-            return []
-
-        context_text = ""
-        for ticker, summaries in ticker_contexts.items():
-            context_text += f"\nTicker: {ticker}\n"
-            context_text += "Recent context:\n" + "\n".join(f"- {s}" for s in summaries) + "\n"
-
-        prompt = (
-            "You are a professional Wall Street analyst generating forward-looking scenario analyses. "
-            "Base every scenario on specific data points from the provided context.\n\n"
-            f"{context_text}\n"
-            "For EACH ticker, generate 3 scenarios with confidence estimates:\n"
-            "1. Bull case (label: 'If [catalyst] materializes...'): The upside scenario with specific triggers\n"
-            "2. Base case (label: 'Most likely: ...'): Your central estimate, weighted by evidence strength\n"
-            "3. Bear case (label: 'If [risk] plays out...'): The downside scenario with specific triggers\n\n"
-            "Confidence calibration: 0.3-0.5 = speculative, 0.5-0.7 = plausible with some evidence, "
-            "0.7-0.85 = well-supported by context, 0.85+ = overwhelming evidence (rare).\n\n"
-            "Format as valid JSON with ticker symbols as keys. Each value:\n"
-            '{"scenarios": [{"label": "...", "time_horizon": "1w|1m|3m", '
-            '"narrative": "2-3 sentence analysis citing specific context", '
-            '"key_drivers": ["driver1", "driver2"], "confidence": 0.0-1.0}]}\n\n'
-            "Do NOT use markdown. Output valid JSON only."
-        )
-
-        try:
-            # deepseek-v4-pro at high reasoning effort — the second most
-            # expensive call in the system, and previously unlogged entirely.
-            with track_llm(self.db, settings.model_reasoner, "trend_forecast") as u:
-                u.response = response = await complete(
-                    model=settings.model_reasoner,
-                    system="You generate forward-looking scenario analyses for stocks. Output valid JSON only.",
-                    prompt=prompt,
-                    temperature=0.3,
-                    json_mode=True,
-                    reasoning="high",
-                    max_tokens=settings.debate_max_output_tokens,
-                )
-
-            parsed = json.loads(strip_code_fence(response.text))
-            forecasts = []
-            for ticker, data in parsed.items():
-                scenarios = data.get("scenarios", [])
-                for sc in scenarios:
-                    forecasts.append({
-                        "ticker": ticker,
-                        "sector": None,
-                        "forecast_type": "trend_projection",
-                        "scenario_label": sc.get("label", ""),
-                        "time_horizon": sc.get("time_horizon", "1m"),
-                        "confidence": sc.get("confidence", 0.5),
-                        "narrative": sc.get("narrative", ""),
-                        "key_drivers": sc.get("key_drivers", []),
-                        "supporting_evidence": context_text[:500],
-                    })
-            return forecasts
-        except Exception as e:
-            log.warning("trend_forecaster.batch_failed", error=str(e))
-            return []
 
     async def get_sector_outlook(self, sector: str) -> Optional[dict]:
         """

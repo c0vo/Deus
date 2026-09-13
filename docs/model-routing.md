@@ -1,6 +1,6 @@
 # Deus model routing
 
-Three ranked picks for all 22 `MODEL_*` settings in `.env`, priced per million tokens and weighted by
+Three ranked picks for all 21 `MODEL_*` settings in `.env`, priced per million tokens and weighted by
 what each function actually needs.
 
 Every model listed here was called through this project's own `config/llm.py` against a real schema
@@ -8,7 +8,7 @@ before it earned a place. Prices are OpenRouter's published per-million rates as
 
 | | |
 |---|---|
-| Routable functions | 22 |
+| Routable functions | 21 |
 | Models verified working | 14 |
 | Models rejected on test | 4 |
 | Spent verifying | $0.011 |
@@ -256,8 +256,8 @@ Grades matured predictions into lessons. Feeds straight back into the next debat
 
 ## Reasoning
 
-Lowest call volume, highest cost per call. Thinking is billed as completion, so these four settings
-are where output price decides your bill.
+Lowest call volume, highest cost per call. Thinking is billed as completion, so this is where output
+price decides your bill.
 
 ### `MODEL_DEBATE` — output-dominated
 
@@ -280,16 +280,6 @@ Synthesises the whole debate into BUY/SELL/HOLD plus conviction, via the `Trader
 | **1** | `deepseek/deepseek-v4-pro-0813` | 0.435 | 0.87 | One call per debate producing the verdict you read. Reasoning tier, schema-verified, and the cheapest output of any model at that tier. |
 | 2 | `google/gemini-3.7-flash` | 0.375 | 1.875 | A second opinion from a different vendor than the debaters — worth something when the synthesiser is judging their arguments. |
 | 3 | `anthropic/claude-sonnet-5` | 2.00 | 10.00 | The strongest synthesiser here. At one call per debate the absolute cost stays small, and this is the output you actually act on. |
-
-### `MODEL_REASONER` — output-dominated
-
-Trend forecasting — scenario sets per ticker at `reasoning="high"`, 8,000 output tokens, JSON out.
-
-| # | Model | $/M in | $/M out | Why |
-|---|---|---:|---:|---|
-| **1** | `deepseek/deepseek-v4-pro-0813` | 0.435 | 0.87 | Your existing choice, and the migration alone cuts its cost: the old price table billed this at $1.25/$5.00, roughly 5.7× the real completion rate. |
-| 2 | `deepseek/deepseek-v4-flash-0731` | 0.14 | 0.28 | A third of the price. Scenario generation degrades more gracefully than debate does — worth trying before you assume you need pro. |
-| 3 | `x-ai/grok-4.6` | 2.00 | 6.00 | Strong forward-looking reasoning, but ~7× the output price on a lane that emits 8k tokens a call. |
 
 ### `MODEL_THESIS_REASONER` — output-dominated
 
@@ -356,7 +346,6 @@ MODEL_REFLECTION=deepseek/deepseek-v4-flash-0731
 # reasoning
 MODEL_DEBATE=deepseek/deepseek-v4-flash-0731
 MODEL_TRADER=deepseek/deepseek-v4-flash-0731
-MODEL_REASONER=deepseek/deepseek-v4-flash-0731
 MODEL_THESIS_REASONER=deepseek/deepseek-v4-flash-0731
 MODEL_THESIS_EXTRACT=deepseek/deepseek-v4-flash-0731
 # pinned
@@ -390,7 +379,6 @@ MODEL_REFLECTION=deepseek/deepseek-v4-flash-0731
 # reasoning
 MODEL_DEBATE=deepseek/deepseek-v4-flash-0731
 MODEL_TRADER=deepseek/deepseek-v4-pro-0813
-MODEL_REASONER=deepseek/deepseek-v4-pro-0813
 MODEL_THESIS_REASONER=deepseek/deepseek-v4-pro-0813
 MODEL_THESIS_EXTRACT=google/gemini-3.7-flash
 # pinned
@@ -424,7 +412,6 @@ MODEL_REFLECTION=deepseek/deepseek-v4-pro-0813
 # reasoning
 MODEL_DEBATE=deepseek/deepseek-v4-pro-0813
 MODEL_TRADER=anthropic/claude-sonnet-5
-MODEL_REASONER=deepseek/deepseek-v4-pro-0813
 MODEL_THESIS_REASONER=deepseek/deepseek-v4-pro-0813
 MODEL_THESIS_EXTRACT=google/gemini-3.7-flash
 # pinned

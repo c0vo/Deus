@@ -89,11 +89,7 @@ class Settings(BaseSettings):
     model_grader: str = ""
     # The weekly tip digest — seasonal precedents plus the coming week's events.
     model_weekly_tip: str = ""
-    # The Bull/Bear debate is configured separately from the trend forecaster,
-    # which is the other consumer of a reasoning-tier model, so the two can be
-    # dialled independently.
     model_debate: str = ""
-    model_reasoner: str = ""
     model_trader: str = ""
     model_predictor_narrative: str = ""
     model_market_scanner: str = ""
@@ -249,7 +245,7 @@ class Settings(BaseSettings):
     thesis_review_benchmark: str = "SPY"
     thesis_review_batch: int = 40
     # Own model keys so the thesis tier can be dialled down to flash
-    # independently of the trend forecaster. The reasoner decomposes the causal
+    # independently of the debate. The reasoner decomposes the causal
     # chain; the extractor only pulls company names out of search results, so
     # it can run several tiers cheaper.
     model_thesis_reasoner: str = ""
@@ -376,8 +372,6 @@ class Settings(BaseSettings):
     # mid-word — or, on a round-2 turn whose prompt carries the full debate
     # history and so reasons longest, empty. Measured prose is ~830 tokens;
     # the rest of this is headroom for the reasoning that precedes it.
-    # `pipeline/trend_forecaster.py` shares this setting, where a truncated
-    # response is a hard json.loads failure rather than a clipped sentence.
     debate_max_output_tokens: int = 8000
 
     # Attempts for a call that failed transiently. Deterministic failures
@@ -539,7 +533,6 @@ _LEGACY_MODEL_ENV: dict[str, str] = {
     "GEMINI_MODEL_CHAT_SHALLOW": "MODEL_CHAT_SHALLOW",
     "GEMINI_MODEL_CHAT_COMPLEX": "MODEL_CHAT_COMPLEX",
     "DEEPSEEK_MODEL_DEBATE": "MODEL_DEBATE",
-    "DEEPSEEK_MODEL_REASONER": "MODEL_REASONER",
     "DEEPSEEK_MODEL_THESIS": "MODEL_THESIS_REASONER",
     "GEMINI_MODEL_THESIS": "MODEL_THESIS_EXTRACT",
 }
@@ -565,7 +558,6 @@ _MODEL_FEATURES: dict[str, str] = {
     "model_chat_shallow": "fast dashboard chat replies",
     "model_chat_complex": "reasoning-tier dashboard chat replies",
     "model_debate": "Bull/Bear debate",
-    "model_reasoner": "trend forecasting",
     "model_trader": "trader synthesis at the end of a debate",
     "model_predictor_narrative": "plain-English rationale on ML predictions",
     "model_market_scanner": "price-swing and earnings-whisper alerts",
