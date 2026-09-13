@@ -512,7 +512,7 @@ class AdvisoryGraph:
         """
         Lightweight heuristic: check if Bull and Bear agree on directional sentiment.
         If both are bullish or both are bearish, there's no real debate — skip round 2.
-        Saves one full DeepSeek reasoning call per ticker.
+        Saves the Bull rebuttal and the second Bear turn, both at xhigh reasoning.
         """
         history = state.get("debate_history", [])
         if len(history) < 2:
@@ -542,24 +542,23 @@ class AdvisoryGraph:
         def count_keywords(text, keywords):
             return sum(1 for kw in keywords if kw in text)
 
-        bull_bullish = count_keywords(bull_text, bullish_keywords)
-        bull_bearish = count_keywords(bull_text, bearish_keywords)
-        bear_bullish = count_keywords(bear_text, bullish_keywords)
-        bear_bearish = count_keywords(bear_text, bearish_keywords)
+        def lean(text: str) -> int:
+            """+1 leans bullish, -1 leans bearish, 0 is mixed or silent."""
+            bullish = count_keywords(text, bullish_keywords)
+            bearish = count_keywords(text, bearish_keywords)
+            return (bullish > bearish) - (bullish < bearish)
 
-        # Determine each agent's dominant sentiment
-        bull_is_bullish = bull_bullish > bull_bearish
-        bear_is_bearish = bear_bearish > bear_bullish
+        # Each side's lean on one shared scale. Two booleans cannot express
+        # this: "Bull is bullish" and "Bear is bearish" answer different
+        # questions, so both-bullish and both-bearish each read as one True and
+        # one False, indistinguishable from a half-hearted Bear.
+        bull_lean = lean(bull_text)
+        bear_lean = lean(bear_text)
 
-        # Consensus = both lean the same way (both bullish or both bearish)
-        # Disagreement = Bull is bullish AND Bear is bearish (the expected case)
-        if bull_is_bullish and bear_is_bearish:
-            return False  # Genuine disagreement — continue debate
-        if (not bull_is_bullish and not bear_is_bearish) or (bull_is_bullish == bear_is_bearish):
-            return True   # Both lean same way — skip to trader
-
-        # If signals are mixed/weak, default to continuing the debate
-        return False
+        # Consensus = both lean the same way (both bullish or both bearish).
+        # Disagreement (the expected case, or the roles swapped) continues the
+        # debate, and so does a mixed or weak signal on either side.
+        return bull_lean != 0 and bull_lean == bear_lean
 
     async def trader_risk_manager_node(self, state: AdvisoryState) -> dict:
         await self._update_progress("✅ Trader/Risk Manager finalizing trade plan...")

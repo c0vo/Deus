@@ -161,6 +161,31 @@ class TestConsensusDetection:
         }
         assert advisory_graph._debate_has_consensus(state) is True
 
+    def test_no_consensus_when_roles_are_swapped(self, advisory_graph):
+        """Bull leaning bearish against a Bear leaning bullish is still a disagreement.
+
+        This was the one case the old two-boolean check called consensus.
+        """
+        state = {
+            "debate_history": [
+                "Bull: I see downside risk and headwinds here.",
+                "Bear: Honestly the growth and upside look strong.",
+            ],
+            "debate_round_count": 1,
+        }
+        assert advisory_graph._debate_has_consensus(state) is False
+
+    def test_mixed_signals_continue_the_debate(self, advisory_graph):
+        """A tie on either side is no evidence of agreement."""
+        state = {
+            "debate_history": [
+                "Bull: The growth is real but so is the risk.",
+                "Bear: Upside exists, and so does downside.",
+            ],
+            "debate_round_count": 1,
+        }
+        assert advisory_graph._debate_has_consensus(state) is False
+
     def test_no_consensus_with_short_history(self, advisory_graph):
         """Less than 2 entries → cannot determine consensus."""
         state = {
