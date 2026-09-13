@@ -1,6 +1,13 @@
 """Tests for SSE (Server-Sent Events) streaming format and parsing."""
 
+import asyncio
 import json
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from api import server
 from api.server import BRAIN_STREAM_TOPICS, _sse_event
 
 
@@ -264,3 +271,177 @@ class TestBrainStreamTopics:
             "embedding_status", "events_updated", "thesis_update",
         }
         assert expected <= set(BRAIN_STREAM_TOPICS)
+
+
+# ── /api/predict/{ticker}/stream: who owns the debate ───────────────────────
+
+ADVISORY = {
+    "debate_history": [
+        "Bull: Margins are expanding faster than guidance.",
+        "Bear: The multiple already prices that in.",
+    ],
+    "final_advisory": "Hold into the print.",
+    "trader_direction": "HOLD",
+    "trader_conviction": "Medium",
+    "ml_prediction": {"predicted_direction": "UP", "confidence": 0.61},
+    "executive_summary": "Balanced risk into earnings.",
+}
+
+VERDICT_KEYS = {
+    "ticker", "predicted_direction", "confidence", "advisory_direction",
+    "advisory_conviction", "final_advisory", "bull_report", "bear_report",
+    "ml_prediction", "debate_history", "executive_summary",
+}
+
+
+class _Request:
+    """Just enough of a Starlette Request for predict_stream."""
+
+    def __init__(self, db):
+        self.app = SimpleNamespace(state=SimpleNamespace(db=db))
+
+    async def is_disconnected(self) -> bool:
+        return False
+
+
+def _db(cached=None):
+    db = MagicMock()
+    db.get_cached_advisory.return_value = cached
+    return db
+
+
+def _parse(raw: str) -> tuple[str, str]:
+    """One chunk from the stream is exactly one `_sse_event`."""
+    lines = raw.rstrip("\n").split("\n")
+    event = lines[0][len("event: "):]
+    data = "\n".join(line[len("data: "):] for line in lines[1:])
+    return event, data
+
+
+async def _drain(response) -> list[tuple[str, str]]:
+    return [_parse(raw) async for raw in response.body_iterator]
+
+
+@pytest.fixture
+def debate(monkeypatch):
+    """
+    StockPredictor replaced by a debate that runs until `release` is set.
+
+    It writes the cache the way the real predict_with_agents does, just before
+    returning, so a test can tell a debate that finished from one that was
+    abandoned.
+    """
+    gate = SimpleNamespace(release=asyncio.Event(), started=[], error=None)
+
+    class FakePredictor:
+        def __init__(self, db):
+            self.db = db
+
+        async def predict_with_agents(self, ticker, **callbacks):
+            gate.started.append(ticker)
+            await callbacks["progress_callback"]("Aggregating data...")
+            await gate.release.wait()
+            if gate.error is not None:
+                raise gate.error
+            self.db.set_cached_advisory(ticker, "2026-09-13", json.dumps(ADVISORY))
+            return dict(ADVISORY)
+
+    monkeypatch.setattr("api.server.StockPredictor", FakePredictor)
+    server._running_debates.clear()
+    yield gate
+    server._running_debates.clear()
+
+
+class TestDebateStreamOwnership:
+    """
+    A debate is up to five paid model turns. It used to be cancelled with the
+    stream that started it, so a page refresh discarded everything already paid
+    for and cached nothing, and two tabs on one ticker each ran their own.
+    """
+
+    async def test_disconnect_does_not_cancel_the_debate(self, debate):
+        db = _db()
+        response = await server.predict_stream(_Request(db), "nvda", refresh=True)
+        stream = response.body_iterator
+
+        assert _parse(await anext(stream)) == ("agent_update", "Aggregating data...")
+        running = server._running_debates["NVDA"]
+
+        # The page is refreshed mid-debate: the server stops iterating the
+        # stream, which runs its cleanup.
+        await stream.aclose()
+        await asyncio.sleep(0.01)
+        assert not running.done()
+
+        debate.release.set()
+        assert await asyncio.wait_for(running, timeout=5) == ADVISORY
+        db.set_cached_advisory.assert_called_once()
+
+        await asyncio.sleep(0)
+        assert "NVDA" not in server._running_debates
+
+    @pytest.mark.parametrize("refresh", [False, True])
+    async def test_concurrent_request_attaches_instead_of_starting_another(
+        self, debate, refresh
+    ):
+        # An older advisory is cached, so a refresh=False request that ignored
+        # the running debate would visibly serve the stale one.
+        db = _db(cached={**ADVISORY, "final_advisory": "stale", "_cache_date": "2026-09-10"})
+
+        first = await server.predict_stream(_Request(db), "NVDA", refresh=True)
+        first_drain = asyncio.create_task(_drain(first))
+        second = await server.predict_stream(_Request(db), "NVDA", refresh=refresh)
+        second_drain = asyncio.create_task(_drain(second))
+
+        await asyncio.sleep(0.01)
+        debate.release.set()
+        first_events = await asyncio.wait_for(first_drain, timeout=5)
+        second_events = await asyncio.wait_for(second_drain, timeout=5)
+
+        assert debate.started == ["NVDA"]
+        db.get_cached_advisory.assert_not_called()
+
+        event, data = second_events[0]
+        assert event == "agent_update"
+        assert "already running" in data
+
+        for events in (first_events, second_events):
+            verdict = json.loads(next(d for e, d in events if e == "verdict"))
+            assert set(verdict) == VERDICT_KEYS
+            assert verdict["final_advisory"] == "Hold into the print."
+            assert verdict["advisory_direction"] == "HOLD"
+            assert events[-1] == ("done", "")
+
+        # The attached client gets the finished debate through the replay path.
+        assert any(e == "debate_chunk" for e, _ in second_events)
+        await asyncio.sleep(0)
+        assert "NVDA" not in server._running_debates
+
+    async def test_failed_debate_reports_the_error_and_leaves_the_registry(self, debate):
+        debate.error = RuntimeError("upstream 502")
+        db = _db()
+        response = await server.predict_stream(_Request(db), "NVDA", refresh=True)
+        drain = asyncio.create_task(_drain(response))
+
+        await asyncio.sleep(0.01)
+        assert "NVDA" in server._running_debates
+
+        debate.release.set()
+        events = await asyncio.wait_for(drain, timeout=5)
+
+        assert ("error", "upstream 502") in events
+        db.set_cached_advisory.assert_not_called()
+        await asyncio.sleep(0)
+        assert "NVDA" not in server._running_debates
+
+    async def test_a_finished_debate_does_not_block_the_next_one(self, debate):
+        db = _db()
+        debate.release.set()
+        first = await server.predict_stream(_Request(db), "NVDA", refresh=True)
+        await asyncio.wait_for(_drain(first), timeout=5)
+        await asyncio.sleep(0)
+
+        second = await server.predict_stream(_Request(db), "NVDA", refresh=True)
+        await asyncio.wait_for(_drain(second), timeout=5)
+
+        assert debate.started == ["NVDA", "NVDA"]

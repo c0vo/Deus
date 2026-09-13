@@ -948,12 +948,151 @@ async def get_predict_history_by_date(request: Request, ticker: str, date: str):
         except Exception:
             raise HTTPException(status_code=500, detail="Error decoding cached advisory")
 
+
+# Debates running in this process, keyed by ticker.
+#
+# A debate is up to four xhigh Bull/Bear turns plus the trader, and it used to
+# belong to the request that started it: the stream's cleanup cancelled it on
+# disconnect, so refreshing the page mid-debate threw away every turn already
+# paid for and cached nothing, and the next request paid again in full. Nothing
+# stopped two tabs from debating the same ticker at once either.
+#
+# The task is owned here now. The strong reference matters — the event loop only
+# holds weak ones, so a task nobody references can be collected mid-debate — and
+# each task removes its own entry when it finishes, however it finishes. A
+# request only ever waits on a debate; it never owns one.
+_running_debates: dict[str, asyncio.Task] = {}
+
+
+def _running_debate(ticker: str) -> Optional[asyncio.Task]:
+    """The debate in flight for `ticker`, or None."""
+    task = _running_debates.get(ticker)
+    if task is None or task.done():
+        return None
+    return task
+
+
+def _start_debate(db: Database, ticker: str, **callbacks) -> asyncio.Task:
+    """Start a debate that outlives the client that asked for it.
+
+    predict_with_agents writes the predictions_cache row itself before it
+    returns, so a debate that runs to completion is cached whether or not
+    anyone is still listening. The callbacks still point at the first client's
+    queue; once that client is gone they fill a queue nobody reads, which is
+    garbage once the debate finishes.
+    """
+    async def run() -> dict:
+        return await StockPredictor(db).predict_with_agents(ticker, **callbacks)
+
+    task = asyncio.create_task(run(), name=f"debate:{ticker}")
+    _running_debates[ticker] = task
+
+    def finished(done: asyncio.Task) -> None:
+        if _running_debates.get(ticker) is done:
+            del _running_debates[ticker]
+        if done.cancelled():
+            log.warning("api.debate_cancelled", ticker=ticker)
+            return
+        # Logged here, once per debate, because every client may already have
+        # left, and then nothing else would ever retrieve the exception.
+        error = done.exception()
+        if error is not None:
+            log.error("api.debate_failed", ticker=ticker, error=str(error),
+                      exc_info=error)
+
+    task.add_done_callback(finished)
+    return task
+
+
+def _verdict_payload(ticker: str, state: dict) -> dict:
+    """The `verdict` event, identical for a live debate and a replayed one."""
+    debate_history = state.get("debate_history", [])
+    ml_prediction = state.get("ml_prediction") or {}
+    return {
+        "ticker": ticker,
+        # `predicted_direction`/`confidence` are the GradientBoosting baseline
+        # and go stale to UNKNOWN/0.0 whenever no model exists for the horizon.
+        # The trade call the debate actually reached is `advisory_*`, which is
+        # what the arena headlines. Advisories cached before the trader started
+        # reporting its own call have neither field.
+        "predicted_direction": ml_prediction.get("predicted_direction", "UNKNOWN"),
+        "confidence": ml_prediction.get("confidence", 0.0),
+        "advisory_direction": state.get("trader_direction"),
+        "advisory_conviction": state.get("trader_conviction"),
+        "final_advisory": state.get("final_advisory"),
+        "bull_report": "\n\n".join(line[6:] for line in debate_history if line.startswith("Bull: ")),
+        "bear_report": "\n\n".join(line[6:] for line in debate_history if line.startswith("Bear: ")),
+        "ml_prediction": state.get("ml_prediction"),
+        "debate_history": debate_history,
+        "executive_summary": state.get("executive_summary"),
+    }
+
+
+async def _replay_advisory(queue: asyncio.Queue, ticker: str, cached: dict) -> None:
+    """Stream a finished advisory back as debate chunks, then its verdict."""
+    await queue.put({"event": "agent_update", "data": f"Loading cached debate advisory from {cached.get('_cache_date', 'database')}..."})
+    await asyncio.sleep(0.3)
+
+    debate_history = cached.get("debate_history", [])
+    bull_count = 0
+    bear_count = 0
+    for line in debate_history:
+        if line.startswith("Bull: "):
+            speaker = "Bull"
+            text = line[6:]
+            bull_count += 1
+            round_num = bull_count
+        elif line.startswith("Bear: "):
+            speaker = "Bear"
+            text = line[6:]
+            bear_count += 1
+            round_num = bear_count
+        else:
+            continue
+
+        await queue.put({"event": "agent_update", "data": f"Retrieving {speaker} Round {round_num} argument..."})
+        words = text.split(" ")
+        chunk_size = 5
+        for i in range(0, len(words), chunk_size):
+            chunk = " ".join(words[i:i+chunk_size]) + (" " if i + chunk_size < len(words) else "")
+            await queue.put({
+                "event": "debate_chunk",
+                "data": json.dumps({"speaker": speaker, "round": round_num, "text": chunk})
+            })
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)
+
+    await queue.put({"event": "verdict", "data": json.dumps(_verdict_payload(ticker, cached))})
+
+
+async def _run_feed(queue: asyncio.Queue, feed) -> None:
+    """Run one client's side of a debate stream and always close it with `done`.
+
+    `feed` is a zero-argument coroutine function. Cancelling this task is what a
+    disconnect does, and it ends that client's stream only: a running debate is
+    awaited through asyncio.shield, so it carries on and caches its result.
+    """
+    try:
+        await feed()
+    except asyncio.CancelledError:
+        pass  # the client disconnected
+    except Exception as e:
+        await queue.put({"event": "error", "data": str(e)})
+    finally:
+        await queue.put({"event": "done", "data": ""})
+
+
 @router.get("/api/predict/{ticker}/stream")
 async def predict_stream(request: Request, ticker: str, refresh: bool = False):
+    """Stream a Bull/Bear debate: cached replay, attach to a running one, or live.
+
+    A debate already running for the ticker is never started twice, with or
+    without `refresh`: the request waits for it and replays the result.
+    """
     ticker = ticker.upper().strip()
     db = getattr(request.app.state, "db", None) or Database()
     queue = asyncio.Queue()
-    background_task = None  # track for cleanup on disconnect
+    background_task = None  # this client's feed, cancelled on disconnect
 
     async def event_generator():
         try:
@@ -973,80 +1112,39 @@ async def predict_stream(request: Request, ticker: str, refresh: bool = False):
         except asyncio.CancelledError:
             raise
         finally:
-            # Cancel any running background task on generator exit
+            # Stops this client's feed and nothing else. The debate itself is
+            # owned by _running_debates and runs to completion regardless.
             nonlocal background_task
             if background_task and not background_task.done():
                 background_task.cancel()
 
-    # 1. Check cache first if refresh is False
-    if not refresh:
-        cached = db.get_cached_advisory(ticker, days=5)
+    running = _running_debate(ticker)
+
+    # 1. Cached replay, if refresh is False and nothing is running
+    if running is None and not refresh:
+        cached = await asyncio.to_thread(db.get_cached_advisory, ticker, days=5)
         if cached:
-            async def run_cached_prediction():
-                try:
-                    await queue.put({"event": "agent_update", "data": f"Loading cached debate advisory from {cached.get('_cache_date', 'database')}..."})
-                    await asyncio.sleep(0.3)
+            async def replay_cached():
+                await _replay_advisory(queue, ticker, cached)
 
-                    debate_history = cached.get("debate_history", [])
-                    bull_count = 0
-                    bear_count = 0
-                    for line in debate_history:
-                        if line.startswith("Bull: "):
-                            speaker = "Bull"
-                            text = line[6:]
-                            bull_count += 1
-                            round_num = bull_count
-                        elif line.startswith("Bear: "):
-                            speaker = "Bear"
-                            text = line[6:]
-                            bear_count += 1
-                            round_num = bear_count
-                        else:
-                            continue
-
-                        await queue.put({"event": "agent_update", "data": f"Retrieving {speaker} Round {round_num} argument..."})
-                        words = text.split(" ")
-                        chunk_size = 5
-                        for i in range(0, len(words), chunk_size):
-                            chunk = " ".join(words[i:i+chunk_size]) + (" " if i + chunk_size < len(words) else "")
-                            await queue.put({
-                                "event": "debate_chunk",
-                                "data": json.dumps({"speaker": speaker, "round": round_num, "text": chunk})
-                            })
-                            await asyncio.sleep(0.01)
-                        await asyncio.sleep(0.1)
-
-                    bull_report = "\n\n".join([line[6:] for line in debate_history if line.startswith("Bull: ")])
-                    bear_report = "\n\n".join([line[6:] for line in debate_history if line.startswith("Bear: ")])
-
-                    verdict_data = {
-                        "ticker": ticker,
-                        # The ML baseline, not the trade call — see the live
-                        # path below. Advisories cached before the trader
-                        # started reporting its own call have neither field.
-                        "predicted_direction": cached.get("ml_prediction", {}).get("predicted_direction", "UNKNOWN"),
-                        "confidence": cached.get("ml_prediction", {}).get("confidence", 0.0),
-                        "advisory_direction": cached.get("trader_direction"),
-                        "advisory_conviction": cached.get("trader_conviction"),
-                        "final_advisory": cached.get("final_advisory"),
-                        "bull_report": bull_report,
-                        "bear_report": bear_report,
-                        "ml_prediction": cached.get("ml_prediction"),
-                        "debate_history": debate_history,
-                        "executive_summary": cached.get("executive_summary")
-                    }
-                    await queue.put({"event": "verdict", "data": json.dumps(verdict_data)})
-                except asyncio.CancelledError:
-                    pass  # cancelled due to client disconnect
-                except Exception as e:
-                    await queue.put({"event": "error", "data": str(e)})
-                finally:
-                    await queue.put({"event": "done", "data": ""})
-
-            background_task = asyncio.create_task(run_cached_prediction())
+            background_task = asyncio.create_task(_run_feed(queue, replay_cached))
             return StreamingResponse(event_generator(), media_type="text/event-stream")
+        # The cache read yielded the event loop, so another request may have
+        # started a debate for this ticker in the meantime.
+        running = _running_debate(ticker)
 
-    # 2. Live prediction if refresh is True or no cache exists
+    # 2. A debate for this ticker is already running: wait for it, then replay
+    if running is not None:
+        async def wait_then_replay():
+            await queue.put({"event": "agent_update", "data": f"A debate for {ticker} is already running. Waiting for it to finish..."})
+            state = await asyncio.shield(running)
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            await _replay_advisory(queue, ticker, {**state, "_cache_date": today})
+
+        background_task = asyncio.create_task(_run_feed(queue, wait_then_replay))
+        return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+    # 3. Live prediction if refresh is True or no cache exists
     async def progress_callback(msg: str):
         await queue.put({"event": "agent_update", "data": msg})
 
@@ -1062,48 +1160,20 @@ async def predict_stream(request: Request, ticker: str, refresh: bool = False):
             "data": json.dumps(data)
         })
 
-    async def run_prediction():
-        try:
-            predictor = StockPredictor(db)
-            result = await predictor.predict_with_agents(
-                ticker,
-                progress_callback=progress_callback,
-                debate_chunk_callback=debate_chunk_callback,
-                research_callback=research_callback
-            )
+    # No await between the registry check above and this registration, so two
+    # requests cannot both find the registry empty and both start a debate.
+    debate = _start_debate(
+        db, ticker,
+        progress_callback=progress_callback,
+        debate_chunk_callback=debate_chunk_callback,
+        research_callback=research_callback,
+    )
 
-            debate_history = result.get("debate_history", [])
-            bull_report = "\n\n".join([line[6:] for line in debate_history if line.startswith("Bull: ")])
-            bear_report = "\n\n".join([line[6:] for line in debate_history if line.startswith("Bear: ")])
+    async def send_verdict():
+        state = await asyncio.shield(debate)
+        await queue.put({"event": "verdict", "data": json.dumps(_verdict_payload(ticker, state))})
 
-            verdict_data = {
-                "ticker": ticker,
-                # `predicted_direction`/`confidence` are the GradientBoosting
-                # baseline and go stale to UNKNOWN/0.0 whenever no model exists
-                # for the horizon. The trade call the debate actually reached
-                # is `advisory_*`, which is what the arena headlines.
-                "predicted_direction": result.get("ml_prediction", {}).get("predicted_direction", "UNKNOWN"),
-                "confidence": result.get("ml_prediction", {}).get("confidence", 0.0),
-                "advisory_direction": result.get("trader_direction"),
-                "advisory_conviction": result.get("trader_conviction"),
-                "final_advisory": result.get("final_advisory"),
-                "bull_report": bull_report,
-                "bear_report": bear_report,
-                "ml_prediction": result.get("ml_prediction"),
-                "debate_history": debate_history,
-                "executive_summary": result.get("executive_summary")
-            }
-            await queue.put({"event": "verdict", "data": json.dumps(verdict_data)})
-        except asyncio.CancelledError:
-            pass  # cancelled due to client disconnect
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            await queue.put({"event": "error", "data": str(e)})
-        finally:
-            await queue.put({"event": "done", "data": ""})
-
-    background_task = asyncio.create_task(run_prediction())
+    background_task = asyncio.create_task(_run_feed(queue, send_verdict))
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
