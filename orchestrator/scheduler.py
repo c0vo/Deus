@@ -500,6 +500,25 @@ class PipelineOrchestrator:
                     )
                     return status
 
+                # The Reddit lane is optional in a way the news lane is not: with
+                # no Reddit slug, news is classified as normal and Reddit rows
+                # wait for one. Reported here, once per run, rather than by the
+                # classifier once per chunk — and it decides the candidate query
+                # below, because rows the run cannot act on would otherwise take
+                # its slots from news on every run.
+                reddit_configured = self.classifier.is_reddit_configured()
+                if not reddit_configured:
+                    log.warning(
+                        "orchestrator.classify_backlog_reddit_unconfigured",
+                        settings_checked=[
+                            "MODEL_REDDIT_SENTIMENT", "MODEL_REDDIT_SENTIMENT_FALLBACK",
+                        ],
+                        impact="Reddit posts stay unclassified and out of the "
+                               "candidate query; news is classified as normal",
+                        hint="set MODEL_REDDIT_SENTIMENT (or its fallback) in .env "
+                             "and restart the worker",
+                    )
+
                 # Give the rows the old write-off semantics killed one more
                 # chance. Once, ever, guarded by a marker.
                 status["error_requeued"] = await self._requeue_error_articles_once()
@@ -524,10 +543,13 @@ class PipelineOrchestrator:
                     settings.classify_per_run_limit,
                     settings.classify_max_attempts,
                     settings.classify_max_age_days,
+                    exclude_reddit=not reddit_configured,
                 )
                 status["candidates"] = len(rows)
                 if rows:
-                    await self._classify_candidates(rows, status, trigger)
+                    await self._classify_candidates(
+                        rows, status, trigger, reddit_configured=reddit_configured,
+                    )
                 else:
                     log.info(
                         "orchestrator.classify_backlog_empty",
@@ -569,7 +591,8 @@ class PipelineOrchestrator:
             return status
 
     async def _classify_candidates(
-        self, rows: list[dict], status: dict, trigger: str
+        self, rows: list[dict], status: dict, trigger: str,
+        *, reddit_configured: bool = True,
     ) -> None:
         """
         Dedup, chunk and classify one run's candidates, updating `status`.
@@ -579,6 +602,16 @@ class PipelineOrchestrator:
         anything to classify.
         """
         articles = [self.db.row_to_article(r) for r in rows]
+
+        if not reddit_configured:
+            # The candidate query already leaves these out; this is the half of
+            # the rule that guards the attempt counter rather than the slots.
+            # `classify_batch` hands an unconfigured-lane Reddit row back
+            # untouched, and `_persist_classifications` reads untouched as "the
+            # model skipped it" — an attempt counted, and 'error' at the cap, for
+            # a row nothing was ever asked about. Filtering on the classifier's
+            # own predicate keeps that true even if the SQL and it drift apart.
+            articles = [a for a in articles if not ArticleClassifier._is_reddit(a)]
 
         # Dedup first, as its own pass: it makes no LLM calls — it reads the
         # article's own embedding against older persisted rows — so an absorbed

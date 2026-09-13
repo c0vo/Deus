@@ -604,6 +604,82 @@ class TestClassifyBatch:
         )
         assert classifier.is_configured() is True
 
+    def test_is_reddit_configured_needs_only_one_slug(self, classifier, monkeypatch):
+        monkeypatch.setattr("pipeline.classifier.settings.model_reddit_sentiment", "")
+        monkeypatch.setattr(
+            "pipeline.classifier.settings.model_reddit_sentiment_fallback", ""
+        )
+        assert classifier.is_reddit_configured() is False
+
+        monkeypatch.setattr(
+            "pipeline.classifier.settings.model_reddit_sentiment_fallback", "test/fallback"
+        )
+        assert classifier.is_reddit_configured() is True
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_reddit_lane_does_not_cost_the_news_half(
+        self, classifier, reddit_article, monkeypatch,
+    ):
+        """The news results in a mixed batch are the ones that were paid for.
+
+        The news group is classified first. With no Reddit slug the Reddit group
+        used to raise `ClassifierNotConfigured` straight after, the scheduler never
+        reached persistence, and the same news rows were re-sent — and re-billed —
+        on every run.
+        """
+        monkeypatch.setattr("pipeline.classifier.settings.model_reddit_sentiment", "")
+        monkeypatch.setattr(
+            "pipeline.classifier.settings.model_reddit_sentiment_fallback", ""
+        )
+        articles = self._articles() + [reddit_article]
+        payload = {"items": [
+            self._result("item_1", 0.1),
+            self._result("item_2", 0.2),
+            self._result("item_3", 0.3),
+        ]}
+        classifier.complete.return_value = make_response(json.dumps(payload))
+
+        result = await classifier.classify_batch(articles)
+
+        by_id = {a.id: a for a in result}
+        assert [by_id[f"batch_{i}"].event_type for i in range(3)] == ["earnings"] * 3
+        # One call, for news only: the Reddit post was never put in a prompt.
+        assert classifier.complete.await_count == 1
+        assert reddit_article.headline not in classifier.complete.await_args.kwargs["prompt"]
+        assert classifier.complete.await_args.kwargs["exact_items"] == 3
+        # And it is untouched, so it waits for a slug rather than being written off.
+        assert by_id[reddit_article.id].event_type is None
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_reddit_lane_does_not_mark_reddit_noise(
+        self, classifier, noise_article, monkeypatch,
+    ):
+        """No verdict of any kind while the lane is unset — not even the free one."""
+        monkeypatch.setattr("pipeline.classifier.settings.model_reddit_sentiment", "")
+        monkeypatch.setattr(
+            "pipeline.classifier.settings.model_reddit_sentiment_fallback", ""
+        )
+
+        result = await classifier.classify_batch([noise_article])
+
+        assert result[0].event_type is None
+        classifier.complete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_news_lane_still_raises_beside_reddit_rows(
+        self, classifier, reddit_article, monkeypatch,
+    ):
+        """The news lane keeps its old contract exactly: raise, call nothing."""
+        from pipeline.classifier import ClassifierNotConfigured
+
+        monkeypatch.setattr("pipeline.classifier.settings.model_classifier", "")
+        monkeypatch.setattr("pipeline.classifier.settings.model_classifier_fallback", "")
+        classifier.model_name = ""
+
+        with pytest.raises(ClassifierNotConfigured):
+            await classifier.classify_batch(self._articles() + [reddit_article])
+        classifier.complete.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_results_map_by_label_not_position(self, classifier):
         """A reordered response must still land on the right articles.

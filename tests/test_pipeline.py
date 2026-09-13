@@ -26,6 +26,15 @@ def _article_row(article_id: str, url: str) -> dict:
     }
 
 
+def _reddit_row(article_id: str, url: str) -> dict:
+    """A row the classifier routes to its Reddit lane."""
+    return {
+        **_article_row(article_id, url),
+        "source_name": "reddit_wallstreetbets",
+        "source_type": "social",
+    }
+
+
 def _build_orchestrator(db_mock: MagicMock) -> PipelineOrchestrator:
     """Wire up an orchestrator whose external calls are all stubbed out."""
     orchestrator = PipelineOrchestrator(db=db_mock)
@@ -56,8 +65,9 @@ def _build_orchestrator(db_mock: MagicMock) -> PipelineOrchestrator:
     orchestrator.classifier = MagicMock()
     orchestrator.classifier.classify = AsyncMock(return_value=classified)
     # The backlog job refuses to do anything when no model slug is set, so the
-    # default stub says one is.
+    # default stub says one is — for the Reddit lane too.
     orchestrator.classifier.is_configured = MagicMock(return_value=True)
+    orchestrator.classifier.is_reddit_configured = MagicMock(return_value=True)
 
     # Classification is batched: the scheduler hands a whole chunk to
     # classify_batch, which labels the articles in place and returns them.
@@ -367,6 +377,97 @@ async def test_classifier_not_configured_exception_aborts_without_stamping():
     assert not db_mock.record_classification_failure.called
 
 
+@pytest.mark.asyncio
+async def test_reddit_rows_wait_uncounted_while_their_lane_is_unconfigured():
+    """News is classified and persisted; Reddit rows are neither sent nor counted.
+
+    The stub below behaves like the real classifier with no Reddit slug: it hands
+    Reddit rows back untouched. `_persist_classifications` reads untouched as "the
+    model skipped it", so a Reddit row that reached a chunk would spend an attempt
+    every run and be stamped 'error' at the cap, for a call never made.
+    """
+    from pipeline.classifier import ArticleClassifier
+
+    rows = [_article_row("A", "1"), _reddit_row("R", "2"), _article_row("B", "3")]
+    db_mock = _make_db_mock(rows)
+    db_mock.find_duplicate.return_value = None
+    db_mock.record_classification_failure.side_effect = (
+        lambda ids: {article_id: 3 for article_id in ids}
+    )
+
+    orchestrator = _build_orchestrator(db_mock)
+    orchestrator.classifier.is_reddit_configured = MagicMock(return_value=False)
+
+    async def _news_only(chunk):
+        for article in chunk:
+            if ArticleClassifier._is_reddit(article):
+                continue
+            article.event_type = "earnings"
+            article.sentiment_score = 0.5
+            article.urgency = "low"
+            article.suggested_direction = "bullish"
+            article.affected_sectors = []
+            article.affected_tickers = []
+            article.classification_summary = "test"
+        return chunk
+
+    orchestrator.classifier.classify_batch = AsyncMock(side_effect=_news_only)
+
+    status = await _run_backlog(orchestrator)
+
+    sent = {
+        article.id
+        for call in orchestrator.classifier.classify_batch.call_args_list
+        for article in call.args[0]
+    }
+    assert sent == {"A", "B"}
+    persisted = {
+        call.kwargs["article_id"]
+        for call in db_mock.update_classification.call_args_list
+    }
+    assert persisted == {"A", "B"}
+    assert not db_mock.record_classification_failure.called
+    assert not _error_stamps(db_mock)
+    assert status["classified"] == 2
+    assert status["failed"] == 0
+    assert status["configured"] is True
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_reddit_lane_is_reported_once_and_narrows_the_query(
+    monkeypatch,
+):
+    from config.settings import settings
+
+    # One article per chunk, so a report made per chunk would show up three times.
+    monkeypatch.setattr(settings, "classify_batch_size", 1)
+
+    db_mock = _make_db_mock()
+    db_mock.find_duplicate.return_value = None
+
+    orchestrator = _build_orchestrator(db_mock)
+    orchestrator.classifier.is_reddit_configured = MagicMock(return_value=False)
+
+    with patch("orchestrator.scheduler.log.warning") as warning:
+        status = await _run_backlog(orchestrator)
+
+    reports = [
+        call for call in warning.call_args_list
+        if call.args and call.args[0] == "orchestrator.classify_backlog_reddit_unconfigured"
+    ]
+    assert len(reports) == 1
+    assert reports[0].kwargs["settings_checked"] == [
+        "MODEL_REDDIT_SENTIMENT", "MODEL_REDDIT_SENTIMENT_FALLBACK",
+    ]
+    # Rows the run cannot act on must not take the slots news could use.
+    assert db_mock.get_classification_candidates.call_args.kwargs == {
+        "exclude_reddit": True,
+    }
+    # The news lane is configured and says so.
+    assert status["configured"] is True
+    assert status["classified"] == 3
+
+
 # ── Bounds ──────────────────────────────────────────────────────────────────
 
 
@@ -385,6 +486,10 @@ async def test_candidates_are_requested_with_the_configured_bounds():
         settings.classify_max_attempts,
         settings.classify_max_age_days,
     )
+    # Both lanes configured, so nothing is left out of the query.
+    assert db_mock.get_classification_candidates.call_args.kwargs == {
+        "exclude_reddit": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -621,7 +726,7 @@ async def test_attempts_are_reset_before_candidates_are_selected():
     )
     db_mock.mark_stale_unclassified.side_effect = lambda *a: order.append("stale") or 0
     db_mock.get_classification_candidates.side_effect = (
-        lambda *a: order.append("candidates") or []
+        lambda *a, **k: order.append("candidates") or []
     )
 
     orchestrator = _build_orchestrator(db_mock)

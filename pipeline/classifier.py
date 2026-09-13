@@ -333,9 +333,25 @@ class ArticleClassifier:
 
         Reddit slugs are deliberately not part of this: Reddit is a minority of
         the intake and its own lane, so an unset MODEL_REDDIT_SENTIMENT should
-        not stop news from being classified.
+        not stop news from being classified. `is_reddit_configured` answers for
+        that lane.
         """
         return bool(settings.model_classifier or settings.model_classifier_fallback)
+
+    def is_reddit_configured(self) -> bool:
+        """
+        Whether a Reddit post can be classified at all.
+
+        Leaving both Reddit slugs unset is a supported configuration, not an
+        outage: news is classified as normal and Reddit rows wait, unclassified,
+        for a slug. `classify_batch` checks it so an unconfigured lane skips its
+        call instead of raising, and the backlog job checks it to keep those rows
+        out of its candidate slots. Read live from `settings`, like
+        `is_configured`.
+        """
+        return bool(
+            settings.model_reddit_sentiment or settings.model_reddit_sentiment_fallback
+        )
 
     def should_classify(self, article: NewsArticle) -> bool:
         """Determines if the article has enough financial relevance to warrant classification."""
@@ -437,6 +453,8 @@ class ArticleClassifier:
 
         Returns the same list, modified in place. Articles the model did not
         answer for are returned untouched — the caller decides what that means.
+        So are Reddit posts while the Reddit lane has no slug, and those are not
+        a failure of any kind: nothing was asked about them.
         """
         if not articles:
             return []
@@ -445,8 +463,25 @@ class ArticleClassifier:
             log.warning("classifier.skipped", reason="No LLM configured", count=len(articles))
             return articles
 
+        candidates = articles
+        if not self.is_reddit_configured():
+            # Held back before the noise heuristic, not after: with no Reddit slug
+            # a Reddit post gets no verdict of any kind until one is set. The call
+            # used to be made regardless — the news group below went first, the
+            # Reddit group then raised `ClassifierNotConfigured`, and the news
+            # results that had just been paid for were discarded with the
+            # exception, never persisted and never counted, so the same rows were
+            # sent and billed again on every run. The backlog job reports the
+            # unconfigured lane once per run, so this stays at debug.
+            candidates = [a for a in articles if not self._is_reddit(a)]
+            if len(candidates) < len(articles):
+                log.debug(
+                    "classifier.reddit_lane_unconfigured_held_back",
+                    count=len(articles) - len(candidates),
+                )
+
         to_send: list[NewsArticle] = []
-        for article in articles:
+        for article in candidates:
             if self.should_classify(article):
                 to_send.append(article)
             else:

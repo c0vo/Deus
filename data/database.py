@@ -1305,6 +1305,7 @@ class Database:
         limit: int = 60,
         max_attempts: int = 3,
         max_age_days: int = 30,
+        exclude_reddit: bool = False,
     ) -> list[dict]:
         """
         Rows the dedicated classify job should spend LLM calls on.
@@ -1322,8 +1323,16 @@ class Database:
           backlog look unclearable. `mark_stale_unclassified` retires those.
         - ``duplicate_of IS NULL`` — a flagged duplicate already inherited its
           canonical row's verdict.
+
+        ``exclude_reddit`` is set while the Reddit lane has no model slug. Those
+        rows cannot be classified and must not be written off, so they stay
+        NULL — and a NULL row the job cannot act on would otherwise take a slot
+        in every run, newest first, ahead of news it can.
         """
         cutoff = f"-{int(max_age_days)} days"
+        # The Reddit clause is switched by its own placeholder (0 leaves every
+        # row in) and otherwise matches `ArticleClassifier._is_reddit` exactly:
+        # GLOB is case-sensitive like str.startswith, where LIKE is not.
         with self.connection() as conn:
             rows = conn.execute(
                 """
@@ -1332,9 +1341,11 @@ class Database:
                   AND duplicate_of IS NULL
                   AND COALESCE(classification_attempts, 0) < ?
                   AND published_at >= datetime('now', ?)
+                  AND NOT (? AND source_type = 'social'
+                           AND source_name GLOB 'reddit*')
                 ORDER BY published_at DESC LIMIT ?
                 """,
-                (int(max_attempts), cutoff, int(limit)),
+                (int(max_attempts), cutoff, int(bool(exclude_reddit)), int(limit)),
             ).fetchall()
             return [dict(row) for row in rows]
 

@@ -827,7 +827,8 @@ class TestClassificationQueue:
 
     @staticmethod
     def _insert(db, article_id, *, days_old=0, event_type=None, attempts=0,
-                duplicate_of=None, summary=None):
+                duplicate_of=None, summary=None, source_name="test",
+                source_type="rss"):
         published = datetime.now(timezone.utc) - timedelta(days=days_old)
         with db.connection() as conn:
             conn.execute(
@@ -836,11 +837,12 @@ class TestClassificationQueue:
                     id, headline, summary, content_hash, source_name, source_type,
                     url, published_at, fetched_at, event_type,
                     classification_attempts, duplicate_of, classification_summary
-                ) VALUES (?, ?, ?, ?, 'test', 'rss', ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     article_id, f"Headline {article_id}", "Summary",
-                    f"hash_{article_id}", f"https://example.com/{article_id}",
+                    f"hash_{article_id}", source_name, source_type,
+                    f"https://example.com/{article_id}",
                     published.isoformat(), published.isoformat(),
                     event_type, attempts, duplicate_of, summary,
                 ),
@@ -890,6 +892,28 @@ class TestClassificationQueue:
             )
         }
         assert ids == {"one_try", "two_tries"}
+
+    def test_candidates_can_leave_reddit_rows_out(self, db):
+        """
+        While the Reddit lane has no slug its rows stay NULL, and left in the
+        query they would take the newest slots in every run ahead of news.
+        """
+        self._insert(db, "news")
+        self._insert(db, "wsb", source_name="reddit_wallstreetbets", source_type="social")
+        # Exactly the rows ArticleClassifier._is_reddit routes to the Reddit
+        # lane: social *and* a case-sensitive "reddit" prefix.
+        self._insert(db, "reddit_rss", source_name="reddit_digest", source_type="rss")
+        self._insert(db, "shouty", source_name="REDDIT_mirror", source_type="social")
+
+        def ids(**kwargs):
+            return {
+                r["id"] for r in db.get_classification_candidates(
+                    limit=50, max_attempts=3, max_age_days=30, **kwargs
+                )
+            }
+
+        assert ids() == {"news", "wsb", "reddit_rss", "shouty"}
+        assert ids(exclude_reddit=True) == {"news", "reddit_rss", "shouty"}
 
     def test_record_failure_increments_and_returns_new_counts(self, db):
         self._insert(db, "a", attempts=1)
