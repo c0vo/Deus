@@ -314,6 +314,17 @@ JSON Schema:
 }}
 """
 
+# How much of a Reddit thread reaches a classification prompt. The scraper keeps
+# up to 20 comments at full length and every one of them went into the prompt, so
+# a busy thread cost more input tokens than the post it hangs off, for replies
+# far enough down that they seldom move the verdict. The cap lives here rather
+# than at fetch time because the free noise heuristics — `should_classify` and
+# the aggregator's `_has_financial_content` — read every stored comment, and a
+# cashtag in the twelfth reply is still worth an LLM call to them.
+REDDIT_PROMPT_MAX_COMMENTS = 8
+REDDIT_PROMPT_MAX_COMMENT_CHARS = 300
+
+
 class ArticleClassifier:
     """Classifies NewsArticles with MODEL_CLASSIFIER, falling back to its pair."""
 
@@ -399,13 +410,18 @@ class ArticleClassifier:
 
     @staticmethod
     def _reddit_comments_text(article: NewsArticle) -> str:
-        comments_data = article.raw_data.get("comments", [])
-        comments = [
-            f"- {c.get('author', '[unknown]')}: {c.get('body', '')}"
-            for c in comments_data
-            if isinstance(c, dict) and c.get("body")
-        ]
-        return "\n".join(comments) if comments else "(No comments)"
+        """The top of the thread for a prompt, capped by the REDDIT_PROMPT_* limits."""
+        lines: list[str] = []
+        for c in article.raw_data.get("comments", []):
+            if not (isinstance(c, dict) and c.get("body")):
+                continue
+            body = str(c["body"])
+            if len(body) > REDDIT_PROMPT_MAX_COMMENT_CHARS:
+                body = body[:REDDIT_PROMPT_MAX_COMMENT_CHARS - 1].rstrip() + "…"
+            lines.append(f"- {c.get('author', '[unknown]')}: {body}")
+            if len(lines) == REDDIT_PROMPT_MAX_COMMENTS:
+                break
+        return "\n".join(lines) if lines else "(No comments)"
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:

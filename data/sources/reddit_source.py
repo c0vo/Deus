@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import calendar
+import html
 from datetime import datetime, timezone
 from typing import Optional
 import re
@@ -27,6 +28,29 @@ log = get_logger(__name__)
 
 # Respectful User-Agent
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Deus/2.0"
+
+# Reddit's RSS hands over the post body as HTML: Reddit's own wrapper markup,
+# entity-escaped text, and a "submitted by /u/name [link] [comments]" footer on
+# every entry, link posts included. Stored as it came, all of that went into
+# each classifier prompt for the post, and the 1,500-character cap counted
+# markup as if it were text. Tags are stripped as rss_source strips them, but
+# replaced with a space: a Reddit body is paragraphs, and deleting a </p><p>
+# outright glues the last word of one to the first of the next.
+_HTML_TAG = re.compile(r"<[^>]+>")
+_SUBMITTED_BY_FOOTER = re.compile(
+    r"\s*submitted by\s+/u/[\w-]+(?:\s+to\s+r/[\w-]+)?\s*\[link\]\s*\[comments\]\s*$"
+)
+
+
+def _plain_summary(raw: str) -> str:
+    """A Reddit RSS summary as plain text, minus the submitted-by footer."""
+    # Tags before entities: unescaping first would turn an escaped "<" in the
+    # post text into the start of a tag, and the tag pattern would eat the text
+    # after it.
+    text = html.unescape(_HTML_TAG.sub(" ", raw))
+    text = " ".join(text.split())
+    return _SUBMITTED_BY_FOOTER.sub("", text)
+
 
 class RedditSource(NewsSource):
     """
@@ -113,7 +137,8 @@ class RedditSource(NewsSource):
             else:
                 dt = datetime.now(timezone.utc)
 
-            summary = entry.get("summary", "")[:1500]
+            # Cleaned before truncating, so the cap is spent on the post.
+            summary = _plain_summary(entry.get("summary", ""))[:1500]
 
             return NewsArticle(
                 id=article_id,
