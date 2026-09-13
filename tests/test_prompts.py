@@ -17,7 +17,11 @@ from pipeline.grounded_answer import (
     HONESTY_SENTENCE,
     MOVE_EXPLANATION_PROMPT,
 )
-from pipeline.daily_stance import DAILY_STANCE_PROMPT
+from pipeline.daily_stance import (
+    DAILY_STANCE_PROMPT,
+    FIELD_MAX_WORDS,
+    THESIS_MAX_WORDS,
+)
 from pipeline.weekly_tip import WEEKLY_TIP_PROMPT
 
 
@@ -262,6 +266,13 @@ class TestDailyStancePrompt:
     def test_falsifier_must_be_checkable(self):
         assert "what_would_change_my_mind" in DAILY_STANCE_PROMPT
         assert "never a sentiment" in DAILY_STANCE_PROMPT
+
+    def test_free_text_fields_are_word_capped(self):
+        """One batched response per morning: an unbounded field is paid per ticker."""
+        assert f"thesis: at most {THESIS_MAX_WORDS} words" in DAILY_STANCE_PROMPT
+        assert f"key_risk: at most {FIELD_MAX_WORDS} words" in DAILY_STANCE_PROMPT
+        assert (f"what_would_change_my_mind: at most {FIELD_MAX_WORDS} words"
+                in DAILY_STANCE_PROMPT)
 
     def test_scheduler_no_longer_defaults_to_hold(self):
         """

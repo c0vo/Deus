@@ -8,7 +8,14 @@ from pipeline.classifier import ClassifierResult
 from config.llm import parse_structured, salvage_json_field
 from data.models import TickerNote, notes_to_dict
 from pipeline.agents import TraderAdvisory
-from pipeline.daily_stance import NO_CALL, UNAVAILABLE, Stance, StanceRow
+from pipeline.daily_stance import (
+    FIELD_MAX_WORDS,
+    NO_CALL,
+    THESIS_MAX_WORDS,
+    UNAVAILABLE,
+    Stance,
+    StanceRow,
+)
 from pipeline.weekly_tip import Tip
 from pipeline.predictor import LlmPrediction
 from pipeline.grounded_answer import GradeVerdict, MoveExplanation
@@ -337,6 +344,21 @@ class TestStanceSchema:
     def test_rejects_conviction_outside_the_literal(self):
         with pytest.raises(ValidationError):
             Stance.model_validate({**self.VALID, "conviction": "Very High"})
+
+    def test_word_caps_reach_the_json_schema(self):
+        """
+        The schema's descriptions travel in `response_format`, apart from the
+        prompt, so the caps are stated there too.
+
+        They are descriptions and not `max_length` on purpose: a validator would
+        turn an over-long but correct call into NO CALL.
+        """
+        props = Stance.model_json_schema()["properties"]
+        caps = {"thesis": THESIS_MAX_WORDS, "key_risk": FIELD_MAX_WORDS,
+                "what_would_change_my_mind": FIELD_MAX_WORDS}
+        for name, cap in caps.items():
+            assert f"At most {cap} words" in props[name]["description"]
+            assert "maxLength" not in props[name]
 
     def test_evidence_defaults_to_empty(self):
         payload = {k: v for k, v in self.VALID.items() if k != "evidence_used"}

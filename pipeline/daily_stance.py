@@ -78,6 +78,14 @@ HISTORY_BARS = 280
 # Sessions in a trading year, for the 52-week high window.
 YEAR_SESSIONS = 252
 
+# Word caps on the model's free-text fields. The note is one batched response
+# for the whole watchlist, so every word is paid for once per ticker per
+# morning, and the full numbers are already stored in `facts_json` — the note
+# only has to name the few that decide the call. Stated in both the prompt and
+# the schema descriptions, which reach the model separately.
+THESIS_MAX_WORDS = 25
+FIELD_MAX_WORDS = 12
+
 
 class Stance(BaseModel):
     """One morning call on one ticker.
@@ -96,10 +104,12 @@ class Stance(BaseModel):
         description="Conviction in the call. Pick the nearest of the three."
     )
     thesis: str = Field(
-        description="One or two sentences naming the specific facts behind the call."
+        description=f"At most {THESIS_MAX_WORDS} words: the facts that decide the call, "
+                    "with their numbers."
     )
     key_risk: str = Field(
-        description="The single fact from this ticker's block that most threatens the call."
+        description=f"At most {FIELD_MAX_WORDS} words: the one fact from this ticker's "
+                    "block that most threatens the call."
     )
     evidence_used: list[str] = Field(
         default_factory=list,
@@ -107,32 +117,40 @@ class Stance(BaseModel):
                     "analyst_target, news, darkpool, insider, ml, macro, debate.",
     )
     what_would_change_my_mind: str = Field(
-        description="A concrete, checkable trigger that would flip the call."
+        description=f"At most {FIELD_MAX_WORDS} words: a concrete, checkable trigger "
+                    "that would flip the call."
     )
 
 
-DAILY_STANCE_PROMPT = """You are the portfolio manager writing the morning stance note on a client's tracked positions.
+DAILY_STANCE_PROMPT = f"""You write the morning stance note on a client's tracked positions. Be terse: numbers over adjectives, fragments over full sentences, no filler or preamble.
 
-For EACH ticker in the FACTS section below, choose exactly one action and justify it from that ticker's own facts.
+For EACH ticker in FACTS below, choose one action from that ticker's own facts.
 
 ACTIONS — all four are available. This is not a hold-or-sell question.
-- BUY/ADD: the evidence supports increasing the position now.
-- HOLD: keep the position as it is.
-- TRIM: reduce the position but stay in it.
-- SELL: exit the position.
+- BUY/ADD: increase the position now.
+- HOLD: keep it as is.
+- TRIM: reduce it but stay in.
+- SELL: exit.
 
 RULES
-1. HOLD is not a default — justify it with named evidence like any other call. "Nothing happened" is not a justification; "RSI 54 with the daily technical rating at Neutral and no news in 48h" is.
-2. If the only evidence is "no news", say so explicitly and state that the call rests on technicals and positioning — then quote the indicator values you used (RSI, the technical rating label, the analyst target and implied upside, the off-exchange short ratio, the ML probability).
-3. Every claim must name a number, a label or a headline that appears in that ticker's FACTS block. Do not use outside knowledge and do not invent figures, dates or price levels.
-4. BUY/ADD and TRIM are expected whenever the facts support them. A note where every ticker is HOLD is a note that did not read the facts.
-5. A fact block that says data is absent ("no analyst coverage", "no news in 48h") is information, not a gap to fill. Reason from what is there.
-6. evidence_used lists short tags for the facts you actually used — for example rsi, technical_rating, analyst_target, news, darkpool, insider, ml, macro, debate. Name only what you used.
-7. key_risk is the one fact that most threatens the call, taken from the same block.
-8. what_would_change_my_mind is a concrete, checkable trigger — "a daily close back above $412", "CPI above 3.1% on Thursday" — never a sentiment like "if conditions worsen".
-9. Do NOT mention yesterday's stance, whether you changed your mind, or how long you have held a view. That is computed from the stored record, not from you.
-10. Plain text only: no markdown, no HTML, no bullet characters, no currency symbols other than $.
-11. Return exactly one entry per ticker, with `ticker` spelled exactly as in its FACTS heading, and no entries for tickers that are not listed.
+1. HOLD is not a default — justify it with facts like any other call: "RSI14 54, 1D rating Neutral", never "nothing happened".
+2. BUY/ADD and TRIM are expected whenever the facts support them. A note where every ticker is HOLD did not read the facts.
+3. Cite only numbers, labels and headlines from that ticker's FACTS block (a headline by its gist, not in full). No outside knowledge; no invented figures, dates or price levels.
+4. With no news, the call rests on technicals and positioning: cite the values that decide it, not every indicator on the sheet.
+5. A block saying data is absent ("no analyst coverage", "no news in 48h") is information, not a gap to fill.
+6. Do NOT mention yesterday's stance, whether you changed your mind, or how long you have held a view. That is computed from the stored record.
+7. Plain text only: no markdown, HTML or bullets; no currency symbols other than $.
+
+FIELDS — the word limits are hard caps, not targets.
+- thesis: at most {THESIS_MAX_WORDS} words. The facts that decide the call; do not restate the action or conviction.
+- key_risk: at most {FIELD_MAX_WORDS} words. The one fact in the block that most threatens the call.
+- what_would_change_my_mind: at most {FIELD_MAX_WORDS} words. A checkable trigger ("daily close above $412", "1D rating back to Buy"), never a sentiment like "if conditions worsen".
+- evidence_used: tags for only the facts you used, e.g. rsi, technical_rating, analyst_target, news, darkpool, insider, ml, macro, debate.
+
+Example of the expected length (its figures are not facts):
+thesis "RSI14 71, 1D rating Sell (12S/3N/2B), 2% under the $190 target." key_risk "ML 5d UP at 64%." what_would_change_my_mind "Daily close above $185."
+
+Return exactly one entry per ticker, `ticker` spelled as in its FACTS heading, and none for tickers not listed.
 """
 
 
