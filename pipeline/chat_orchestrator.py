@@ -200,8 +200,11 @@ class ChatOrchestrator:
 
             with track_llm(self.db, model_name, "chat_router",
                            prompt_text=prompt, store_text=True) as u:
+                # A one-word verdict. Unset, reasoning is the model's own
+                # default, and a thinking-by-default model thinks first.
                 u.response = resp = await complete(
                     model=model_name, prompt=prompt, json_mode=True,
+                    reasoning="none",
                 )
             result_text = resp.text.strip()
             try:
@@ -359,7 +362,7 @@ class ChatOrchestrator:
         return await self._generate_answer(
             state,
             model_name=settings.model_chat_shallow,
-            reasoning=None,  # No thinking
+            reasoning="none",  # No thinking. None would leave the model's default on.
             operation_name="chat_shallow"
         )
 
@@ -379,7 +382,7 @@ class ChatOrchestrator:
     async def _generate_answer(self, state: ChatState, model_name: str,
                                reasoning: Optional[str], operation_name: str) -> dict:
         """
-        The shallow/complex split is now one argument: `reasoning` is None for
+        The shallow/complex split is now one argument: `reasoning` is "none" for
         the fast lane and "medium" for the thinking lane, where it used to be a
         provider-specific ThinkingConfig object.
         """
@@ -545,7 +548,7 @@ class ChatOrchestrator:
                 async for chunk in stream_complete(
                     model=model,
                     prompt=prompt,
-                    reasoning=None if decision == "shallow" else "medium",
+                    reasoning="none" if decision == "shallow" else "medium",
                 ):
                     if chunk.text:
                         collected.append(chunk.text)

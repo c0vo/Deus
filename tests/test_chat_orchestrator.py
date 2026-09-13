@@ -125,9 +125,9 @@ async def test_agent_nodes(mock_db):
         result = await orchestrator.shallow_agent_node(state)
         assert result["final_answer"] == "Shallow Answer"
 
-        # The shallow lane must not ask for reasoning — that is the whole
-        # point of routing to it.
-        assert mock_complete.await_args.kwargs["reasoning"] is None
+        # The shallow lane must switch reasoning off, not leave it unset —
+        # that is the whole point of routing to it.
+        assert mock_complete.await_args.kwargs["reasoning"] == "none"
         assert mock_complete.await_args.kwargs["model"] == "test/shallow"
 
         # Test complex agent
@@ -422,7 +422,7 @@ class TestIterEvents:
     @pytest.mark.asyncio
     async def test_shallow_streams_without_reasoning(self, mock_db):
         _, stream = await self._run(mock_db, decision="shallow")
-        assert stream.call_args.kwargs["reasoning"] is None
+        assert stream.call_args.kwargs["reasoning"] == "none"
         assert stream.call_args.kwargs["model"] == "test/shallow"
 
     @pytest.mark.asyncio
