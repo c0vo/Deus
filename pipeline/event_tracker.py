@@ -294,6 +294,12 @@ class EventTracker:
                 prompt=prompt,
                 temperature=0.0,
                 json_mode=True,
+                # Copying fields out of one article is lookup, not deliberation.
+                # Left at the model default, reasoning tokens draw down the same
+                # small max_tokens budget as the answer, and a thinking model can
+                # spend all of it and return empty content — for an article the
+                # caller then marks scanned for good.
+                reasoning="none",
                 max_tokens=settings.extraction_max_output_tokens,
             )
 
