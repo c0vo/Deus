@@ -96,10 +96,9 @@ function DashboardContent() {
     // that transition is the trade timing, so it lands without a poll.
     onThesisUpdate: (data) => setThesisTransitions(data?.transitions || []),
     // The 4-hourly trend job publishes the regenerated themes, and the card
-    // renders them straight from this state. Refetching instead would be worse
-    // than useless: /api/brain/macro-themes checks an in-memory cache that
-    // lives in the WORKER process, so in the API process it is always cold and
-    // the "cheap" refetch pays for a whole fresh LLM generation.
+    // renders them straight from this state. The push carries the whole list —
+    // the same one the job stores and /api/brain/macro-themes serves on page
+    // load — so a refetch here would only fetch it a second time.
     onMacroThemes: (data) => setThemes(Array.isArray(data) ? data : []),
     onAlert,
     // The publish payload is a notification, not the digest — the tips and the
@@ -172,8 +171,9 @@ function DashboardContent() {
       const url = forceRefresh
         ? "/api/brain/macro-themes?refresh=true"
         : "/api/brain/macro-themes";
-      // Generous: on a cold cache this endpoint generates themes with an LLM.
-      // It still needs a ceiling — without one the card span forever.
+      // Generous: on a refresh, or before any themes have been stored, this
+      // endpoint generates them with an LLM. It still needs a ceiling — without
+      // one the card span forever.
       const json = await fetchJson<{ data?: any[] }>(url, { timeoutMs: 30000 });
       setThemes(json.data || []);
     } catch {}

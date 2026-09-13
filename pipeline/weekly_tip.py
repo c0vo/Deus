@@ -25,8 +25,8 @@ whole module:
   same reasoning as `EMPTY_BRIEFING_TEXT`.
 
 Nothing here triggers an expensive generation as a side effect: the macro themes
-are read from `TrendForecaster`'s cache and never regenerated, and the theme
-clustering runs its numpy path without the LLM naming call.
+are read from where `TrendForecaster` stored them and never regenerated, and the
+theme clustering runs its numpy path without the LLM naming call.
 """
 
 from __future__ import annotations
@@ -82,6 +82,11 @@ WOW_SESSIONS = 5
 # tip is meant to carry the handful of stories still worth naming a week later.
 NEWS_MIN_IMPORTANCE = 7.5
 NEWS_WINDOW_HOURS = 168
+
+# How old the stored macro themes may be and still go in as current. The trend
+# job rewrites them every four hours, so a day-old row means six runs in a row
+# produced nothing, and quoting it would present a stale list as this week's.
+MACRO_THEMES_MAX_AGE_HOURS = 24
 
 # Numeric tokens, for the post-validation pass. Deliberately permissive about the
 # sign so "+8.8%", "-0.6%" and "45%" all come out whole rather than as a bare
@@ -311,16 +316,23 @@ class WeeklyTipComposer:
         ]
 
     def _news_warnings(self) -> dict:
-        # Cached only, never generated. A cold cache here is a missing section;
-        # calling generate_and_cache_macro_themes() would turn a digest job into
-        # an unannounced reasoning call.
-        cached = TrendForecaster.get_cached_macro_themes() or []
+        # Stored only, never generated: calling generate_and_cache_macro_themes()
+        # would turn a digest job into an unannounced model call. No stored
+        # themes, or none newer than MACRO_THEMES_MAX_AGE_HOURS, is a missing
+        # section rather than an old list presented as current.
+        stored = self._safe(
+            "macro_themes",
+            lambda: TrendForecaster(self.db).get_stored_macro_themes(
+                max_age_hours=MACRO_THEMES_MAX_AGE_HOURS
+            ),
+            None,
+        )
         themes = [
             {
                 "title": str(t.get("title") or "")[:160],
                 "explanation": str(t.get("explanation") or "")[:400],
             }
-            for t in cached[:MAX_THEMES]
+            for t in (stored["themes"] if stored else [])[:MAX_THEMES]
             if isinstance(t, dict)
         ]
 

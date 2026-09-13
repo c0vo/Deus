@@ -834,9 +834,12 @@ async def themes_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         from pipeline.trend_forecaster import TrendForecaster
         forecaster = TrendForecaster(db)
 
-        # Read from in-memory cache first (refreshed every 4h by scheduler)
-        themes = TrendForecaster.get_cached_macro_themes()
-        if themes is None:
+        # What the 4-hourly trend job stored. Generated here only on a database
+        # that has never had any, which stores them for the dashboard as well.
+        stored = forecaster.get_stored_macro_themes()
+        if stored is not None:
+            themes = stored["themes"]
+        else:
             themes = await forecaster.generate_and_cache_macro_themes()
 
         if not themes:

@@ -2116,16 +2116,21 @@ async def get_digests(
 
 @router.get("/api/brain/macro-themes")
 async def get_macro_themes(request: Request, refresh: bool = False):
-    """Get LLM-generated macro themes from recent high-importance news."""
-    # Fast path: return in-memory cache if warm (refreshed every 4h by scheduler)
-    if not refresh:
-        cached = TrendForecaster.get_cached_macro_themes()
-        if cached is not None:
-            return {"data": cached, "cached": True}
+    """
+    LLM-generated macro themes from recent high-importance news.
 
-    # Cold cache or forced refresh → generate fresh and cache
+    Served from what the worker's 4-hourly trend job stored, so a page load is
+    one SQLite read in a worker thread. Only a forced refresh, or a database that
+    has never stored themes, pays for a generation here.
+    """
     db = getattr(request.app.state, "db", None) or Database()
     forecaster = TrendForecaster(db)
+
+    if not refresh:
+        stored = await asyncio.to_thread(forecaster.get_stored_macro_themes)
+        if stored is not None:
+            return {"data": stored["themes"], "cached": True}
+
     themes = await forecaster.generate_and_cache_macro_themes()
     return {"data": themes}
 

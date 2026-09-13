@@ -17,7 +17,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from config.logging_config import get_logger
-from config.llm import complete, is_llm_configured, strip_code_fence
+from config.llm import complete, is_llm_configured, parse_json_list, strip_code_fence
 from config.settings import settings
 from config.usage import track_llm
 from data.database import Database
@@ -25,9 +25,12 @@ from api.sse_manager import event_bus
 
 log = get_logger(__name__)
 
-# Module-level in-memory cache for macro themes (shared across all TrendForecaster instances)
-_macro_themes_cache: dict = {"data": None, "timestamp": 0}
-_MACRO_THEMES_TTL = 14400  # 4 hours (matches scheduler cadence)
+# The user_config row holding the last generated macro themes, as
+# {"generated_at": <UTC ISO-8601>, "themes": [...]}. A row rather than module
+# memory: the worker's 4-hourly job writes them, the API process serves them, and
+# module memory is per process — the API's own copy was empty after every
+# restart and expiry, and each empty read paid for another generation.
+MACRO_THEMES_CONFIG_KEY = "macro_themes"
 
 # Per-sector outlook cache, keyed by normalised sector name. /forecast takes a
 # free-text sector from the user, so the key space is unbounded — expired
@@ -270,11 +273,14 @@ class TrendForecaster:
                     json_mode=True,
                     reasoning="low",
                 )
-            raw = strip_code_fence(response.text)
 
-            themes = json.loads(raw)
-            if isinstance(themes, list):
+            # json_mode forces an object root, so a model honouring it answers
+            # this prompt's bare array as {"themes": [...]}. A plain json.loads
+            # took that for a failure and threw away a paid result.
+            themes = [t for t in parse_json_list(response.text) if isinstance(t, dict)]
+            if themes:
                 return themes
+            log.warning("trend_forecaster.macro_themes_empty")
         except Exception as e:
             log.warning("trend_forecaster.macro_themes_failed", error=str(e))
 
@@ -354,22 +360,67 @@ class TrendForecaster:
             return [dict(row) for row in rows]
 
     async def generate_and_cache_macro_themes(self) -> list[dict]:
-        """Generate macro themes and update the in-memory cache. Called by scheduler and API."""
+        """
+        Generate macro themes, store them where every process can read them, and
+        publish them to the dashboard.
+
+        The scheduler's 4-hourly job is what keeps the stored themes current. The
+        API and /themes call this only when nothing has ever been stored, and the
+        API also on a forced refresh. A run that produces nothing leaves the last
+        stored themes in place rather than blanking them.
+        """
         themes = await self.generate_macro_themes()
-        if themes:
-            _macro_themes_cache["data"] = themes
-            _macro_themes_cache["timestamp"] = time.time()
-            log.info("trend_forecaster.macro_themes_cached", count=len(themes))
-            # Publish via SSE for real-time dashboard updates
-            try:
-                await event_bus.publish("macro_themes", themes)
-            except Exception as e:
-                log.warning("trend_forecaster.macro_themes_sse_failed", error=str(e))
+        if not themes:
+            return themes
+
+        generated_at = datetime.now(timezone.utc).isoformat()
+        try:
+            await asyncio.to_thread(
+                self.db.set_config,
+                MACRO_THEMES_CONFIG_KEY,
+                json.dumps({"generated_at": generated_at, "themes": themes}),
+            )
+            log.info("trend_forecaster.macro_themes_stored",
+                     count=len(themes), generated_at=generated_at)
+        except Exception as e:
+            # Still published and returned: the call is already paid for, and
+            # the dashboard and the caller can use the result without the row.
+            log.error("trend_forecaster.macro_themes_store_failed", error=str(e))
+
+        # Publish via SSE for real-time dashboard updates
+        try:
+            await event_bus.publish("macro_themes", themes)
+        except Exception as e:
+            log.warning("trend_forecaster.macro_themes_sse_failed", error=str(e))
         return themes
 
-    @staticmethod
-    def get_cached_macro_themes() -> list[dict] | None:
-        """Return cached macro themes if within TTL. Returns None if cache is cold."""
-        if _macro_themes_cache["data"] and (time.time() - _macro_themes_cache["timestamp"]) < _MACRO_THEMES_TTL:
-            return _macro_themes_cache["data"]
-        return None
+    def get_stored_macro_themes(self, max_age_hours: Optional[float] = None) -> Optional[dict]:
+        """
+        The last themes generate_and_cache_macro_themes() stored, as
+        {"generated_at": ..., "themes": [...]}. None if none were ever stored, or,
+        with `max_age_hours` set, if they were generated longer ago than that.
+
+        A blocking SQLite read: async callers go through asyncio.to_thread.
+        """
+        raw = self.db.get_config(MACRO_THEMES_CONFIG_KEY, "")
+        if not raw:
+            return None
+        try:
+            record = json.loads(raw)
+        except (TypeError, ValueError) as e:
+            log.warning("trend_forecaster.macro_themes_unreadable", error=str(e))
+            return None
+        if not isinstance(record, dict) or not isinstance(record.get("themes"), list):
+            log.warning("trend_forecaster.macro_themes_unreadable", error="unexpected shape")
+            return None
+
+        if max_age_hours is not None:
+            try:
+                age = datetime.now(timezone.utc) - datetime.fromisoformat(record["generated_at"])
+            except (KeyError, TypeError, ValueError):
+                # A record whose age cannot be read cannot be vouched for as recent.
+                return None
+            if age > timedelta(hours=max_age_hours):
+                return None
+
+        return record
