@@ -698,11 +698,17 @@ class ThesisGraph:
         )
 
         try:
+            # Reasoning is set rather than left to the model: omitting it lets a
+            # thinking-by-default slug think at its own budget. The causal work
+            # happened in the decomposition; this reads cited names out of the
+            # results. Low rather than none, since exposure_pct and
+            # substitutability are still judgment calls.
             with track_llm(self.db, settings.model_thesis_extract, "thesis_extract") as u:
                 u.response = response = await complete(
                     model=settings.model_thesis_extract,
                     prompt=prompt,
                     schema=CandidateList,
+                    reasoning="low",
                 )
             parsed = response.parsed
             if not isinstance(parsed, CandidateList):

@@ -2395,7 +2395,10 @@ async def run_reflection_job(db, alert_manager=None):
 
         try:
             # Point MODEL_REFLECTION at a cheap model — this is a
-            # summarization task, not reasoning-heavy analysis.
+            # summarization task, not reasoning-heavy analysis. Reasoning is
+            # set rather than left to the model, which on a thinking-by-default
+            # slug means thinking at its own budget on every lesson. Low rather
+            # than none: the lesson is replayed into every later debate.
             model_name = settings.model_reflection
             with track_llm(db, model_name, "reflection") as u:
                 u.response = response = await complete(
@@ -2404,6 +2407,7 @@ async def run_reflection_job(db, alert_manager=None):
                     prompt=prompt,
                     temperature=0.0,
                     json_mode=True,
+                    reasoning="low",
                 )
 
             raw = response.text
