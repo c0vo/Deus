@@ -3,16 +3,21 @@
 No live LLM calls: every client is mocked. The focus is on the three guards
 that live in Python rather than in a prompt — chain validation, search
 targeting, and the evidence gate — plus the mechanical check that no node
-returns a state key LangGraph would silently discard.
+returns a state key LangGraph would silently discard, and the once-a-day rule
+the scheduler applies to the morning run.
 """
 
 import ast
 import inspect
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
+from orchestrator import scheduler
+from orchestrator.scheduler import PipelineOrchestrator
 from pipeline import thesis_engine as te
 from pipeline.thesis_engine import (
     THESIS_DECOMPOSITION_PROMPT,
@@ -606,3 +611,105 @@ def test_exposure_pct_is_bounded():
             {"companies": [{"node_key": "n", "company_name": "x",
                             "role_in_chain": "r", "exposure_pct": 500}]}
         )
+
+
+# ── The morning run and its start-up catch-up ────────────────────────────
+#
+# The catch-up used to decide from saved theses alone, so a morning whose
+# paid decomposition failed to persist was re-bought on every worker restart —
+# and deploy.sh restarts the worker on every push.
+
+
+class _ConfigDB:
+    """user_config as a dict, plus the one theses query the catch-up makes."""
+
+    def __init__(self, theses_today=0, config=None):
+        self.config = dict(config or {})
+        self.theses_today = theses_today
+
+    def get_config(self, key, default="{}"):
+        return self.config.get(key, default)
+
+    def set_config(self, key, value):
+        self.config[key] = value
+
+    def count_theses_since(self, cutoff_utc):
+        return self.theses_today
+
+
+def _orchestrator(db, generate):
+    """Only what the thesis schedule reads, without building every tracker."""
+    orch = PipelineOrchestrator.__new__(PipelineOrchestrator)
+    orch.db = db
+    orch.tz = ZoneInfo(scheduler.settings.timezone)
+    orch.thesis_engine = MagicMock()
+    orch.thesis_engine.generate = generate
+    return orch
+
+
+def _today_local():
+    return datetime.now(ZoneInfo(scheduler.settings.timezone)).strftime("%Y-%m-%d")
+
+
+@pytest.fixture
+def thesis_due_now(monkeypatch):
+    """Enabled and due from midnight, so the catch-up acts whenever this runs."""
+    monkeypatch.setattr(scheduler.settings, "thesis_enabled", True)
+    monkeypatch.setattr(scheduler, "THESIS_GENERATION_HOUR", 0)
+    monkeypatch.setattr(scheduler, "THESIS_GENERATION_MINUTE", 0)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_run_records_the_attempt_before_generating():
+    """Stamped before the paid call, so a restart mid-run cannot repeat it."""
+    db = _ConfigDB()
+    stamp_seen_by_generate = []
+
+    async def generate():
+        stamp_seen_by_generate.append(
+            db.config.get(PipelineOrchestrator.THESIS_ATTEMPT_KEY)
+        )
+        return []
+
+    await _orchestrator(db, generate).run_thesis_generation()
+
+    assert stamp_seen_by_generate == [_today_local()]
+
+
+@pytest.mark.asyncio
+async def test_catchup_skips_a_day_already_attempted_with_nothing_saved(thesis_due_now):
+    db = _ConfigDB(
+        theses_today=0,
+        config={PipelineOrchestrator.THESIS_ATTEMPT_KEY: _today_local()},
+    )
+    generate = AsyncMock(return_value=[])
+
+    with patch.object(scheduler, "log") as mock_log:
+        await _orchestrator(db, generate)._catchup_thesis()
+
+    generate.assert_not_awaited()
+    events = [c.args[0] for c in mock_log.info.call_args_list]
+    assert "orchestrator.startup_catchup.thesis_already_attempted" in events
+
+
+@pytest.mark.asyncio
+async def test_catchup_runs_when_the_last_attempt_was_another_day(thesis_due_now):
+    db = _ConfigDB(config={PipelineOrchestrator.THESIS_ATTEMPT_KEY: "2000-01-01"})
+    generate = AsyncMock(return_value=["t1"])
+
+    await _orchestrator(db, generate)._catchup_thesis()
+
+    generate.assert_awaited_once()
+    assert db.config[PipelineOrchestrator.THESIS_ATTEMPT_KEY] == _today_local()
+
+
+@pytest.mark.asyncio
+async def test_a_catchup_that_saved_nothing_is_not_repeated_on_restart(thesis_due_now):
+    db = _ConfigDB(theses_today=0)
+    generate = AsyncMock(return_value=[])   # the decomposition persisted nothing
+    orch = _orchestrator(db, generate)
+
+    await orch._catchup_thesis()
+    await orch._catchup_thesis()            # the next deploy restarts the worker
+
+    assert generate.await_count == 1

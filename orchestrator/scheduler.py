@@ -1897,15 +1897,8 @@ class PipelineOrchestrator:
             # 06:30 KST: build one thesis from the most accelerated theme.
             # Ahead of daily_predictions at 08:30 so a name promoted this
             # morning is already tracked when the rest of the stack runs.
-            async def run_thesis_generation():
-                try:
-                    ids = await self.thesis_engine.generate()
-                    log.info("orchestrator.thesis_generated", count=len(ids))
-                except Exception as e:
-                    log.error("orchestrator.thesis_generation_failed", error=str(e))
-
             self.scheduler.add_job(
-                run_thesis_generation,
+                self.run_thesis_generation,
                 CronTrigger(hour=THESIS_GENERATION_HOUR,
                             minute=THESIS_GENERATION_MINUTE,
                             timezone=self.tz),
@@ -2062,6 +2055,37 @@ class PipelineOrchestrator:
         except Exception as e:
             log.error("orchestrator.startup_catchup_error", error=str(e))
 
+    # user_config key holding the local date (settings.timezone) of the last
+    # morning-thesis attempt. Stamped before any tokens are spent, by the cron
+    # job and the catch-up alike, so a run that saved nothing still counts.
+    # The on-demand thesis from the API neither writes nor reads it.
+    THESIS_ATTEMPT_KEY = "thesis_generation_attempted_on"
+
+    async def run_thesis_generation(self) -> None:
+        """The 06:30 job: build a thesis from the most accelerated theme."""
+        await self._record_thesis_attempt()
+        try:
+            ids = await self.thesis_engine.generate()
+            log.info("orchestrator.thesis_generated", count=len(ids))
+        except Exception as e:
+            log.error("orchestrator.thesis_generation_failed", error=str(e))
+
+    async def _record_thesis_attempt(self) -> None:
+        """Stamp today's local date as attempted, before the paid run starts.
+
+        A failed write is logged rather than raised. Without the stamp the
+        worst case is one repeat run on the next restart — the behaviour before
+        the stamp existed — whereas aborting would lose the morning's thesis.
+        """
+        today_local = datetime.datetime.now(self.tz).strftime("%Y-%m-%d")
+        try:
+            await asyncio.to_thread(
+                self.db.set_config, self.THESIS_ATTEMPT_KEY, today_local
+            )
+        except Exception as e:
+            log.error("orchestrator.thesis_attempt_record_failed",
+                      date=today_local, error=str(e))
+
     async def _catchup_thesis(self) -> None:
         """Run the morning thesis if the worker was down when it was due.
 
@@ -2071,6 +2095,11 @@ class PipelineOrchestrator:
         a reboot, Termux being killed — skips straight to tomorrow. That is the
         common case here, and it is why the morning thesis went missing on days
         the phone had been restarted.
+
+        At most one attempt a day, counted in attempts rather than saved
+        theses. A morning whose decomposition failed to persist leaves no row,
+        and deploy.sh restarts the worker on every push, so counting rows
+        re-bought the most expensive call in the system on every deploy.
         """
         if not settings.thesis_enabled:
             return
@@ -2085,6 +2114,7 @@ class PipelineOrchestrator:
             log.info("orchestrator.startup_catchup.thesis_not_due_yet")
             return
 
+        today_local = now_local.strftime("%Y-%m-%d")
         midnight_utc = (
             now_local.replace(hour=0, minute=0, second=0, microsecond=0)
             .astimezone(datetime.timezone.utc)
@@ -2096,6 +2126,9 @@ class PipelineOrchestrator:
             generated_today = await asyncio.to_thread(
                 self.db.count_theses_since, midnight_utc
             )
+            attempted_on = await asyncio.to_thread(
+                self.db.get_config, self.THESIS_ATTEMPT_KEY, ""
+            )
         except Exception as e:
             log.error("orchestrator.startup_catchup.thesis_query_failed", error=str(e))
             return
@@ -2104,7 +2137,17 @@ class PipelineOrchestrator:
             log.info("orchestrator.startup_catchup.thesis_ok", count=generated_today)
             return
 
+        if attempted_on == today_local:
+            # Attempted today with nothing saved yet: a run that failed, was
+            # cut off by a restart, or is still going (a boot just before
+            # 06:30). Retrying would repeat it on every restart, so the next
+            # attempt is tomorrow's 06:30.
+            log.info("orchestrator.startup_catchup.thesis_already_attempted",
+                     date=today_local)
+            return
+
         log.info("orchestrator.startup_catchup.missed_thesis")
+        await self._record_thesis_attempt()
         try:
             ids = await self.thesis_engine.generate()
             log.info("orchestrator.startup_catchup.thesis_generated", count=len(ids))
