@@ -7,10 +7,13 @@ import FormattedText from "../components/FormattedText";
 import GeneralNewsFeed from "../components/GeneralNewsFeed";
 import PriceChart from "../components/PriceChart";
 import AnalystPanel from "../components/AnalystPanel";
+import ForecastNarratives from "../components/ForecastNarratives";
 
 interface PredictionInfo {
   direction: "UP" | "DOWN" | "TRAINING";
   confidence: number;
+  // Absent on the TRAINING placeholders, which stand in for a missing row.
+  created_at?: string | null;
 }
 
 interface AdvisoryInfo {
@@ -584,6 +587,19 @@ export default function WatchlistPage() {
                               )}
                             </div>
                           )}
+
+                          {/* The written reading behind the ML Forecast badges,
+                              per horizon. Fetches itself like AnalystPanel: the
+                              text stays off /api/markets, which every tab polls,
+                              and is only read once a report is open. The key
+                              changes whenever a badge does, so a report left
+                              open follows the grid. */}
+                          <ForecastNarratives
+                            ticker={item.ticker}
+                            refreshKey={["5d", "1m", "3m", "1y"]
+                              .map((horizon) => item.predictions?.[horizon]?.created_at ?? "")
+                              .join("|")}
+                          />
 
                           {/* Sell-side consensus and the local technical rating.
                               Fetches itself rather than riding on fetchTickerDetail:

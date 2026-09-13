@@ -194,6 +194,15 @@ def _prediction_to_badge(pred: dict | None) -> dict | None:
     }
 
 
+# Prediction rows whose llm_narrative is an LLM reading of the call against news
+# context: the trained model tiers _load_model reports, and the LLM-only
+# predictor it falls back to. The predictions table holds two other types, left
+# out on purpose. A multi_agent row carries the debate's final advisory, which
+# the markets report already renders from cached_advisory, and a fast_heuristic
+# row carries a one-line template that no model wrote.
+NARRATIVE_MODEL_TYPES = frozenset({"per_ticker", "sector", "universal", "llm_only"})
+
+
 # ── Request Models ────────────────────────────────────────────────────
 
 class WatchlistRequest(BaseModel):
@@ -798,6 +807,60 @@ async def _build_markets_payload(db: Database, tickers: list[str]) -> dict:
 
     data = await asyncio.gather(*(process_ticker(t) for t in tickers))
     return {"data": data}
+
+
+def _build_prediction_narratives_payload(db: Database, symbol: str) -> dict:
+    """
+    The newest live narrative per dashboard horizon for one ticker.
+
+    Synchronous: one SQLite read, run in a worker thread by the endpoint.
+
+    Each entry carries the direction, confidence and created_at of the row its
+    text interprets, which is not always the row the grid badge shows. The badge
+    takes the newest live row of any type, and the daily debate job writes a
+    multi_agent 5d row every few days. Skipping those rows keeps the model's own
+    reading of that horizon on the page rather than hidden behind the debate
+    verdict, which the report already shows.
+
+    A horizon is left out when it has no live narrative row, or when its newest
+    one has blank text. Blank text does not fall back to an older call, which
+    the newer one has superseded.
+    """
+    horizons: dict[str, dict] = {}
+    seen: set[str] = set()
+    for pred in db.get_recent_predictions(symbol, limit=20, active_only=True):
+        label = HORIZON_LABELS.get(pred.get("horizon_days"))
+        if not label or label in seen:
+            continue
+        if pred.get("model_type") not in NARRATIVE_MODEL_TYPES:
+            continue
+        seen.add(label)
+        narrative = (pred.get("llm_narrative") or "").strip()
+        if narrative:
+            horizons[label] = {
+                **_prediction_to_badge(pred),
+                "model_type": pred.get("model_type"),
+                "narrative": narrative,
+            }
+    return {"data": {"ticker": symbol, "horizons": horizons}}
+
+
+@router.get("/api/predictions/{ticker}/narratives")
+async def get_prediction_narratives(request: Request, ticker: str):
+    """
+    The written reading behind each live horizon forecast for one ticker.
+
+    Served here rather than as a field on the /api/markets badges. Each
+    narrative is a few sentences, so four horizons per tracked ticker would ride
+    on every grid poll from every open tab, and the text is only read when
+    someone opens a report.
+
+    Uncached, unlike the grid: nothing polls this, and a cache would let the
+    text trail the badges it explains.
+    """
+    db = getattr(request.app.state, "db", None) or Database()
+    symbol = ticker.upper().strip()
+    return await asyncio.to_thread(_build_prediction_narratives_payload, db, symbol)
 
 
 def _build_stances_payload(db: Database) -> dict:
