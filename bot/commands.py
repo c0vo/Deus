@@ -23,6 +23,7 @@ from bot.formatters import (
     MACRO_IMPORTANCE_MARKERS,
     chunk_html,
     escape_html,
+    markdown_to_html,
     render_briefing,
     render_weekly_tip,
 )
@@ -440,15 +441,6 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 
         orchestrator = ChatOrchestrator(db, progress_callback=progress_callback)
         answer = await orchestrator.run(query)
-        
-        # Send final answer
-        await context.bot.edit_message_text(
-            chat_id=update.effective_chat.id,
-            message_id=status_msg.message_id,
-            text=f"<b>Analyst Report</b>\n\n{answer}",
-            parse_mode="HTML"
-        )
-        
     except Exception as e:
         log.error("telegram.query_failed", error=str(e))
         await context.bot.edit_message_text(
@@ -456,6 +448,36 @@ async def handle_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             message_id=status_msg.message_id,
             text="❌ Failed to process query."
         )
+        return
+
+    async def send_answer(chunks: list[str], parse_mode: str | None) -> None:
+        """The first chunk replaces the status message; the rest follow as replies."""
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=status_msg.message_id,
+            text=chunks[0],
+            parse_mode=parse_mode,
+        )
+        for chunk in chunks[1:]:
+            await update.message.reply_text(chunk, parse_mode=parse_mode)
+
+    # The answer is paid for by now, so a failed send must not end in "Failed
+    # to process query" - nor overwrite a first chunk that already landed with
+    # it. Escaped and chunked the HTML should go through; if it still does not
+    # (a paragraph long enough to be hard-split through a tag or an entity,
+    # say), the same answer goes out again as plain text, with nothing to parse.
+    try:
+        await send_answer(
+            chunk_html(f"<b>Analyst Report</b>\n\n{markdown_to_html(answer)}"), "HTML"
+        )
+        return
+    except Exception as e:
+        log.warning("telegram.query_html_send_failed", error=str(e), answer_chars=len(answer))
+
+    try:
+        await send_answer(chunk_html(f"Analyst Report\n\n{answer}"), None)
+    except Exception as e:
+        log.error("telegram.query_send_failed", error=str(e), answer_chars=len(answer))
 
 async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /predict <TICKER> [force] command."""

@@ -7,6 +7,7 @@ HTML messages for Telegram, avoiding markdown parsing issues.
 
 from __future__ import annotations
 
+import re
 from html import escape
 from typing import Optional
 
@@ -75,6 +76,30 @@ def chunk_html(text: str, limit: int = TELEGRAM_CHUNK_LIMIT) -> list[str]:
         chunks.append(chunk.strip())
 
     return chunks
+
+def markdown_to_html(text: str) -> str:
+    """
+    Render model-written markdown as Telegram HTML.
+
+    Escapes first, so a `<` or `&` in the prose stays text instead of breaking
+    the parse, then converts only the subset the analyst prompts ask for: `#`
+    headings, `**bold**` and `-` / `*` bullets. Anything else is left as the
+    model wrote it.
+
+    Bold is matched within a single line. chunk_html splits on blank lines and
+    relies on no tag spanning two paragraphs; an unpaired `**` paired across
+    lines would open a tag in one chunk and close it in the next, and Telegram
+    rejects both.
+    """
+    text = escape_html(text)
+    # A heading's own `**` is dropped rather than nested inside the <b> it becomes.
+    text = re.sub(
+        r"(?m)^[ \t]*#{1,6}[ \t]+(.+)$",
+        lambda m: f"<b>{m.group(1).replace('**', '').strip()}</b>",
+        text,
+    )
+    text = re.sub(r"\*\*([^\n]+?)\*\*", r"<b>\1</b>", text)
+    return re.sub(r"(?m)^([ \t]*)[-*][ \t]+", r"\1• ", text)
 
 def render_briefing(
     lanes: list[tuple[str, list[dict]]], title: str = "📰 Daily Market Briefing"
