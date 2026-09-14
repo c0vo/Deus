@@ -24,14 +24,35 @@ import {
 import FormattedText from "../components/FormattedText";
 import { getApiUrl } from "../utils/api";
 
+// A feature the snapshot could not compute arrives as null (the predictor
+// writes NaN that way). Keys starting with "_" are metadata, such as _asof.
 interface FeatureDict {
-  [key: string]: number;
+  [key: string]: number | string | null;
+}
+
+// The feature snapshot as a dict. The predictor sends a JSON string; advisories
+// cached by older code can hold it already decoded, or encoded twice.
+function parseFeatureSnapshot(raw: unknown): FeatureDict {
+  let value: unknown = raw;
+  for (let i = 0; i < 2; i++) {
+    if (typeof value !== "string") break;
+    try {
+      value = JSON.parse(value);
+    } catch (err) {
+      console.error("Failed to parse features", err);
+      return {};
+    }
+  }
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as FeatureDict)
+    : {};
 }
 
 interface DebateVerdict {
   ticker: string;
-  // The GradientBoosting baseline. UNKNOWN / 0 whenever no model artifact
-  // exists for the horizon, which is not the same thing as the trade call.
+  // The ML baseline. UNKNOWN / 0 whenever no model artifact exists for the
+  // horizon, and the base rate when the model has no measurable edge there;
+  // neither is the same thing as the trade call.
   predicted_direction?: string;
   confidence?: number;
   // The Head Trader's own call, synthesized from the debate. This is the
@@ -44,7 +65,25 @@ interface DebateVerdict {
   ml_prediction?: {
     predicted_direction?: string;
     confidence?: number;
+    // Calibrated P(up) from the pooled model, or the base rate when status is
+    // "prior". Absent on advisories cached before the pooled model.
+    probability_up?: number | null;
+    // "model": the horizon passed the walk-forward ship rule. "prior": it did
+    // not, and the baseline is the base rate.
+    status?: string | null;
     model_type?: string;
+    // Out-of-sample skill of the model behind the baseline.
+    model_meta?: {
+      auc?: number | null;
+      auc_ci_low?: number | null;
+      auc_ci_high?: number | null;
+      brier_skill?: number | null;
+      base_rate?: number | null;
+      trained_at?: string | null;
+      config?: unknown;
+      universe?: string | null;
+      n_tickers?: number | null;
+    } | null;
     feature_snapshot?: string; // JSON string
   };
   debate_history?: string[];
@@ -68,13 +107,28 @@ const CALL_COLORS: Record<string, string> = {
 
 // The ML baseline is a separate, optional signal from the trade call. When no
 // model artifact exists for the horizon the predictor reports UNKNOWN at 0.0 —
-// say that plainly instead of printing it as if it were a prediction.
+// say that plainly instead of printing it as if it were a prediction. When the
+// model has no measurable edge the direction is the base rate, which is not a
+// call either.
 function mlBaselineLabel(ml?: DebateVerdict["ml_prediction"]): string {
   const dir = ml?.predicted_direction;
-  if (!dir || dir === "UNKNOWN" || ml?.model_type === "llm_only") {
+  if (!ml || !dir || dir === "UNKNOWN" || ml.model_type === "llm_only") {
     return "no model trained — advisory is news + fundamentals only";
   }
-  const conf = ml?.confidence !== undefined ? `${(ml.confidence * 100).toFixed(1)}%` : "n/a";
+  if (ml.model_type === "prior" || ml.status === "prior") {
+    const base = ml.probability_up ?? ml.model_meta?.base_rate;
+    return typeof base === "number"
+      ? `no measurable edge — base rate ${(base * 100).toFixed(0)}% up`
+      : "no measurable edge — base rate";
+  }
+  if (ml.model_type === "universal") {
+    const pUp = ml.probability_up;
+    const auc = ml.model_meta?.auc;
+    const pText = typeof pUp === "number" ? `${(pUp * 100).toFixed(0)}%` : "n/a";
+    const aucText = typeof auc === "number" ? auc.toFixed(2) : "n/a";
+    return `${dir} · P(up) ${pText} · walk-forward AUC ${aucText}`;
+  }
+  const conf = ml.confidence !== undefined ? `${(ml.confidence * 100).toFixed(1)}%` : "n/a";
   return `${dir} @ ${conf} confidence`;
 }
 
@@ -212,12 +266,7 @@ function PredictContent() {
       setBearRounds(parsedBearRounds);
 
       if (stateObj.ml_prediction?.feature_snapshot) {
-        try {
-          const feat = JSON.parse(stateObj.ml_prediction.feature_snapshot);
-          setFeatures(feat);
-        } catch (err) {
-          console.error("Failed to parse features", err);
-        }
+        setFeatures(parseFeatureSnapshot(stateObj.ml_prediction.feature_snapshot));
       }
 
       setLogs((prev) => [...prev, `Debate loaded.`]);
@@ -419,12 +468,7 @@ function PredictContent() {
                 setCurrentRound(0);
 
                 if (res.ml_prediction?.feature_snapshot) {
-                  try {
-                    const feat = JSON.parse(res.ml_prediction.feature_snapshot);
-                    setFeatures(feat);
-                  } catch (err) {
-                    console.error("Failed to parse features", err);
-                  }
+                  setFeatures(parseFeatureSnapshot(res.ml_prediction.feature_snapshot));
                 }
                 setLogs((prev) => [...prev, `Verdict generated.`]);
               } catch (err) {
@@ -448,6 +492,11 @@ function PredictContent() {
       setRunning(false);
     }
   };
+
+  // Metadata keys ("_asof": the session the features describe) are not features.
+  const featureKeys = Object.keys(features).filter((key) => !key.startsWith("_")).sort();
+  const asOf = features._asof;
+  const featureAsOf = typeof asOf === "string" ? asOf : null;
 
   const getStatusText = () => {
     if (!running) return "ARENA STANDBY";
@@ -1212,27 +1261,33 @@ function PredictContent() {
             </div>
           )}
 
-          {/* 23-Feature Vector Panel */}
-          {Object.keys(features).length > 0 && (
+          {/* Feature Vector Panel */}
+          {featureKeys.length > 0 && (
             <div className="border border-border-dim bg-bg-card">
               <button
                 onClick={() => setFeaturesExpanded(!featuresExpanded)}
                 className="w-full p-4 flex items-center justify-between text-xs font-bold text-terminal-text uppercase tracking-wider hover:bg-bg-surface transition-colors"
               >
-                <span>[23-Feature Quantitative Vector Snapshot]</span>
+                <span>
+                  [{featureKeys.length}-Feature Quantitative Vector Snapshot{featureAsOf ? ` · as of ${featureAsOf}` : ""}]
+                </span>
                 {featuresExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
               </button>
               {featuresExpanded && (
                 <div className="p-3 md:p-4 border-t border-border-dim grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 text-[10px] bg-bg-surface/30">
-                  {Object.keys(features).sort().map((key) => {
+                  {featureKeys.map((key) => {
                     const val = features[key];
                     return (
                       <div key={key} className="border border-border-dim/50 p-2 flex flex-col justify-between min-w-0">
                         {/* Long keys truncate in a 2-col phone grid; title makes
                             them recoverable via long-press / hover. */}
                         <span title={key} className="text-terminal-muted truncate uppercase">{key}</span>
-                        <span className="text-terminal-text font-bold text-right mt-1">
-                          {typeof val === "number" ? val.toFixed(4) : String(val)}
+                        <span className={`font-bold text-right mt-1 ${val === null || val === undefined ? "text-terminal-muted" : "text-terminal-text"}`}>
+                          {typeof val === "number"
+                            ? val.toFixed(4)
+                            : val === null || val === undefined
+                              ? "N/A"
+                              : String(val)}
                         </span>
                       </div>
                     );

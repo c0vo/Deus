@@ -25,6 +25,9 @@ from config.logging_config import get_logger
 from config.settings import settings
 from data.database import Database
 from data.macro_calendar import VERIFIED_AGAINST as MACRO_SEED_VERIFIED_AGAINST
+from data.prediction_rows import accuracy_breakdown, accuracy_by_horizon, latest_by_horizon
+from pipeline.features import FEATURE_GROUPS
+from pipeline.model_configs import ModelConfig, resolve_columns
 from pipeline.predictor import StockPredictor, HORIZON_LABELS
 from pipeline.chat_orchestrator import ChatOrchestrator
 from pipeline.embedder import Embedder
@@ -45,13 +48,31 @@ router = APIRouter()
 
 log = get_logger(__name__)
 
-def _safe_float(value, default: float = 0.0) -> float:
+def _safe_float(value, default: Optional[float] = 0.0) -> Optional[float]:
     try:
         if value is None or pd.isna(value):
             return default
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _json_safe(value):
+    """`value` with NaN/inf as None and numpy scalars as plain Python numbers.
+
+    For payloads serialised with bare json.dumps, which writes NaN as a token
+    the browser's JSON.parse rejects: one unmeasured metric would then drop the
+    whole event, not just the number.
+    """
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
 
 
 def _sse_event(event: str, data="") -> str:
@@ -110,6 +131,10 @@ _digests_cache = TTLCache(ttl_seconds=60)
 # One stance per ticker per day, written once by the worker's morning job. A
 # minute is short only so a manually triggered re-run shows up without a wait.
 _stances_cache = TTLCache(ttl_seconds=60)
+
+# Model metrics change once a week (the Sunday retrain) or when the worker trains
+# a missing horizon. A minute only so a fresh run appears without a wait.
+_model_metrics_cache = TTLCache(ttl_seconds=60)
 
 # Generation runs a reasoning call plus several web searches, and this endpoint
 # lives in the read-mostly API process. One at a time, so two open tabs cannot
@@ -184,23 +209,43 @@ def _classification_status(db: Database) -> dict:
 
 
 def _prediction_to_badge(pred: dict | None) -> dict | None:
+    """One horizon's call as the grid and the narratives show it.
+
+    `model_type` says what the numbers are. A `prior` row is not a forecast:
+    the horizon showed no measurable edge in walk-forward evaluation, so its
+    direction and `probability_up` are the historical base rate. `confidence`
+    stays the probability of the called direction, max(p, 1 - p).
+    """
     if not pred:
         return None
     return {
         "direction": pred.get("predicted_direction", "UP"),
         "confidence": _safe_float(pred.get("confidence")),
+        "probability_up": _safe_float(pred.get("probability_up"), None),
+        "model_type": pred.get("model_type"),
         "horizon_days": pred.get("horizon_days"),
         "created_at": pred.get("created_at"),
     }
 
 
-# Prediction rows whose llm_narrative is an LLM reading of the call against news
-# context: the trained model tiers _load_model reports, and the LLM-only
-# predictor it falls back to. The predictions table holds two other types, left
-# out on purpose. A multi_agent row carries the debate's final advisory, which
-# the markets report already renders from cached_advisory, and a fast_heuristic
-# row carries a one-line template that no model wrote.
-NARRATIVE_MODEL_TYPES = frozenset({"per_ticker", "sector", "universal", "llm_only"})
+# Prediction rows whose llm_narrative is a web-grounded LLM reading of the call
+# against current news: the pooled model's rows, `universal` and `prior` (a
+# no-edge row still gets that reading, one that says the model has no edge),
+# the retired per-ticker and sector tiers, and the LLM-only fallback. Two types
+# are left out on purpose. A multi_agent row carries the debate's final
+# advisory, which the markets report already renders from cached_advisory, and
+# a fast_heuristic row carries a one-line template that no model wrote.
+NARRATIVE_MODEL_TYPES = frozenset({"universal", "prior", "per_ticker", "sector", "llm_only"})
+
+# How many permutation importances /api/model-metrics keeps per horizon.
+MODEL_METRICS_TOP_FEATURES = 10
+
+# Per-run fields /api/model-metrics returns in `history`: enough to see whether
+# the model beats the base rate week over week, without every fold's breakdown.
+MODEL_METRICS_HISTORY_KEYS = (
+    "created_at", "status", "auc_mean", "auc_ci_low", "auc_ci_high",
+    "brier_skill_mean", "hi_conf_acc", "hi_conf_n", "prior_up_rate",
+)
 
 
 # ── Request Models ────────────────────────────────────────────────────
@@ -767,10 +812,13 @@ async def _build_markets_payload(db: Database, tickers: list[str]) -> dict:
             load_ticker_rows, ticker
         )
 
+        # The pooled model's own row per horizon (universal, or prior when it
+        # has no edge), not merely the newest: the debate writes a multi_agent
+        # 5d row every few days that would otherwise hide the model's call.
         predictions = {}
-        for pred in recent_preds:
-            label = HORIZON_LABELS.get(pred.get("horizon_days"))
-            if label and label not in predictions:
+        for horizon_days, pred in latest_by_horizon(recent_preds).items():
+            label = HORIZON_LABELS.get(horizon_days)
+            if label:
                 predictions[label] = _prediction_to_badge(pred)
 
         for horizon_days, label in HORIZON_LABELS.items():
@@ -811,37 +859,38 @@ async def _build_markets_payload(db: Database, tickers: list[str]) -> dict:
 
 def _build_prediction_narratives_payload(db: Database, symbol: str) -> dict:
     """
-    The newest live narrative per dashboard horizon for one ticker.
+    The live narrative per dashboard horizon for one ticker.
 
     Synchronous: one SQLite read, run in a worker thread by the endpoint.
 
-    Each entry carries the direction, confidence and created_at of the row its
-    text interprets, which is not always the row the grid badge shows. The badge
-    takes the newest live row of any type, and the daily debate job writes a
-    multi_agent 5d row every few days. Skipping those rows keeps the model's own
-    reading of that horizon on the page rather than hidden behind the debate
+    Each entry carries the badge fields of the row its text interprets: the
+    direction, confidence, `probability_up`, `model_type` and created_at, plus
+    `no_edge`, true for a `prior` row. That row's direction and probability are
+    the base rate, so a surface must show them as such, beside a narrative that
+    is still a web-grounded reading of the news.
+
+    Rows are chosen the way the grid chooses them: the pooled model's newest
+    `universal` or `prior` row, falling back to the newest other narrative type
+    only when a horizon has neither. multi_agent rows never qualify, so the
+    model's reading stays on the page rather than hidden behind the debate
     verdict, which the report already shows.
 
-    A horizon is left out when it has no live narrative row, or when its newest
-    one has blank text. Blank text does not fall back to an older call, which
-    the newer one has superseded.
+    A horizon is left out when it has no live narrative row, or when the chosen
+    row has blank text. Blank text does not fall back to an older call, which
+    the chosen one has superseded.
     """
+    rows = db.get_recent_predictions(symbol, limit=20, active_only=True)
     horizons: dict[str, dict] = {}
-    seen: set[str] = set()
-    for pred in db.get_recent_predictions(symbol, limit=20, active_only=True):
-        label = HORIZON_LABELS.get(pred.get("horizon_days"))
-        if not label or label in seen:
-            continue
-        if pred.get("model_type") not in NARRATIVE_MODEL_TYPES:
-            continue
-        seen.add(label)
+    for horizon_days, pred in latest_by_horizon(rows, NARRATIVE_MODEL_TYPES).items():
+        label = HORIZON_LABELS.get(horizon_days)
         narrative = (pred.get("llm_narrative") or "").strip()
-        if narrative:
-            horizons[label] = {
-                **_prediction_to_badge(pred),
-                "model_type": pred.get("model_type"),
-                "narrative": narrative,
-            }
+        if not label or not narrative:
+            continue
+        horizons[label] = {
+            **_prediction_to_badge(pred),
+            "narrative": narrative,
+            "no_edge": pred.get("model_type") == "prior",
+        }
     return {"data": {"ticker": symbol, "horizons": horizons}}
 
 
@@ -1070,14 +1119,18 @@ def _start_debate(db: Database, ticker: str, **callbacks) -> asyncio.Task:
 def _verdict_payload(ticker: str, state: dict) -> dict:
     """The `verdict` event, identical for a live debate and a replayed one."""
     debate_history = state.get("debate_history", [])
-    ml_prediction = state.get("ml_prediction") or {}
+    # The baseline carries model_meta (walk-forward AUC, CI, Brier skill), and
+    # a metric a run could not measure must not reach the stream as NaN.
+    baseline = _json_safe(state.get("ml_prediction"))
+    ml_prediction = baseline or {}
     return {
         "ticker": ticker,
-        # `predicted_direction`/`confidence` are the GradientBoosting baseline
-        # and go stale to UNKNOWN/0.0 whenever no model exists for the horizon.
-        # The trade call the debate actually reached is `advisory_*`, which is
-        # what the arena headlines. Advisories cached before the trader started
-        # reporting its own call have neither field.
+        # `predicted_direction`/`confidence` are the ML baseline: UNKNOWN/0.0
+        # when no model artifact exists for the horizon, and the base rate when
+        # the model has no measurable edge (model_type "prior"). The trade call
+        # the debate actually reached is `advisory_*`, which is what the arena
+        # headlines. Advisories cached before the trader started reporting its
+        # own call have neither field.
         "predicted_direction": ml_prediction.get("predicted_direction", "UNKNOWN"),
         "confidence": ml_prediction.get("confidence", 0.0),
         "advisory_direction": state.get("trader_direction"),
@@ -1085,7 +1138,7 @@ def _verdict_payload(ticker: str, state: dict) -> dict:
         "final_advisory": state.get("final_advisory"),
         "bull_report": "\n\n".join(line[6:] for line in debate_history if line.startswith("Bull: ")),
         "bear_report": "\n\n".join(line[6:] for line in debate_history if line.startswith("Bear: ")),
-        "ml_prediction": state.get("ml_prediction"),
+        "ml_prediction": baseline,
         "debate_history": debate_history,
         "executive_summary": state.get("executive_summary"),
     }
@@ -1470,13 +1523,20 @@ async def get_charts(ticker: str, days: int = 90):
 
 # ── Accuracy & Reflections ───────────────────────────────────────────
 
-@router.get("/api/accuracy")
-async def get_accuracy(request: Request, ticker: Optional[str] = None):
-    db = getattr(request.app.state, "db", None) or Database()
-    if ticker:
-        ticker = ticker.upper().strip()
+def _build_accuracy_payload(db: Database, ticker: Optional[str]) -> dict:
+    """
+    Resolved-prediction accuracy: the overall record, then split by horizon and
+    by model type within each horizon.
+
+    Synchronous: SQLite reads, run in one worker thread by the endpoint.
+
+    `by_model_type` is what makes the number readable. `prior` rows serve the
+    base rate at a horizon with no model edge, so their hit rate is the
+    benchmark the `universal` rows beside them have to beat.
+    """
     acc = db.get_prediction_accuracy(ticker)
     recent = db.get_recent_predictions(ticker, limit=10)
+    by_model_type = accuracy_breakdown(db, ticker)
     total = acc.get("total", 0) or 0
     correct = acc.get("correct", 0) or 0
     incorrect = acc.get("incorrect", 0) or 0
@@ -1490,8 +1550,116 @@ async def get_accuracy(request: Request, ticker: Optional[str] = None):
         "correct_count": correct,
         "incorrect_count": incorrect,
         "raw": acc,
-        "recent": recent
+        "recent": recent,
+        "by_horizon": accuracy_by_horizon(by_model_type),
+        "by_model_type": by_model_type,
     }
+
+
+@router.get("/api/accuracy")
+async def get_accuracy(request: Request, ticker: Optional[str] = None):
+    db = getattr(request.app.state, "db", None) or Database()
+    ticker = (ticker or "").upper().strip() or None
+    return await asyncio.to_thread(_build_accuracy_payload, db, ticker)
+
+
+def _config_columns(config) -> list[str]:
+    """A stored run config's feature columns in model order, or [] if it cannot say."""
+    if not isinstance(config, dict):
+        return []
+    if isinstance(config.get("feature_names"), list):
+        return [str(name) for name in config["feature_names"]]
+    fields = {k: v for k, v in config.items() if k in ModelConfig.__dataclass_fields__}
+    try:
+        return resolve_columns(ModelConfig(**fields), FEATURE_GROUPS, strict=False)
+    except (TypeError, ValueError, KeyError):
+        return []
+
+
+def _top_importance(raw, config, limit: int = MODEL_METRICS_TOP_FEATURES) -> list[dict]:
+    """
+    A run's `limit` largest permutation importances, largest first, as
+    `{feature, importance[, std]}`.
+
+    Accepts either stored shape: model_eval's list of {feature, importance,
+    std}, where `feature` may be a column index or a name, or a plain
+    {name: importance} mapping. An index is named through the run's config.
+    """
+    if isinstance(raw, dict):
+        raw = [{"feature": name, **(value if isinstance(value, dict) else {"importance": value})}
+               for name, value in raw.items()]
+    if not isinstance(raw, list):
+        return []
+    columns: Optional[list[str]] = None
+    entries = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        feature = item.get("name", item.get("feature"))
+        importance = _safe_float(item.get("importance"), None)
+        if feature is None or importance is None:
+            continue
+        if isinstance(feature, (int, float)) and not isinstance(feature, bool):
+            if columns is None:
+                columns = _config_columns(config)
+            index = int(feature)
+            feature = columns[index] if 0 <= index < len(columns) else f"col_{index}"
+        entry = {"feature": str(feature), "importance": importance}
+        std = _safe_float(item.get("std"), None)
+        if std is not None:
+            entry["std"] = std
+        entries.append(entry)
+    entries.sort(key=lambda entry: entry["importance"], reverse=True)
+    return entries[:limit]
+
+
+def _build_model_metrics_payload(db: Database) -> dict:
+    """
+    The newest training run per horizon, and each horizon's recent runs.
+
+    Synchronous: SQLite reads, run in one worker thread by the endpoint.
+
+    `data` rows are model_metrics rows as stored, `*_json` columns decoded and
+    `importance_json` cut to the top features, plus `horizon_label`. `history`
+    is keyed by horizon in days (a string, being a JSON object key) and lists
+    the last twelve runs newest first, reduced to MODEL_METRICS_HISTORY_KEYS.
+    Every dashboard horizon has a key, an empty list until it has trained.
+    """
+    data = []
+    for row in db.get_latest_model_metrics():
+        entry = dict(row)
+        entry["horizon_label"] = HORIZON_LABELS.get(row.get("horizon_days"))
+        entry["importance_json"] = _top_importance(row.get("importance_json"),
+                                                   row.get("config_json"))
+        data.append(entry)
+
+    horizons = list(HORIZON_LABELS)
+    horizons += [row["horizon_days"] for row in data
+                 if row.get("horizon_days") is not None and row["horizon_days"] not in horizons]
+    history = {
+        str(horizon): [{key: run.get(key) for key in MODEL_METRICS_HISTORY_KEYS}
+                       for run in db.get_model_metrics_history(horizon, limit=12)]
+        for horizon in horizons
+    }
+    # insert_model_metrics stores a *_json string as given, so a NaN written by
+    # hand would decode back to NaN and fail the response's JSON encoding.
+    return _json_safe({"data": data, "history": history})
+
+
+@router.get("/api/model-metrics")
+async def get_model_metrics(request: Request):
+    """
+    Walk-forward skill of the pooled direction model, per horizon.
+
+    Every metric is measured out of sample on purged folds and written by the
+    retrain (pipeline.model_eval). status "prior" means the horizon failed the
+    ship rule and predictions there serve the base rate. Read-only: nothing
+    here loads or trains a model.
+    """
+    db = getattr(request.app.state, "db", None) or Database()
+    return await _model_metrics_cache.get_or_build(
+        "latest", lambda: asyncio.to_thread(_build_model_metrics_payload, db)
+    )
 
 @router.get("/api/reflections/sectors")
 async def get_reflection_sectors(request: Request):

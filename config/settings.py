@@ -149,6 +149,17 @@ class Settings(BaseSettings):
     # timeframes for every tracked ticker, which is real CPU on a phone.
     technical_rating_enabled: bool = True
 
+    # ── Direction model (pooled walk-forward predictor) ──────────────────
+    # Which symbols the weekly retrain learns from: "tracked" (the watchlist
+    # only), "core" (tracked + default watchlist + the eleven sector ETFs) or
+    # "backbone" (core + ~24 long-listed large caps). Predictions are made for
+    # tracked tickers whatever this says; it only decides the training rows.
+    predictor_universe: str = "core"
+    # Thread cap for every fit and predict. HistGradientBoosting takes every
+    # core through OpenMP otherwise, and on the phone the SoC is shared with the
+    # API process.
+    predictor_threads: int = 2
+
     # ── Web Search (optional — enables real-time news for agent debates) ──
     tavily_api_key: str = ""
     web_search_provider: str = "tavily"

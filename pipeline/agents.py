@@ -1,5 +1,6 @@
 import json
 import asyncio
+import math
 from typing import TypedDict, Optional, Dict, Callable, Awaitable, Literal
 import yfinance as yf
 from langgraph.graph import StateGraph, START, END
@@ -25,6 +26,36 @@ from pipeline.analyst_ratings import AnalystRatingsTracker
 from pipeline.technical_rating import TechnicalRatingTracker
 
 log = get_logger(__name__)
+
+
+def _finite(value) -> Optional[float]:
+    """`value` as a float, or None when it is missing, non-numeric, NaN or infinite."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _or_na(value: Optional[float], spec: str) -> str:
+    return "N/A" if value is None else format(value, spec)
+
+
+def _feature_snapshot(raw) -> dict:
+    """The ML baseline's feature snapshot as a dict, whatever form it arrived in.
+
+    The predictor sends a JSON string with NaN written as null. Advisories
+    cached by older code can hold a dict, or a string encoded twice.
+    """
+    value = raw
+    for _ in range(2):
+        if not isinstance(value, (str, bytes, bytearray)):
+            break
+        try:
+            value = json.loads(value or "{}")
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
 
 
 # Passed to Gemini as `response_schema`, which constrains decoding so the long
@@ -86,7 +117,9 @@ _TRADER_SYSTEM_MESSAGE = (
     "You synthesize conflicting analyst reports into actionable trade decisions. "
     "Your decision weights: (1) news sentiment and specific catalysts as primary "
     "drivers, (2) fundamental data as structural context, (3) ML predictions as "
-    "a minor confirmatory signal only. For every recommendation, explicitly state "
+    "a minor confirmatory signal only. An ML baseline reporting no measurable edge "
+    "is the historical base rate, not a forecast: never count it, or an argument "
+    "resting on it, as directional evidence. For every recommendation, explicitly state "
     "your conviction level, time horizon, and the key risk that would invalidate "
     "your thesis. Format output as clean Markdown with ### headers."
 )
@@ -98,7 +131,8 @@ _COMMON_RULES = (
     "2. Ground your arguments primarily in the RECENT news context. You MUST explicitly call out and analyze any specific upcoming catalysts, exact dates (e.g., IPOs, earnings), and figures mentioned in the news.\n"
     "3. If the opposing side makes a valid point, intelligently acknowledge it. Meaningful debate requires conceding undeniable facts.\n"
     "4. News is presented in two sections — 'IN-HOUSE NEWS' (curated, classified by importance) and 'LIVE WEB SEARCH RESULTS' (real-time web data). Treat both as current and factual, but prioritize in-house news when available as it has been through classification.\n"
-    "5. 'SMART MONEY' sections carry disclosed positioning and are factual filings, not opinion. Insider activity comes from SEC Form 4 and covers OPEN-MARKET buys and sells only — grants and option exercises are excluded because they are compensation, not conviction. A sale marked '10b5-1 pre-scheduled' was set up months in advance and is weak evidence of a view; an unscheduled purchase is strong evidence. A 13D means a holder intends to influence the company; a 13G is passive. Korean flows show what institutions (기관) and foreign investors (외국인) net bought or sold. Absence of insider buying is NOT the same as insider selling — do not treat 'no disclosures' as bearish."
+    "5. 'SMART MONEY' sections carry disclosed positioning and are factual filings, not opinion. Insider activity comes from SEC Form 4 and covers OPEN-MARKET buys and sells only — grants and option exercises are excluded because they are compensation, not conviction. A sale marked '10b5-1 pre-scheduled' was set up months in advance and is weak evidence of a view; an unscheduled purchase is strong evidence. A 13D means a holder intends to influence the company; a 13G is passive. Korean flows show what institutions (기관) and foreign investors (외국인) net bought or sold. Absence of insider buying is NOT the same as insider selling — do not treat 'no disclosures' as bearish.\n"
+    "6. 'Technicals (ML Base)' is a statistical baseline. When it reports no measurable edge, its direction is the historical base rate, not a forecast: do not cite it as evidence for either side."
 )
 
 # Persona + rules composed into the system message so the ENTIRE invariant part
@@ -203,21 +237,7 @@ class AdvisoryGraph:
             fundamentals = f"Error fetching fundamentals: {e}"
 
         # Technicals / ML
-        ml = state.get("ml_prediction", {})
-        direction = ml.get("predicted_direction", "UNKNOWN")
-        conf = ml.get("confidence", 0.0)
-
-        if direction == "UNKNOWN":
-            technicals = "No trained ML model exists yet for this ticker. Running debate using news, fundamentals, and general knowledge."
-        else:
-            try:
-                feats = json.loads(ml.get("feature_snapshot", "{}"))
-                rsi = feats.get("rsi_14", "N/A")
-                vol = feats.get("volatility", "N/A")
-                llm_acc = feats.get("llm_historical_accuracy", "N/A")
-                technicals = f"Quantitative ML Predicts {direction} with {int(conf*100)}% confidence.\nFeatures: RSI={rsi}, Volatility={vol}, Hist LLM Accuracy={llm_acc}."
-            except Exception:
-                technicals = f"Quantitative ML Predicts {direction} with {int(conf*100)}% confidence."
+        technicals = self._ml_baseline_report(state.get("ml_prediction") or {})
 
         # Smart money — disclosed positioning. US tickers get SEC Form 4 insider
         # trades and 13D/G stakes; Korean tickers get daily 기관/외국인 flows.
@@ -242,6 +262,64 @@ class AdvisoryGraph:
             "debate_round_count": 0,
             "debate_history": []
         }
+
+    @staticmethod
+    def _ml_baseline_report(ml: dict) -> str:
+        """
+        The ML baseline as the researchers read it, worded by what the model
+        can actually claim.
+
+        `prior` means walk-forward evaluation found no measurable edge at this
+        horizon, so the direction and probability are the historical base rate.
+        Printed like a forecast ("Predicts UP with 57% confidence") that base
+        rate reads as a directional argument. `universal` is the pooled model's
+        calibrated probability, stated beside the skill it measured out of
+        sample. Rows from the retired per-ticker and sector tiers, which only
+        old cached state still carries, keep their original wording.
+        """
+        direction = ml.get("predicted_direction") or "UNKNOWN"
+        model_type = ml.get("model_type")
+        meta = ml.get("model_meta") or {}
+
+        if direction == "UNKNOWN" or model_type == "llm_only":
+            return ("No trained ML model exists yet for this ticker. Running debate "
+                    "using news, fundamentals, and general knowledge.")
+
+        if model_type == "prior":
+            text = "ML baseline: no measurable edge at this horizon"
+            auc = _finite(meta.get("auc"))
+            if auc is not None:
+                low, high = _finite(meta.get("auc_ci_low")), _finite(meta.get("auc_ci_high"))
+                ci = f", CI {low:.2f}-{high:.2f}" if low is not None and high is not None else ""
+                text += f" (walk-forward AUC {auc:.2f}{ci})"
+            base = _finite(meta.get("base_rate"))
+            if base is None:
+                base = _finite(ml.get("probability_up"))
+            if base is None:
+                return f"{text}. Treat direction as a coin flip."
+            return (f"{text}; historical base rate {base:.0%} of windows closed higher. "
+                    "Treat direction as a coin flip weighted by the base rate.")
+
+        confidence = _finite(ml.get("confidence")) or 0.0
+        if model_type == "universal":
+            p_up = _finite(ml.get("probability_up"))
+            if p_up is None:
+                p_up = confidence if direction == "UP" else 1.0 - confidence
+            features = _feature_snapshot(ml.get("feature_snapshot"))
+            rsi = _finite(features.get("rsi_14"))
+            vol_21 = _finite(features.get("vol_21"))
+            rel_spy_21d = _finite(features.get("rel_spy_21d"))
+            return (
+                f"Quantitative ML (pooled walk-forward model, AUC {_or_na(_finite(meta.get('auc')), '.2f')}, "
+                f"Brier skill {_or_na(_finite(meta.get('brier_skill')), '+.3f')}): "
+                f"P(up) = {p_up:.0%} ({direction}). Key readings: RSI {_or_na(rsi, '.1f')}, "
+                # vol_21 is the daily log-return standard deviation, and
+                # rel_spy_21d the excess log return over SPY in units of it.
+                f"21d vol {_or_na(vol_21, '.1%')}{'/day' if vol_21 is not None else ''}, "
+                f"21d return vs SPY {_or_na(rel_spy_21d, '+.2f')}{'σ' if rel_spy_21d is not None else ''}."
+            )
+
+        return f"Quantitative ML Predicts {direction} with {int(confidence * 100)}% confidence."
 
     def _build_smart_money_report(self, ticker: str) -> str:
         """Insider / stake / flow / off-exchange context for the debate, by market.

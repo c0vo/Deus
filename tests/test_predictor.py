@@ -1,489 +1,564 @@
-import pytest
+"""
+Tests for the pooled direction predictor (feature schema v4).
+
+Everything runs against a temporary SQLite file filled with synthetic daily
+bars: no network, no live LLM. `complete` and `is_llm_configured` are patched as
+pipeline.predictor imports them, and `_enrich_with_web_search` on the class.
+
+The load-bearing assertions are about the product contract, not only the
+numbers: every stored prediction — a model row, a no-edge prior row, a
+short-history row — still runs the web search and an LLM narrative, with the
+model's statistics in the prompt.
+
+Training uses a tiny HistGradientBoosting config registered in place of the
+production ones, so a full train takes a couple of seconds.
+"""
+
+from __future__ import annotations
+
+import json
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import joblib
 import numpy as np
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, AsyncMock, patch
-from pipeline.predictor import FEATURE_DEFAULTS, FEATURE_SCHEMA_VERSION, StockPredictor
+import pandas as pd
+import pytest
 
-@pytest.fixture
-def mock_db():
-    db = MagicMock()
-    # Mock sentiment features
-    db.get_ticker_sentiment_features.return_value = {
-        "sentiment_avg_1d": 0.5,
-        "sentiment_avg_3d": 0.4,
-        "sentiment_avg_7d": 0.3,
-        "sentiment_momentum": 0.2,
-        "news_velocity": 1.5,
-        "max_urgency_24h": 1.0,
-        "avg_importance": 6.5,
-        "bullish_ratio": 0.8,
-    }
-    # Every series loader must return a real (empty) list, not a bare MagicMock.
-    # _cached_series wraps the loader in `except Exception` and falls back to an
-    # empty series, so an unstubbed MagicMock raises on iteration and is
-    # swallowed — the test then passes while silently exercising the defaults
-    # path instead of the code it names.
-    db.get_insider_series.return_value = []
-    db.get_stakes_series.return_value = []
-    db.get_kr_flow_series.return_value = []
-    db.get_offexchange_series.return_value = []
-    db.get_market_regime_series.return_value = []
-    return db
+from config.settings import settings
+from data.database import Database
+from data.watchlist import SECTOR_ETFS, TRAINING_BACKBONE
+from orchestrator.scheduler import (PREDICTION_REFRESH_DAYS, PipelineOrchestrator, grade_prediction,
+                                    has_price_history)
+from pipeline import features, model_configs, model_training
+from pipeline import predictor as predictor_module
+from pipeline.model_artifact import PooledArtifact
+from pipeline.predictor import FEATURE_SCHEMA_VERSION, StockPredictor, resolve_after_date
+from tests.conftest import make_llm_response
+
+N_SESSIONS = 700
+START = "2023-06-01"
+TICKERS = ["AAA", "BBB", "CCC", "DDD", "EEE", "SIG"]
+SHORT = "NEWCO"          # 40 sessions: below the pooled model's 63-session minimum
+NARRATOR = "test/narrator"
+
+TINY = model_configs.ModelConfig(
+    name="test_tiny",
+    feature_groups=("price", "market", "calendar", "context"),
+    params=dict(learning_rate=0.1, max_iter=40, max_leaf_nodes=7, min_samples_leaf=40,
+                early_stopping=False, random_state=0),
+    n_folds=3, test_days=60, min_train_days=250, universe="tracked",
+)
+
+CONTRACT_KEYS = {
+    "ticker", "horizon_days", "predicted_direction", "confidence", "probability_up", "edge",
+    "model_type", "status", "feature_asof", "feature_snapshot", "llm_narrative",
+    "resolve_after", "model_meta",
+}
+MODEL_META_KEYS = {"auc", "auc_ci_low", "auc_ci_high", "brier_skill", "base_rate",
+                   "trained_at", "config", "universe", "n_tickers"}
 
 
-def _offexch_rows(n, last_session="2026-08-07", short_ratio=0.40, spike=None):
-    """n consecutive daily off-exchange rows ending on last_session.
+# ── Synthetic data ───────────────────────────────────────────────────────────
 
-    Alternating jitter keeps the trailing window's variance non-zero, since
-    _z_score returns None on a flat window rather than dividing by zero.
+def _bar_rows(n: int, seed: int, *, price: float = 100.0, vol: float = 0.02,
+              signal: bool = False) -> list[dict]:
+    """A business-day random walk as price_history rows.
+
+    With `signal`, each session drifts in the direction of the trailing
+    21-session return, so ret_21d predicts the next five sessions' direction.
     """
-    end = datetime.strptime(last_session, "%Y-%m-%d").date()
-    rows = []
+    rng = np.random.default_rng(seed)
+    days = pd.bdate_range(START, periods=n)
+    noise = rng.normal(0.0003, vol, n)
+    log_close = np.empty(n)
+    level = np.log(price)
     for i in range(n):
-        day = end - timedelta(days=n - 1 - i)
-        ratio = short_ratio + (0.01 if i % 2 else -0.01)
-        if spike is not None and i == n - 1:
-            ratio = spike
-        total = 1_000_000.0
-        rows.append({
-            "session_date": day.isoformat(),
-            "published_at": f"{day.isoformat()}T22:00:00+00:00",
-            "short_volume": total * ratio,
-            "short_exempt_volume": 0.0,
-            "total_volume": total,
-            "market_codes": "B,Q,N",
-            "consolidated_volume": 2_500_000.0 + (50_000.0 if i % 2 else 0.0),
-        })
+        drift = 0.004 * np.sign(log_close[i - 1] - log_close[i - 22]) if signal and i >= 22 else 0.0
+        level += noise[i] + drift
+        log_close[i] = level
+    close = np.exp(log_close)
+    open_ = close * np.exp(rng.normal(0.0, vol / 3, n))
+    volume = rng.integers(1_000_000, 5_000_000, n)
+    return [{"date": d.strftime("%Y-%m-%d"), "open": float(o), "high": float(max(o, c) * 1.004),
+             "low": float(min(o, c) * 0.996), "close": float(c), "volume": int(v)}
+            for d, o, c, v in zip(days, open_, close, volume)]
+
+
+@pytest.fixture(scope="module")
+def bar_rows() -> dict[str, list[dict]]:
+    rows = {t: _bar_rows(N_SESSIONS, i, signal=(t == "SIG")) for i, t in enumerate(TICKERS)}
+    rows[SHORT] = _bar_rows(40, 77)
+    rows["^GSPC"] = _bar_rows(N_SESSIONS, 100, price=4000.0, vol=0.010)
+    rows["^VIX"] = _bar_rows(N_SESSIONS, 101, price=18.0, vol=0.050)
+    rows["^TNX"] = _bar_rows(N_SESSIONS, 102, price=4.0, vol=0.020)
     return rows
 
 
-def _regime_rows(n, metric, value=0.45, last_session="2026-08-07"):
-    end = datetime.strptime(last_session, "%Y-%m-%d").date()
-    rows = []
-    for i in range(n):
-        day = end - timedelta(days=n - 1 - i)
-        rows.append({
-            "metric": metric,
-            "session_date": day.isoformat(),
-            "value": value + (0.01 if i % 2 else -0.01),
-            "published_at": f"{(day + timedelta(days=1)).isoformat()}T00:00:00+00:00",
-            "source": "test",
-        })
-    return rows
+def _make_db(path: Path, bar_rows: dict[str, list[dict]]) -> Database:
+    database = Database(db_path=str(path))
+    database.initialize()
+    for symbol, rows in bar_rows.items():
+        database.upsert_price_history(symbol, rows)
+    with database.connection() as conn:
+        # A stored sector keeps get_ticker_sector off yfinance.
+        for symbol in TICKERS + [SHORT]:
+            conn.execute("INSERT OR REPLACE INTO ticker_info (ticker, sector) VALUES (?, ?)",
+                         (symbol, "Technology"))
+    database.set_config("tracked_tickers", json.dumps(TICKERS + [SHORT]))
+    return database
+
+
+@contextmanager
+def _tiny_production_config():
+    with patch.dict(model_configs.CONFIGS, {TINY.name: TINY}), \
+            patch.dict(model_configs.PRODUCTION, {h: TINY.name for h in features.HORIZONS}), \
+            patch.object(settings, "predictor_universe", "tracked"), \
+            patch.object(settings, "predictor_threads", 1):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def tiny_config():
+    with _tiny_production_config():
+        yield
+
 
 @pytest.fixture
-def predictor(mock_db):
-    return StockPredictor(mock_db)
-
-def test_compute_rsi(predictor):
-    closes = np.array([10, 11, 12, 11, 10, 9, 8, 9, 10, 11, 12, 13, 14, 15, 14])
-    rsi = predictor._compute_rsi(closes, period=14)
-    assert 0 <= rsi <= 100
-
-def test_compute_sma(predictor):
-    closes = np.array([10, 20, 30, 40, 50])
-    sma = predictor._compute_sma(closes, period=3)
-    assert sma == 40.0
-
-@pytest.mark.asyncio
-async def test_build_feature_vector(predictor):
-    with patch.object(predictor, '_fetch_and_cache_prices', new_callable=AsyncMock) as mock_fetch:
-        # Mock price fetch for the stock and market regimes
-        def side_effect(ticker, *args, **kwargs):
-            if ticker == "^VIX":
-                return [{"date": "2026-05-23", "close": 15}, {"date": "2026-05-24", "close": 16}]
-            elif ticker == "^GSPC":
-                return [{"date": "2026-05-23", "close": 4000}, {"date": "2026-05-24", "close": 4040}]
-            elif ticker == "^TNX":
-                return [{"date": "2026-05-23", "close": 4.0}, {"date": "2026-05-24", "close": 4.1}]
-            else:
-                # Return dummy price history
-                return [{"date": f"2026-05-{i:02d}", "close": 100 + i, "high": 101 + i, "low": 99 + i, "volume": 1000} for i in range(1, 25)]
-        
-        mock_fetch.side_effect = side_effect
-
-        features = await predictor.build_feature_vector("AAPL", as_of_date="2026-05-24")
-        
-        assert features is not None
-        assert "sentiment_avg_1d" in features
-        assert "return_1d" in features
-        assert "vix_level" in features
-        assert features["vix_level"] == 16.0
-        assert features["market_return_1d"] == 0.01  # 4040/4000 - 1
-        # Width is enforced at the source: a typo'd key in any feature method
-        # raises out of build_feature_vector, and nothing on the live path
-        # catches it — the API returns a 500 rather than a degraded prediction.
-        assert len(features) == len(FEATURE_DEFAULTS)
-        assert set(features) == set(FEATURE_DEFAULTS)
+def db(tmp_path, bar_rows) -> Database:
+    return _make_db(tmp_path / "predictor.db", bar_rows)
 
 
-# ── Off-exchange (dark pool) features ───────────────────────────────────────
+@pytest.fixture
+def predictor(db, tmp_path) -> StockPredictor:
+    p = StockPredictor(db)
+    p.models_dir = tmp_path / "models"
+    return p
 
-def test_darkpool_excludes_rows_published_after_the_as_of(predictor, mock_db):
-    """The lookahead guard: a session is invisible until FINRA has posted it.
 
-    Both calls see the identical series. The only difference is where the as-of
-    edge falls relative to the final session's 22:00 UTC publication, and that
-    session is a large spike — so if the boundary were off by a day the z-score
-    would jump, which is exactly the failure that flatters a backtest and dies
-    in production.
-    """
-    mock_db.get_offexchange_series.return_value = _offexch_rows(
-        25, last_session="2026-08-07", spike=0.95
+@pytest.fixture(scope="module")
+def trained(tmp_path_factory, bar_rows) -> dict:
+    """One 5d training run on the synthetic panel, shared by the tests that only read it."""
+    root = tmp_path_factory.mktemp("trained")
+    database = _make_db(root / "train.db", bar_rows)
+    with _tiny_production_config():
+        artifact, row, eval_dict = model_training.train_horizon(
+            database, 5, universe="tracked", n_threads=1, run_id="test-run")
+    return {"artifact": artifact, "row": row, "eval": eval_dict, "db": database}
+
+
+@pytest.fixture(scope="module")
+def noise_trained(tmp_path_factory, bar_rows) -> dict:
+    """The same training on a panel with no planted signal anywhere."""
+    root = tmp_path_factory.mktemp("noise")
+    noise_rows = {s: r for s, r in bar_rows.items() if s != "SIG"}
+    database = _make_db(root / "noise.db", noise_rows)
+    database.set_config("tracked_tickers", json.dumps([t for t in TICKERS if t != "SIG"]))
+    with _tiny_production_config():
+        artifact, row, _ = model_training.train_horizon(
+            database, 5, universe="tracked", n_threads=1, run_id="noise-run")
+    return {"artifact": artifact, "row": row}
+
+
+def _model_artifact(database: Database, horizon: int = 5) -> PooledArtifact:
+    """A "model" artifact fitted directly, so the model path does not hinge on the ship rule."""
+    tickers = model_training.training_tickers(database, "tracked")
+    inputs, panel = model_training.load_panel(database, tickers)
+    design = model_training.build_design(panel, TINY, horizon, inputs=inputs)
+    model = model_training.factory_for(TINY, design)()
+    model.fit(design.X, design.y.astype(int))
+    return PooledArtifact(
+        model=model, calibrator=None, feature_names=list(design.columns),
+        feature_index=list(design.feature_index), categorical_idx=list(design.cat_idx),
+        horizon=horizon, schema_version=FEATURE_SCHEMA_VERSION, status="model",
+        prior_up_rate=float(design.y.mean()), trained_at="2020-01-01T00:00:00+00:00",
+        train_end="2026-01-01", config_name=TINY.name, universe="tracked",
+        n_tickers=len(tickers), n_rows=design.n_rows,
+        metrics={"auc_mean": 0.56, "auc_ci_low": 0.53, "auc_ci_high": 0.59,
+                 "brier_skill_mean": 0.004, "decile_spread_mean": 0.01},
+        top_features=["ret_21d", "vol_21", "rsi_14"],
     )
-    now = datetime(2026, 8, 7, 23, 59, 59, tzinfo=timezone.utc)
-
-    with_spike = predictor._darkpool_features(
-        "AAPL", datetime(2026, 8, 7, 23, 59, 59, tzinfo=timezone.utc), now)
-    predictor._darkpool_cache.clear()
-    without_spike = predictor._darkpool_features(
-        "AAPL", datetime(2026, 8, 6, 23, 59, 59, tzinfo=timezone.utc), now)
-
-    assert with_spike["offexch_short_ratio_z20"] > 4.0
-    assert abs(without_spike["offexch_short_ratio_z20"]) < 2.0
 
 
-def test_darkpool_needs_enough_history(predictor, mock_db):
-    """A freshly tracked ticker has no distribution to score against."""
-    mock_db.get_offexchange_series.return_value = _offexch_rows(10)
-    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
-
-    assert predictor._darkpool_features("AAPL", None, now) == {}
+def _save(predictor: StockPredictor, artifact: PooledArtifact, horizon: int = 5) -> Path:
+    path = predictor._get_model_path("universal", horizon)
+    predictor._save_artifact(artifact, path)
+    return path
 
 
-def test_darkpool_staleness_guard(predictor, mock_db):
-    """A stale window scored as if it were current looks confident and is not.
+@contextmanager
+def _llm_and_web():
+    """Patch the narrative LLM and the web search; yields (complete_mock, web_mock)."""
+    complete = AsyncMock(return_value=make_llm_response("A plain-English reading."))
+    web = AsyncMock(return_value="IN-HOUSE NEWS\n- something happened")
+    with patch.object(predictor_module, "complete", complete), \
+            patch.object(predictor_module, "is_llm_configured", return_value=True), \
+            patch.object(predictor_module.settings, "model_predictor_narrative", NARRATOR), \
+            patch.object(StockPredictor, "_enrich_with_web_search", web):
+        yield complete, web
 
-    Returning {} hands the caller the neutral default, which is an honest "no
-    reading" — a number computed from three-week-old inputs is not.
+
+def _no_nan_json(text: str) -> dict:
+    def reject(token):
+        raise ValueError(f"non-finite JSON token {token}")
+    return json.loads(text, parse_constant=reject)
+
+
+# ── Universe ─────────────────────────────────────────────────────────────────
+
+def test_training_tickers_exclude_crypto_indices_and_market_inputs():
+    database = MagicMock()
+    database.get_tracked_tickers.return_value = ["nvda", "BTC-USD", "^VIX", "SPY", "^GSPC", "QQQM", "NVDA"]
+
+    assert model_training.training_tickers(database, "tracked") == ["NVDA", "QQQM"]
+
+    core = model_training.training_tickers(database, "core")
+    assert core == sorted(set(core))
+    assert set(SECTOR_ETFS) <= set(core)
+    assert {"NVDA", "QQQM", "AAPL"} <= set(core)
+    assert not any(s.endswith("-USD") or s.startswith("^") for s in core)
+    assert "SPY" not in core
+
+    backbone = model_training.training_tickers(database, "backbone")
+    assert set(TRAINING_BACKBONE) <= set(backbone) and set(core) <= set(backbone)
+
+    with pytest.raises(ValueError):
+        model_training.training_tickers(database, "everything")
+
+
+# ── Training ─────────────────────────────────────────────────────────────────
+
+def test_train_horizon_returns_a_v4_artifact_and_a_metrics_row(trained):
+    artifact, row = trained["artifact"], trained["row"]
+
+    assert artifact.schema_version == FEATURE_SCHEMA_VERSION == 4
+    assert artifact.feature_names and set(artifact.feature_names) <= set(features.FEATURE_NAMES)
+    assert artifact.feature_index == [features.FEATURE_NAMES.index(n) for n in artifact.feature_names]
+    assert artifact.status in ("model", "prior")
+    assert 0.0 < artifact.prior_up_rate < 1.0
+    assert artifact.horizon == 5 and artifact.config_name == TINY.name
+    assert artifact.n_tickers == len(TICKERS) + 1 and artifact.n_rows > 0
+
+    columns = set(Database._MODEL_METRICS_COLUMNS) - {"created_at"}
+    assert columns <= set(row)
+    assert row["status"] == artifact.status and row["horizon_days"] == 5
+    assert row["run_id"] == "test-run" and row["schema_version"] == 4
+    assert row["auc_mean"] is not None and row["folds_json"]
+
+    # The row is insertable as-is, and reads back as the latest for its horizon.
+    trained["db"].insert_model_metrics(row)
+    latest = trained["db"].get_latest_model_metrics()
+    assert [r["horizon_days"] for r in latest] == [5]
+    assert latest[0]["config_json"]["name"] == TINY.name
+
+
+def test_pure_noise_panel_ships_the_prior(noise_trained):
+    artifact = noise_trained["artifact"]
+    assert artifact.status == "prior"
+    assert artifact.model is None
+    # A prior artifact answers its base rate whatever the row says.
+    assert artifact.predict_proba_up(np.zeros(len(features.FEATURE_NAMES))) == artifact.prior_up_rate
+    # The evaluation that explains the decision is kept.
+    assert noise_trained["row"]["status"] == "prior"
+    assert noise_trained["row"]["auc_mean"] is not None
+
+
+def test_horizon_without_enough_history_is_saved_as_prior_with_a_note(db):
+    artifact, row, eval_dict = model_training.train_horizon(db, 252, universe="tracked", n_threads=1)
+    assert eval_dict["status"] == "not_measurable"
+    assert artifact.status == "prior" and artifact.model is None
+    assert row["status"] == "prior" and row["auc_mean"] is None
+    assert row["config_json"]["note"]
+
+
+def test_hgb_ignores_columns_with_no_observed_training_value():
+    # scikit-learn 1.9 raises on a numeric column that is NaN on every training row;
+    # every early walk-forward fold has such columns (dark pool, regime, sentiment).
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(400, 4))
+    y = (X[:, 0] > 0).astype(int)
+    X[:, 2] = np.nan
+    X[:, 3] = rng.integers(0, 3, 400)
+    model = model_training.ObservedColumnsHGB(params={"max_iter": 20}, categorical_idx=(2, 3))
+    model.fit(X, y)
+    assert list(model.columns_) == [0, 1, 3]
+    proba = model.predict_proba(X[:5])
+    assert proba.shape == (5, 2) and np.all((proba >= 0) & (proba <= 1))
+
+
+async def test_train_pooled_saves_the_artifact_and_load_model_round_trips_it(predictor, db):
+    path, row = await predictor.train_pooled(5, universe="tracked")
+
+    assert Path(path).name == "universal_model_5d_v4.joblib"
+    assert Path(path).exists() and not Path(path + ".tmp").exists()
+    artifact, label = predictor._load_model("AAA", 5)
+    assert isinstance(artifact, PooledArtifact)
+    assert label == ("universal" if artifact.status == "model" else "prior")
+    assert artifact.status == row["status"]
+    assert [r["horizon_days"] for r in db.get_latest_model_metrics()] == [5]
+
+
+def test_load_model_without_an_artifact_is_llm_only(predictor):
+    assert predictor._load_model("AAA", 5) == (None, "llm_only")
+
+
+def test_load_model_rejects_an_artifact_from_another_schema_without_deleting_it(predictor, trained):
+    stale = PooledArtifact(**{**trained["artifact"].__dict__, "schema_version": 3})
+    path = _save(predictor, stale)
+    assert predictor._load_model("AAA", 5) == (None, "llm_only")
+    assert path.exists()
+
+
+# ── Predictions ──────────────────────────────────────────────────────────────
+
+async def test_prior_prediction_is_web_grounded_and_narrated(predictor, db, noise_trained):
+    artifact = noise_trained["artifact"]
+    _save(predictor, artifact)
+
+    with _llm_and_web() as (complete, web):
+        pred = await predictor.predict("AAA", 5)
+
+    assert CONTRACT_KEYS <= set(pred)
+    assert pred["model_type"] == "prior" and pred["status"] == "prior"
+    assert pred["probability_up"] == artifact.prior_up_rate
+    assert pred["confidence"] == max(pred["probability_up"], 1 - pred["probability_up"])
+    assert pred["edge"] == pred["probability_up"] - 0.5
+    assert set(pred["model_meta"]) == MODEL_META_KEYS
+
+    snapshot = _no_nan_json(pred["feature_snapshot"])
+    assert snapshot["_asof"] == pred["feature_asof"]
+    assert set(snapshot) - {"_asof"} == set(artifact.feature_names)
+
+    # The product contract: web search and the LLM run for a no-edge row too.
+    web.assert_awaited_once()
+    complete.assert_awaited_once()
+    prompt = complete.await_args.kwargs["prompt"]
+    assert "no measurable edge" in prompt
+    assert "IN-HOUSE NEWS" in prompt
+    assert pred["llm_narrative"] == "A plain-English reading."
+
+    stored = db.get_recent_predictions("AAA", 1)[0]
+    assert stored["model_type"] == "prior"
+    assert stored["probability_up"] == pytest.approx(artifact.prior_up_rate)
+    assert stored["feature_asof"] == pred["feature_asof"]
+
+
+async def test_model_prediction_is_web_grounded_and_narrated(predictor, db):
+    artifact = _model_artifact(db)
+    _save(predictor, artifact)
+
+    with _llm_and_web() as (complete, web):
+        pred = await predictor.predict("SIG", 5)
+
+    assert CONTRACT_KEYS <= set(pred)
+    assert pred["model_type"] == "universal" and pred["status"] == "model"
+    assert 0.02 <= pred["probability_up"] <= 0.98
+    assert pred["confidence"] >= 0.5
+    assert pred["edge"] == pred["probability_up"] - 0.5
+    assert pred["predicted_direction"] == ("UP" if pred["probability_up"] >= 0.5 else "DOWN")
+    _no_nan_json(pred["feature_snapshot"])
+
+    web.assert_awaited_once()
+    complete.assert_awaited_once()
+    prompt = complete.await_args.kwargs["prompt"]
+    assert "probability of closing higher" in prompt
+    assert "walk-forward AUC 0.56" in prompt
+    assert "ret_21d" in prompt
+
+
+async def test_short_history_ticker_gets_a_narrated_prior_under_a_model_artifact(predictor, db):
+    _save(predictor, _model_artifact(db))
+
+    with _llm_and_web() as (complete, web):
+        pred = await predictor.predict(SHORT, 5)
+
+    assert pred["model_type"] == "prior" and pred["status"] == "prior"
+    web.assert_awaited_once()
+    complete.assert_awaited_once()
+    assert "only 40 sessions of price history" in complete.await_args.kwargs["prompt"]
+
+
+async def test_todays_row_is_reused_only_when_this_artifact_made_it(predictor, db, noise_trained):
+    artifact = noise_trained["artifact"]
+    _save(predictor, artifact)
+    # An llm_only row from earlier today is not an answer this model gave. Stamped
+    # at the start of the day so it cannot share a second with the fresh row.
+    old_id = db.insert_prediction({"ticker": "AAA", "predicted_direction": "UP", "confidence": 0.7,
+                                   "horizon_days": 5, "model_type": "llm_only",
+                                   "feature_snapshot": "{}", "llm_narrative": "old",
+                                   "resolve_after": "2099-01-01"})
+    with db.connection() as conn:
+        conn.execute("UPDATE predictions SET created_at = datetime('now', 'start of day') WHERE id = ?",
+                     (old_id,))
+
+    with _llm_and_web() as (complete, _web):
+        first = await predictor.predict("AAA", 5)
+        second = await predictor.predict("AAA", 5)
+
+    assert first["model_type"] == "prior"
+    assert complete.await_count == 1
+    assert second["id"] == first["id"]
+    assert second["status"] == "prior" and second["model_meta"] == artifact.meta()
+    assert isinstance(second["feature_snapshot"], str)
+
+
+async def test_fast_fallback_without_an_artifact_is_an_unstored_placeholder(predictor, db):
+    with _llm_and_web() as (complete, web):
+        pred = await predictor.predict("AAA", 21, fast_fallback=True)
+
+    assert pred == {"ticker": "AAA", "horizon_days": 21, "predicted_direction": "TRAINING",
+                    "confidence": 0.0, "model_type": "untrained"}
+    assert db.get_recent_predictions("AAA", 5) == []
+    complete.assert_not_awaited()
+    web.assert_not_awaited()
+
+
+async def test_predict_with_agents_hands_the_debate_the_ml_contract(predictor, db, noise_trained):
+    _save(predictor, noise_trained["artifact"])
+    seen = {}
+
+    class FakeGraph:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def run(self, ticker, ml_prediction, past_lessons, news_context):
+            seen["ml"] = ml_prediction
+            return {"final_advisory": "Hold steady."}
+
+    with _llm_and_web() as (_complete, web), patch("pipeline.agents.AdvisoryGraph", FakeGraph):
+        state = await predictor.predict_with_agents("AAA", 5)
+
+    assert state == {"final_advisory": "Hold steady."}
+    web.assert_awaited_once()
+    ml = seen["ml"]
+    assert set(ml) == {"predicted_direction", "confidence", "probability_up", "edge", "model_type",
+                       "status", "feature_asof", "feature_snapshot", "model_meta"}
+    assert ml["model_type"] == "prior" and ml["status"] == "prior"
+    assert isinstance(ml["feature_snapshot"], str)
+    stored = db.get_recent_predictions("AAA", 1)[0]
+    assert stored["model_type"] == "multi_agent"
+    assert stored["probability_up"] == pytest.approx(ml["probability_up"])
+    assert stored["feature_asof"] == ml["feature_asof"]
+
+
+# ── Dates and grading ────────────────────────────────────────────────────────
+
+def test_resolve_after_counts_weekdays_from_the_asof_session():
+    assert resolve_after_date("2026-09-11", 5) == "2026-09-18"      # Friday -> next Friday
+    assert resolve_after_date("2026-09-14", 1) == "2026-09-15"
+    for asof in ("2026-01-02", "2026-03-31", "2026-12-24"):
+        for h in features.HORIZONS:
+            resolved = date.fromisoformat(resolve_after_date(asof, h))
+            assert resolved.weekday() < 5 and resolved >= date.fromisoformat(asof)
+
+
+def test_grade_prediction_uses_the_session_the_features_described(db, bar_rows):
+    history = bar_rows["AAA"]
+    base, outcome = history[-10], history[-5]
+    grade = grade_prediction({"ticker": "AAA", "horizon_days": 5, "feature_asof": base["date"],
+                              "predicted_direction": "UP"}, db)
+    assert grade["base_date"] == base["date"] and grade["resolved_date"] == outcome["date"]
+    assert grade["actual_change_pct"] == pytest.approx((outcome["close"] / base["close"] - 1) * 100)
+    assert grade["actual_direction"] == ("UP" if outcome["close"] > base["close"] else "DOWN")
+    assert grade["is_correct"] == (grade["actual_direction"] == "UP")
+
+
+def test_grade_prediction_anchors_created_at_on_the_new_york_close(db, bar_rows):
+    history = bar_rows["AAA"]
+    session, previous = history[-30]["date"], history[-31]["date"]
+    before_close = f"{session} 14:00:00"      # 09:00-10:00 in New York
+    after_close = f"{session} 22:00:00"       # 17:00-18:00 in New York
+
+    early = grade_prediction({"ticker": "AAA", "horizon_days": 5, "created_at": before_close,
+                              "predicted_direction": "UP"}, db)
+    late = grade_prediction({"ticker": "AAA", "horizon_days": 5, "created_at": after_close,
+                             "predicted_direction": "UP"}, db)
+    assert early["base_date"] == previous
+    assert late["base_date"] == session
+
+
+def test_grade_prediction_waits_until_the_resolving_session_is_stored(db, bar_rows):
+    history = bar_rows["AAA"]
+    pending = {"ticker": "AAA", "horizon_days": 5, "feature_asof": history[-3]["date"],
+               "predicted_direction": "UP"}
+    assert grade_prediction(pending, db) is None
+    assert has_price_history(db, "AAA") and not has_price_history(db, "ZZZZ")
+
+
+# ── Refresh selection ────────────────────────────────────────────────────────
+#
+# train_missing_models over a stubbed database and predictor. The row that
+# decides whether a horizon is refreshed is the one latest_by_horizon picks, so
+# the debate's newer multi_agent row does not buy a predict() on its own.
+
+def _live_row(ticker: str, horizon: int, model_type: str, hours_ago: float) -> dict:
+    created = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    return {"ticker": ticker, "horizon_days": horizon, "model_type": model_type,
+            "created_at": created.strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def _current_model_rows(ticker: str, *, except_horizon: int | None = None) -> list[dict]:
+    """A universal row from three hours ago for every horizon but `except_horizon`."""
+    return [_live_row(ticker, h, "universal", 3) for h in features.HORIZONS if h != except_horizon]
+
+
+async def _run_refresh(live: dict[str, list[dict]]):
+    """One train_missing_models run, with an artifact trained 30 days ago for every horizon.
+
+    `live` maps each tracked ticker to its active prediction rows. Returns the
+    predict mock and the refreshes the run logged, as (ticker, horizon, reason).
     """
-    mock_db.get_offexchange_series.return_value = _offexch_rows(
-        25, last_session="2026-07-10")
-    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
+    trained_at = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    database = MagicMock()
+    database.get_tracked_tickers.return_value = list(live)
+    database.get_recent_predictions.side_effect = lambda ticker, limit, active_only: sorted(
+        live[ticker], key=lambda row: row["created_at"], reverse=True)   # newest first
+    stub = MagicMock()
+    stub._load_model.side_effect = lambda _ticker, horizon: (
+        PooledArtifact(status="model", horizon=horizon, trained_at=trained_at), "universal")
+    stub.predict = AsyncMock(return_value={"model_type": "universal"})
 
-    assert predictor._darkpool_features("AAPL", None, now) == {}
+    orchestrator = PipelineOrchestrator(db=database)
+    with patch("orchestrator.scheduler.StockPredictor", return_value=stub), \
+            patch("orchestrator.scheduler.log") as log:
+        await orchestrator.train_missing_models()
 
+    # The job swallows its own exceptions; one would pass a no-refresh case vacuously.
+    log.error.assert_not_called()
+    refreshes = [(c.kwargs["ticker"], c.kwargs["horizon_days"], c.kwargs["reason"])
+                 for c in log.info.call_args_list if c.args == ("orchestrator.prediction_refresh",)]
+    return stub.predict, refreshes
 
-def test_darkpool_survives_missing_price_history(predictor, mock_db):
-    """price_history is filled on demand, so the share leg is often absent.
 
-    The short-ratio leg does not depend on it and must still be produced;
-    defaulting both would discard half the signal for no reason.
-    """
-    rows = _offexch_rows(25)
-    for row in rows:
-        row["consolidated_volume"] = None
-    mock_db.get_offexchange_series.return_value = rows
-    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
+async def test_a_debate_row_newer_than_a_current_model_row_does_not_refresh_it():
+    live = {"AAA": _current_model_rows("AAA") + [_live_row("AAA", 5, "multi_agent", 1)],
+            "BBB": []}
 
-    features = predictor._darkpool_features("AAPL", None, now)
-    assert "offexch_short_ratio_z20" in features
-    assert "offexch_volume_share_z20" not in features
+    predict, refreshes = await _run_refresh(live)
 
+    # Every AAA horizon is still current, so the run's one unit goes to BBB.
+    assert refreshes == [("BBB", 5, "missing")]
+    predict.assert_awaited_once_with("BBB", horizon_days=5, fast_fallback=False)
 
-def test_darkpool_is_us_gated(predictor, mock_db):
-    """A Korean ticker must never reach the US-only off-exchange table."""
-    mock_db.get_offexchange_series.return_value = _offexch_rows(25)
 
-    kr = predictor._get_smart_money_features("005930.KS", as_of_date="2026-08-07")
-    assert not any(k.startswith("offexch_") for k in kr)
-    mock_db.get_offexchange_series.assert_not_called()
+async def test_a_horizon_with_only_a_debate_row_is_refreshed_as_not_pooled_model():
+    live = {"AAA": _current_model_rows("AAA", except_horizon=5)
+            + [_live_row("AAA", 5, "multi_agent", 1)]}
 
-    us = predictor._get_smart_money_features("AAPL", as_of_date="2026-08-07")
-    assert "offexch_short_ratio_z20" in us
+    predict, refreshes = await _run_refresh(live)
 
+    assert refreshes == [("AAA", 5, "not_pooled_model")]
+    predict.assert_awaited_once_with("AAA", horizon_days=5, fast_fallback=False)
 
-# ── Market-wide regime features ─────────────────────────────────────────────
 
-def test_regime_series_is_loaded_once_for_all_tickers(predictor, mock_db):
-    """The series is market-wide, so it is cached under a sentinel key.
+async def test_a_stale_model_row_behind_a_newer_debate_row_is_refreshed_as_stale():
+    stale_hours = (PREDICTION_REFRESH_DAYS[5] + 1) * 24
+    live = {"AAA": _current_model_rows("AAA", except_horizon=5)
+            + [_live_row("AAA", 5, "universal", stale_hours), _live_row("AAA", 5, "multi_agent", 1)]}
 
-    retrain_models builds one StockPredictor for every ticker and horizon, so a
-    per-ticker cache key would mean one identical full-table scan per symbol
-    across ~56,000 feature builds.
-    """
-    mock_db.get_market_regime_series.return_value = (
-        _regime_rows(65, "dix", 0.45) + _regime_rows(65, "gex", 8e9)
-    )
-    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
+    predict, refreshes = await _run_refresh(live)
 
-    first = predictor._regime_series_features(None, now)
-    second = predictor._regime_series_features(None, now)
-
-    assert mock_db.get_market_regime_series.call_count == 1
-    assert first == second
-    assert "dix_z60" in first and "gex_z60" in first
-
-
-def test_regime_metrics_default_independently(predictor, mock_db):
-    """DIX has history, OCC does not — one absent feed must not blank the others."""
-    mock_db.get_market_regime_series.return_value = (
-        _regime_rows(65, "dix", 0.45) + _regime_rows(5, "occ_put_call_ratio", 0.7)
-    )
-    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
-
-    features = predictor._regime_series_features(None, now)
-    assert "dix_z60" in features
-    assert "occ_put_call_ratio_z60" not in features
-
-
-def test_regime_staleness_guard(predictor, mock_db):
-    mock_db.get_market_regime_series.return_value = _regime_rows(
-        65, "dix", 0.45, last_session="2026-06-01")
-    now = datetime(2026, 8, 7, tzinfo=timezone.utc)
-
-    assert predictor._regime_series_features(None, now) == {}
-
-
-@pytest.mark.asyncio
-async def test_train_model(predictor):
-    path, cv_metrics = await predictor.train_model("AAPL", scope="per_ticker")
-    # Model filenames carry the feature-schema version so a schema change makes
-    # old artifacts unfindable rather than deleting them.
-    assert path.endswith(f"AAPL_model_1d_v{FEATURE_SCHEMA_VERSION}.joblib")
-    
-    # Verify CV metrics are returned with expected keys
-    assert isinstance(cv_metrics, dict)
-    for key in ["accuracy_mean", "accuracy_std", "brier_mean", "brier_std", "auc_mean", "auc_std", "n_samples", "n_folds"]:
-        assert key in cv_metrics, f"Missing key: {key}"
-    assert cv_metrics["n_folds"] == 5
-    assert 0.0 <= cv_metrics["accuracy_mean"] <= 1.0
-    assert 0.0 <= cv_metrics["brier_mean"] <= 1.0
-    assert 0.0 <= cv_metrics["auc_mean"] <= 1.0
-    
-    # We should be able to load it
-    model, scope = predictor._load_model("AAPL")
-    assert scope == "per_ticker"
-    assert model is not None
-
-@pytest.mark.asyncio
-async def test_predict(predictor):
-    with patch.object(predictor, 'build_feature_vector', new_callable=AsyncMock) as mock_build:
-        # Fake features
-        mock_build.return_value = {f"f_{i}": 0.0 for i in range(20)}
-        
-        with patch.object(predictor, '_load_model') as mock_load:
-            mock_model = MagicMock()
-            mock_model.predict.return_value = [1]
-            mock_model.predict_proba.return_value = [[0.2, 0.8]]
-            mock_load.return_value = (mock_model, "per_ticker")
-            
-            with patch.object(predictor, '_generate_narrative', new_callable=AsyncMock) as mock_narrative:
-                mock_narrative.return_value = "It will go up."
-                
-                predictor.db.get_existing_prediction.return_value = None
-                predictor.db.insert_prediction.return_value = "pred_123"
-                
-                result = await predictor.predict("AAPL", horizon_days=1)
-                
-                assert result["ticker"] == "AAPL"
-                assert result["predicted_direction"] == "UP"
-                assert result["confidence"] == 0.8
-                assert result["model_type"] == "per_ticker"
-                assert result["id"] == "pred_123"
-
-@pytest.mark.asyncio
-async def test_calibrated_model_structure(predictor):
-    """Verify that train_model produces a CalibratedClassifierCV wrapper."""
-    from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.ensemble import GradientBoostingClassifier
-
-    path, cv_metrics = await predictor.train_model("AAPL", scope="per_ticker")
-    model, scope = predictor._load_model("AAPL")
-
-    # The saved model should be a CalibratedClassifierCV wrapping a GradientBoostingClassifier
-    assert isinstance(model, CalibratedClassifierCV), (
-        f"Expected CalibratedClassifierCV, got {type(model).__name__}"
-    )
-    assert isinstance(model.estimator, GradientBoostingClassifier)
-    assert model.method == "sigmoid"  # Platt Scaling
-
-
-# ── Phase 3: Additional ML Model Integrity Tests ────────────────────────────
-
-@pytest.mark.asyncio
-async def test_predict_returns_confidence_between_05_and_10(predictor):
-    """Confidence should always be between 0.5 and 1.0 (not 0.0 or flat 0.5)."""
-    with patch.object(predictor, 'build_feature_vector', new_callable=AsyncMock) as mock_build:
-        mock_build.return_value = {f"f_{i}": 0.0 for i in range(20)}
-
-        with patch.object(predictor, '_load_model') as mock_load:
-            mock_model = MagicMock()
-            mock_model.predict.return_value = [1]
-            mock_model.predict_proba.return_value = [[0.3, 0.7]]
-            mock_load.return_value = (mock_model, "per_ticker")
-
-            with patch.object(predictor, '_generate_narrative', new_callable=AsyncMock) as mock_narrative:
-                mock_narrative.return_value = "Up."
-                predictor.db.get_existing_prediction.return_value = None
-                predictor.db.insert_prediction.return_value = "pred_123"
-
-                result = await predictor.predict("AAPL", horizon_days=1)
-
-                assert 0.5 <= result["confidence"] <= 1.0
-
-@pytest.mark.asyncio
-async def test_predict_different_confidences_for_different_models(predictor):
-    """Different models should produce different confidence values."""
-    with patch.object(predictor, 'build_feature_vector', new_callable=AsyncMock) as mock_build:
-        mock_build.return_value = {f"f_{i}": 0.0 for i in range(20)}
-
-        with patch.object(predictor, '_generate_narrative', new_callable=AsyncMock) as mock_narrative:
-            mock_narrative.return_value = "Narrative."
-            predictor.db.get_existing_prediction.return_value = None
-            predictor.db.insert_prediction.return_value = "pred_123"
-
-            # Test with UP prediction
-            with patch.object(predictor, '_load_model') as mock_load:
-                model_up = MagicMock()
-                model_up.predict.return_value = [1]
-                model_up.predict_proba.return_value = [[0.1, 0.9]]
-                mock_load.return_value = (model_up, "per_ticker")
-
-                result_up = await predictor.predict("AAPL", horizon_days=1)
-
-            predictor.db.insert_prediction.return_value = "pred_456"
-
-            # Test with DOWN prediction
-            with patch.object(predictor, '_load_model') as mock_load2:
-                model_down = MagicMock()
-                model_down.predict.return_value = [0]
-                model_down.predict_proba.return_value = [[0.75, 0.25]]
-                mock_load2.return_value = (model_down, "per_ticker")
-
-                result_down = await predictor.predict("MSFT", horizon_days=1)
-
-            # Different tickers should have different directions
-            assert result_up["predicted_direction"] == "UP"
-            assert result_down["predicted_direction"] == "DOWN"
-
-@pytest.mark.asyncio
-async def test_llm_fallback_when_no_model_exists(predictor):
-    """When no model exists and fast_fallback is True, use LLM-only prediction."""
-    with patch.object(predictor, '_load_model', return_value=(None, None)):
-        with patch.object(predictor, 'build_feature_vector', new_callable=AsyncMock) as mock_build:
-            mock_build.return_value = {f"f_{i}": 0.0 for i in range(20)}
-
-            with patch.object(predictor, '_generate_narrative_with_confidence', new_callable=AsyncMock) as mock_gen:
-                mock_gen.return_value = {
-                    "predicted_direction": "UP",
-                    "confidence": 0.65,
-                    "narrative": "LLM-generated prediction based on recent news.",
-                }
-                predictor.db.get_existing_prediction.return_value = None
-                predictor.db.insert_prediction.return_value = "pred_llm"
-
-                result = await predictor.predict("RARE_TICKER", horizon_days=1, fast_fallback=True)
-
-                assert result["predicted_direction"] == "UP"
-                assert result["confidence"] == 0.65
-
-@pytest.mark.asyncio
-async def test_feature_vector_has_expected_structure(predictor):
-    """build_feature_vector should return a dict with all expected feature keys."""
-    with patch.object(predictor, '_fetch_and_cache_prices', new_callable=AsyncMock) as mock_fetch:
-        def side_effect(ticker, *args, **kwargs):
-            if ticker == "^VIX":
-                return [{"date": "2026-05-23", "close": 15}, {"date": "2026-05-24", "close": 16}]
-            elif ticker == "^GSPC":
-                return [{"date": "2026-05-23", "close": 4000}, {"date": "2026-05-24", "close": 4040}]
-            elif ticker == "^TNX":
-                return [{"date": "2026-05-23", "close": 4.0}, {"date": "2026-05-24", "close": 4.1}]
-            else:
-                return [{"date": f"2026-05-{i:02d}", "close": 100 + i, "high": 101 + i, "low": 99 + i, "volume": 1000} for i in range(1, 25)]
-
-        mock_fetch.side_effect = side_effect
-
-        features = await predictor.build_feature_vector("AAPL", as_of_date="2026-05-24")
-
-        # Should have sentiment features
-        assert "sentiment_avg_1d" in features
-        assert "sentiment_avg_3d" in features
-        assert "sentiment_avg_7d" in features
-        assert "sentiment_momentum" in features
-        assert "news_velocity" in features
-        assert "bullish_ratio" in features
-
-        # Should have price/technical features
-        assert "return_1d" in features
-        assert "return_5d" in features
-        assert "rsi_14" in features
-        assert "volatility" in features
-
-        # Should have market regime features
-        assert "vix_level" in features
-        assert "market_return_1d" in features
-
-def test_rsi_handles_flat_prices(predictor):
-    """RSI should handle flat price sequences without division by zero."""
-    closes = np.array([100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100])
-    rsi = predictor._compute_rsi(closes, period=14)
-    # RSI for flat prices should be 50 (neutral, no gains or losses)
-    assert rsi == 50.0
-
-def test_rsi_handles_period_larger_than_data(predictor):
-    """RSI should handle case where period > len(closes) gracefully."""
-    closes = np.array([100, 101, 102])
-    rsi = predictor._compute_rsi(closes, period=14)
-    # Should return 50 (neutral) when not enough data
-    assert rsi == 50.0
-
-def test_sma_handles_period_larger_than_data(predictor):
-    """SMA should handle period > len(closes) gracefully."""
-    closes = np.array([100, 101, 102])
-    sma = predictor._compute_sma(closes, period=14)
-    assert sma == 0.0  # Returns 0 when not enough data
-
-@pytest.mark.asyncio
-async def test_model_serialization_round_trip(predictor):
-    """Training → save → load should preserve model calibration."""
-    from sklearn.calibration import CalibratedClassifierCV
-    from sklearn.ensemble import GradientBoostingClassifier
-
-    path, cv_metrics = await predictor.train_model("AAPL", scope="per_ticker")
-    # Model filenames carry the feature-schema version so a schema change makes
-    # old artifacts unfindable rather than deleting them.
-    assert path.endswith(f"AAPL_model_1d_v{FEATURE_SCHEMA_VERSION}.joblib")
-
-    # Load it fresh
-    model, scope = predictor._load_model("AAPL")
-
-    assert isinstance(model, CalibratedClassifierCV)
-    assert hasattr(model, "predict_proba")
-    assert hasattr(model, "predict")
-
-@pytest.mark.asyncio
-async def test_sector_model_fallback(predictor):
-    """Predictor should fall through model tiers: per_ticker → sector → universal."""
-    # Mock _get_sector to return a known sector
-    with patch.object(predictor, '_get_sector', return_value="Technology"):
-        with patch.object(predictor, 'build_feature_vector', new_callable=AsyncMock) as mock_build:
-            mock_build.return_value = {f"f_{i}": 0.1 for i in range(20)}
-
-            # _load_model already returns (None, None) if no model found
-            # But train_model creates a per_ticker model, so we need to test
-            # the _get_model_path fallback logic directly
-
-            # Test _get_model_path returns None when no model exists
-            from pipeline.predictor import StockPredictor
-            model, scope = predictor._load_model("NONEXISTENT_TICKER_XYZ")
-            # Should not crash — should return (None, None)
-            assert model is None or hasattr(model, "predict")
-
-@pytest.mark.asyncio
-async def test_train_model_cv_metrics_are_reasonable(predictor):
-    """Cross-validation metrics from training should be in valid ranges."""
-    path, cv_metrics = await predictor.train_model("AAPL", scope="per_ticker")
-
-    assert cv_metrics["n_folds"] == 5
-    assert 0.0 <= cv_metrics["accuracy_mean"] <= 1.0
-    assert 0.0 <= cv_metrics["brier_mean"] <= 1.0
-    assert 0.0 <= cv_metrics["auc_mean"] <= 1.0
-    assert cv_metrics["n_samples"] > 0
-
-    # AUC should be better than random ( > 0.5) if signal exists
-    # Note: on synthetic data this might not hold, so check structure only
-    assert "accuracy_std" in cv_metrics
-    assert "brier_std" in cv_metrics
-    assert "auc_std" in cv_metrics
-
+    assert refreshes == [("AAA", 5, "stale")]
+    predict.assert_awaited_once_with("AAA", horizon_days=5, fast_fallback=False)

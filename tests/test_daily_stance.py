@@ -138,6 +138,35 @@ class TestFactSheet:
         assert "none in the last 5 days" in block
         assert "None" not in block
 
+    def test_ml_line_writes_a_prior_row_as_no_edge(self, engine):
+        """A no-edge row carries the base rate, which must not read as a call."""
+        block = engine.render_fact_block({"ticker": TICKER, "ml": [
+            {"horizon_days": 5, "direction": "UP", "confidence": 0.57,
+             "probability_up": 0.57, "model_type": "prior"},
+            {"horizon_days": 21, "direction": "DOWN", "confidence": 0.58,
+             "probability_up": 0.42, "model_type": "universal"},
+            {"horizon_days": 63, "direction": "UP", "confidence": 0.61,
+             "probability_up": None, "model_type": "llm_only"},
+        ]})
+        assert ("- ML probability: 5d no edge (base 57% up); 21d DOWN 58%; "
+                "63d UP 61% (llm_only)") in block
+
+    def test_ml_block_prefers_the_model_row_over_a_debate_row(self, engine, db):
+        """A debate restates the baseline in a multi_agent row; the model's own row speaks."""
+        for model_type, direction, confidence in (("prior", "UP", 0.57),
+                                                  ("multi_agent", "UNKNOWN", 0.0)):
+            db.insert_prediction({
+                "ticker": TICKER, "predicted_direction": direction,
+                "confidence": confidence, "probability_up": 0.57,
+                "feature_asof": dt.date.today().isoformat(), "horizon_days": 5,
+                "model_type": model_type, "feature_snapshot": "{}",
+                "llm_narrative": "", "resolve_after": "2099-01-01",
+            })
+        ml = engine.build_fact_sheet(TICKER)["ml"]
+        assert [(m["horizon_days"], m["model_type"], m["direction"]) for m in ml] == [
+            (5, "prior", "UP")
+        ]
+
     def test_technical_rating_reaches_the_block(self, engine):
         block = engine.render_fact_block(engine.build_fact_sheet(TICKER))
         assert "1D=Sell" in block

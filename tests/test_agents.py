@@ -1,5 +1,7 @@
 """Tests for AdvisoryGraph — Bull/Bear debate and Trader synthesis."""
 
+import json
+
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from datetime import datetime, timezone
@@ -121,6 +123,64 @@ class TestAggregateDataNode:
             result = await advisory_graph.aggregate_data_node(state)
 
         assert "No trained ML model exists" in result["technical_report"]
+
+
+class TestMlBaselineReport:
+    """_ml_baseline_report() words the baseline by what the model can claim."""
+
+    def test_prior_is_worded_as_the_base_rate_not_a_call(self):
+        from pipeline.agents import AdvisoryGraph
+        text = AdvisoryGraph._ml_baseline_report({
+            "predicted_direction": "UP", "confidence": 0.57, "probability_up": 0.57,
+            "model_type": "prior", "status": "prior",
+            "model_meta": {"auc": 0.512, "auc_ci_low": 0.481, "auc_ci_high": 0.538,
+                           "base_rate": 0.57},
+        })
+        assert text.startswith("ML baseline: no measurable edge at this horizon")
+        assert "(walk-forward AUC 0.51, CI 0.48-0.54)" in text
+        assert "historical base rate 57% of windows closed higher" in text
+        assert "coin flip" in text
+        assert "Predicts" not in text
+
+    def test_prior_without_a_measured_auc_omits_it(self):
+        from pipeline.agents import AdvisoryGraph
+        text = AdvisoryGraph._ml_baseline_report({
+            "predicted_direction": "UP", "confidence": 0.55, "probability_up": 0.55,
+            "model_type": "prior", "model_meta": {"auc": None},
+        })
+        assert "AUC" not in text
+        # No base_rate in model_meta: a prior row's probability_up is the base rate.
+        assert "historical base rate 55%" in text
+
+    def test_universal_states_probability_skill_and_readings(self):
+        from pipeline.agents import AdvisoryGraph
+        snapshot = json.dumps({"rsi_14": 61.23, "vol_21": 0.0182, "rel_spy_21d": None,
+                               "_asof": "2026-09-11"})
+        text = AdvisoryGraph._ml_baseline_report({
+            "predicted_direction": "UP", "confidence": 0.58, "probability_up": 0.58,
+            "model_type": "universal", "status": "model", "feature_snapshot": snapshot,
+            "model_meta": {"auc": 0.552, "brier_skill": 0.0041},
+        })
+        assert "pooled walk-forward model, AUC 0.55, Brier skill +0.004" in text
+        assert "P(up) = 58% (UP)" in text
+        assert "RSI 61.2" in text
+        assert "21d vol 1.8%/day" in text
+        assert "21d return vs SPY N/A" in text
+
+    def test_llm_only_uses_the_no_model_wording(self):
+        from pipeline.agents import AdvisoryGraph
+        text = AdvisoryGraph._ml_baseline_report({
+            "predicted_direction": "UP", "confidence": 0.6, "model_type": "llm_only",
+        })
+        assert "No trained ML model exists" in text
+
+    def test_legacy_tier_keeps_its_wording(self):
+        from pipeline.agents import AdvisoryGraph
+        text = AdvisoryGraph._ml_baseline_report({
+            "predicted_direction": "DOWN", "confidence": 0.64, "model_type": "per_ticker",
+            "feature_snapshot": {"rsi_14": 40.0},
+        })
+        assert text == "Quantitative ML Predicts DOWN with 64% confidence."
 
 
 # ── Consensus Detection Tests ───────────────────────────────────────────────

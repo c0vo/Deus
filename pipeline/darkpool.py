@@ -19,7 +19,7 @@ where the wholesaler marks its own side short, plus market-maker hedging. The
 level is therefore a near-constant per ticker and carries no signal, while
 comparing it across tickers carries less than none. Only the deviation from a
 ticker's OWN trailing distribution is usable, which is why every feature built
-on this is a z-score — see pipeline.predictor._darkpool_features.
+on this is a z-score — see pipeline.features._darkpool_features.
 
 This is not a NewsSource. That ABC is contractually `fetch() -> list[NewsArticle]`
 and these are numeric rows, so the module follows the insider_tracker / kr_flows

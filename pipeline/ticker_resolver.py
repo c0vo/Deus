@@ -206,7 +206,8 @@ class TickerResolver:
         fetched = await self.price_feed._fetch_chart(client, semaphore, symbol, "1y")
         if not fetched:
             return None
-        meta, rows = fetched
+        # (meta, rows, splits); the split events are not needed to resolve a name.
+        meta, rows = fetched[0], fetched[1]
         resolved_symbol = (meta.get("symbol") or symbol).upper()
         long_name = meta.get("longName") or meta.get("shortName") or ""
         exchange = (meta.get("exchangeName") or "").upper()

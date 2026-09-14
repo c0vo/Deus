@@ -144,6 +144,11 @@ class TestDebateSystemMessages:
         assert "news" in _COMMON_RULES.lower()
         assert "CRITICAL RULES" in _COMMON_RULES
 
+    def test_no_edge_baseline_is_not_directional_evidence(self):
+        """A prior baseline is the base rate; argued as a call it becomes invented conviction."""
+        assert "no measurable edge" in _COMMON_RULES
+        assert "no measurable edge" in _TRADER_SYSTEM_MESSAGE
+
 
 class TestChatPrompts:
     """Verify chat/orchestrator prompts are well-formed."""
@@ -258,6 +263,10 @@ class TestDailyStancePrompt:
     def test_absent_data_is_framed_as_information(self):
         assert "no analyst coverage" in DAILY_STANCE_PROMPT
         assert "not a gap to fill" in DAILY_STANCE_PROMPT
+
+    def test_no_edge_means_no_model_signal(self):
+        """The fact block writes a prior row as "no edge"; the rules say what that means."""
+        assert '"no edge" means the model has no signal' in DAILY_STANCE_PROMPT
 
     def test_model_is_not_asked_whether_it_changed_its_mind(self):
         """changed_since_yesterday is computed from the record, never asked."""

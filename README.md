@@ -1,6 +1,6 @@
 # Deus
 
-Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Hacker News, Nitter, Finnhub, WallStreetJournal, Twitter (In-Progress) and Alpha Vantage; classifies and ranks it through OpenRouter, with the model for each function set independently in `.env`; trains per-ticker gradient boosting models to predict price direction; and serves everything through a Next.js dashboard and a Telegram bot. Built to track US + Korean markets.
+Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Hacker News, Nitter, Finnhub, WallStreetJournal, Twitter (In-Progress) and Alpha Vantage; classifies and ranks it through OpenRouter, with the model for each function set independently in `.env`; forecasts price direction with one pooled gradient boosting model per horizon, which serves the base rate wherever walk-forward testing finds no edge; and serves everything through a Next.js dashboard and a Telegram bot. Built to track US + Korean markets.
 
 <p align="center">
   <img src="screenshots/dashboard.png" alt="Deus dashboard" width="100%">
@@ -15,7 +15,7 @@ Self-hosted AI financial news terminal. Ingests market news from RSS, Reddit, Ha
 - **News ingestion** — 6 source types fetched concurrently, deduplicated by URL and by embedding cosine similarity
 - **One model per function** — every call goes through OpenRouter on one key; 21 `MODEL_<FUNCTION>` settings in `.env` decide which model runs which step, provider included
 - **Pipeline** — classification tags event type, sentiment, urgency and tickers; ranking scores importance 0–10 and pushes high-impact stories to Telegram
-- **ML prediction** — per-ticker `GradientBoostingClassifier` with Platt scaling, 38 features (sentiment, technicals, market regime, disclosed positioning, off-exchange volume), 5-fold walk-forward CV
+- **ML prediction** — one pooled `HistGradientBoostingClassifier` per horizon (5d to 1y) on 70 features (technicals, market regime, disclosed positioning, off-exchange volume, sentiment), tested on purged walk-forward folds; a horizon without a measurable edge shows NO EDGE instead of a call, and every prediction still gets a web-grounded LLM reading
 - **Smart money** — SEC Form 4 insider trades and 13D/13G >5% stakes for US tickers, daily institutional and foreign investor flows for Korean ones. Both feed the debate and the model, not just a dashboard panel
 - **Positioning** — FINRA off-exchange (dark pool) volume per ticker, market-wide DIX/GEX and OCC put/call, daily option-chain aggregates, sell-side consensus and price targets, short/medium/long technical ratings
 - **Multi-agent debate** — Bull and Bear researchers argue over two rounds, synthesized into a Buy/Sell/Hold call by a trader agent
@@ -47,7 +47,7 @@ flowchart LR
     DB[("SQLite<br/>FTS5 · sqlite-vec · sse_events")]
 
     subgraph BRAIN["Intelligence"]
-        ML["Predictor<br/>GradientBoosting + Platt"]
+        ML["Predictor<br/>pooled HistGradientBoosting"]
         DEB["Debate<br/>Bull vs Bear → Trader"]
         THE["Thesis engine<br/>theme → bottleneck → names"]
         RAG["Analyst chat<br/>RAG"]
@@ -164,6 +164,6 @@ Leave it empty and the insider and stake jobs simply don't run; everything else 
 
 ## Telegram
 
-`/markets` `/predict <TICKER>` `/trending` `/track` `/untrack` `/accuracy` `/briefing` `/sectors` `/ipos` `/events` `/themes` `/forecast` `/status` `/usage` `/help`
+`/markets` `/predict <TICKER>` `/trending` `/track` `/untrack` `/accuracy` `/model` `/briefing` `/sectors` `/ipos` `/events` `/themes` `/forecast` `/status` `/usage` `/help`
 
 Plain messages are answered by the RAG chat orchestrator — e.g. *"Why did TSLA drop today?"*

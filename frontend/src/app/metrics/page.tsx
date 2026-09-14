@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
-import { Gauge, Database as DbIcon, ShieldAlert, Cpu, BarChart3, HelpCircle } from "lucide-react";
+import { Gauge, Database as DbIcon, ShieldAlert, Cpu, BarChart3, HelpCircle, Brain } from "lucide-react";
 
 interface StatusInfo {
   total_articles: number;
@@ -26,18 +26,65 @@ interface UsageInfo {
   by_model?: Record<string, { tokens: number; cost: number }>;
 }
 
+// Resolved accuracy for one horizon (by_horizon) or one horizon and model type
+// (by_model_type) from /api/accuracy.
+interface AccuracySlice {
+  horizon_days: number;
+  model_type?: string;
+  total: number;
+  correct: number;
+  accuracy_pct: number;
+}
+
 interface AccuracyInfo {
   accuracy: number;
   correct_count: number;
   incorrect_count: number;
   total?: number;
   recent?: Array<{ ticker: string; is_correct: boolean }>;
+  by_horizon?: AccuracySlice[];
+  by_model_type?: AccuracySlice[];
 }
+
+// The newest walk-forward training run for one horizon, from /api/model-metrics.
+// Every metric is out of sample; rates are fractions in [0, 1].
+interface ModelMetricsRow {
+  horizon_days: number;
+  horizon_label?: string | null;
+  created_at?: string | null;
+  // "model": the horizon passed the ship rule. "prior": it did not, and
+  // predictions there serve the base rate.
+  status?: string | null;
+  auc_mean?: number | null;
+  auc_ci_low?: number | null;
+  auc_ci_high?: number | null;
+  brier_skill_mean?: number | null;
+  hi_conf_acc?: number | null;
+  hi_conf_n?: number | null;
+  prior_up_rate?: number | null;
+}
+
+interface ModelMetricsInfo {
+  data?: ModelMetricsRow[];
+}
+
+const HORIZON_LABELS: Record<number, string> = { 5: "5d", 21: "1m", 63: "3m", 252: "1y" };
+const horizonLabel = (days: number) => HORIZON_LABELS[days] ?? `${days}d`;
+
+// "—" for a metric the run could not measure, so a gap never reads as zero.
+const fixed = (value: number | null | undefined, digits: number, signed = false) =>
+  typeof value === "number" && Number.isFinite(value)
+    ? `${signed && value > 0 ? "+" : ""}${value.toFixed(digits)}`
+    : "—";
+const percentOf = (value: number | null | undefined) =>
+  typeof value === "number" && Number.isFinite(value) ? `${(value * 100).toFixed(1)}%` : "—";
 
 export default function Metrics() {
   const [status, setStatus] = useState<StatusInfo | null>(null);
   const [usage, setUsage] = useState<UsageInfo | null>(null);
   const [accuracy, setAccuracy] = useState<AccuracyInfo | null>(null);
+  const [modelMetrics, setModelMetrics] = useState<ModelMetricsInfo | null>(null);
+  const [modelMetricsError, setModelMetricsError] = useState<string | null>(null);
   const [tickers, setTickers] = useState<string[]>([]);
   const [selectedTicker, setSelectedTicker] = useState<string>("");
 
@@ -52,11 +99,12 @@ export default function Metrics() {
         ? `/api/accuracy?ticker=${encodeURIComponent(ticker)}`
         : "/api/accuracy";
 
-      const [statusRes, usageRes, accuracyRes, tickersRes] = await Promise.all([
+      const [statusRes, usageRes, accuracyRes, tickersRes, modelMetricsRes] = await Promise.all([
         fetch("/api/status"),
         fetch("/api/usage"),
         fetch(accuracyUrl),
-        fetch("/api/markets")
+        fetch("/api/markets"),
+        fetch("/api/model-metrics")
       ]);
 
       if (!statusRes.ok || !usageRes.ok || !accuracyRes.ok) {
@@ -71,11 +119,23 @@ export default function Metrics() {
       setUsage(usageData);
       setAccuracy(accuracyData);
 
-      // Extract ticker symbols from markets data for the dropdown
+      // Its own error state: a model that has never trained, or an API that
+      // predates the endpoint, should not blank the rest of the page.
+      if (modelMetricsRes.ok) {
+        setModelMetrics(await modelMetricsRes.json());
+        setModelMetricsError(null);
+      } else {
+        setModelMetrics(null);
+        setModelMetricsError(`/api/model-metrics responded ${modelMetricsRes.status}`);
+      }
+
+      // Extract ticker symbols from markets data for the dropdown. The grid
+      // arrives wrapped as {data: [...]}.
       if (tickersRes.ok) {
         const marketsData = await tickersRes.json();
-        const symbols = Array.isArray(marketsData)
-          ? marketsData.map((m: any) => m.ticker).filter(Boolean).sort()
+        const rows = Array.isArray(marketsData) ? marketsData : marketsData?.data;
+        const symbols = Array.isArray(rows)
+          ? rows.map((m: any) => m.ticker).filter(Boolean).sort()
           : [];
         setTickers(symbols);
       }
@@ -101,6 +161,8 @@ export default function Metrics() {
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
+
+  const modelRows = modelMetrics?.data ?? [];
 
   return (
     <div className="p-4 md:p-6 space-y-4 md:space-y-6">
@@ -213,6 +275,78 @@ export default function Metrics() {
 
           </div>
 
+          {/* Model skill: the pooled model's out-of-sample evaluation per
+              horizon, the numbers that say whether a badge's percentage means
+              anything. NO EDGE rows are serving the base rate. */}
+          <div className="border border-border-dim bg-bg-card p-4">
+            <h3 className="text-xs font-bold text-terminal-muted uppercase tracking-wider mb-4 flex items-center gap-2">
+              <Brain size={14} className="text-terminal-signal" />
+              Model skill (walk-forward)
+            </h3>
+
+            {modelMetricsError ? (
+              <div className="text-xs text-terminal-error">Failed to load model skill: {modelMetricsError}</div>
+            ) : modelRows.length === 0 ? (
+              <div className="border border-border-dim/40 p-3 bg-bg-surface/30 text-xs text-terminal-muted">
+                No model has been trained yet. The worker trains the pooled models automatically.
+              </div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs whitespace-nowrap">
+                  <thead>
+                    <tr className="text-[10px] text-terminal-muted uppercase tracking-wider border-b border-border-dim/40">
+                      <th className="text-left font-medium py-1.5 pr-4">Horizon</th>
+                      <th className="text-left font-medium py-1.5 pr-4">Status</th>
+                      <th className="text-right font-medium py-1.5 pr-4">AUC (90% CI)</th>
+                      <th className="text-right font-medium py-1.5 pr-4">Brier skill</th>
+                      <th className="text-right font-medium py-1.5 pr-4">Hi-conf acc (n)</th>
+                      <th className="text-right font-medium py-1.5 pr-4">Base up-rate</th>
+                      <th className="text-right font-medium py-1.5">Trained</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {modelRows.map((row) => {
+                      const shipped = row.status === "model";
+                      return (
+                        <tr key={row.horizon_days} className="border-b border-border-dim/20 last:border-b-0">
+                          <td className="py-1.5 pr-4 font-bold text-terminal-text">
+                            {row.horizon_label ?? horizonLabel(row.horizon_days)}
+                          </td>
+                          <td className="py-1.5 pr-4">
+                            <span className={shipped ? "tag tag-up" : "tag"}>{shipped ? "MODEL" : "NO EDGE"}</span>
+                          </td>
+                          <td className="py-1.5 pr-4 text-right num text-terminal-text">
+                            {fixed(row.auc_mean, 3)}
+                            <span className="text-terminal-muted">
+                              {" "}({fixed(row.auc_ci_low, 3)}–{fixed(row.auc_ci_high, 3)})
+                            </span>
+                          </td>
+                          <td className="py-1.5 pr-4 text-right num text-terminal-text">
+                            {fixed(row.brier_skill_mean, 4, true)}
+                          </td>
+                          <td className="py-1.5 pr-4 text-right num text-terminal-text">
+                            {percentOf(row.hi_conf_acc)}
+                            <span className="text-terminal-muted"> ({row.hi_conf_n ?? "—"})</span>
+                          </td>
+                          <td className="py-1.5 pr-4 text-right num text-terminal-text">
+                            {percentOf(row.prior_up_rate)}
+                          </td>
+                          <td className="py-1.5 text-right num text-terminal-muted">
+                            {row.created_at ? row.created_at.slice(0, 10) : "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <p className="mt-3 text-[10px] text-terminal-muted leading-relaxed">
+              AUC ranks tickers within a day (0.50 = coin flip) · Brier skill &gt; 0 beats the base rate · NO EDGE = serving the base rate (includes too little evidence to judge)
+            </p>
+          </div>
+
           {/* Bottom Panel: Win Rate & Forecast Accuracy */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
             
@@ -284,6 +418,31 @@ export default function Metrics() {
                       <span className="text-lg font-bold text-terminal-red">{accuracy.incorrect_count}</span>
                     </div>
                   </div>
+
+                  {/* The win rate above mixes every horizon and model type.
+                      prior rows serve the base rate, so theirs is the hit rate
+                      the model rows beside them have to beat. */}
+                  {accuracy.by_model_type && accuracy.by_model_type.length > 0 && (
+                    <div className="border-t border-border-dim/40 pt-3 text-left space-y-1">
+                      <span className="text-[10px] text-terminal-muted uppercase tracking-wider block mb-1">
+                        By horizon &amp; model
+                      </span>
+                      {accuracy.by_model_type.map((row) => (
+                        <div
+                          key={`${row.horizon_days}-${row.model_type}`}
+                          className="flex flex-wrap justify-between gap-x-3 text-[11px]"
+                        >
+                          <span className="text-terminal-muted">
+                            {horizonLabel(row.horizon_days)} · {row.model_type === "prior" ? "prior (base rate)" : row.model_type}
+                          </span>
+                          <span className="num text-terminal-text">
+                            {row.accuracy_pct.toFixed(1)}%
+                            <span className="text-terminal-muted"> n={row.total}</span>
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               ) : (
                 <span className="text-xs text-terminal-muted">No forecasting logs logged.</span>

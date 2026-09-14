@@ -11,7 +11,14 @@ import ForecastNarratives from "../components/ForecastNarratives";
 
 interface PredictionInfo {
   direction: "UP" | "DOWN" | "TRAINING";
+  // Probability of the called direction, max(p, 1 - p).
   confidence: number;
+  // What the numbers are. "universal" is the pooled walk-forward model's call;
+  // "prior" means that horizon showed no measurable edge, so direction and
+  // probability_up are the historical base rate, not a forecast.
+  model_type?: string;
+  // Calibrated P(up), or the base rate on a prior row. Null on older rows.
+  probability_up?: number | null;
   // Absent on the TRAINING placeholders, which stand in for a missing row.
   created_at?: string | null;
 }
@@ -506,13 +513,38 @@ export default function WatchlistPage() {
                               );
                             }
 
+                            // No measurable edge at this horizon: the numbers are the
+                            // base rate, so the badge stays neutral instead of
+                            // colouring a coin flip as a call.
+                            if (pred.model_type === "prior") {
+                              const baseUp = pred.probability_up;
+                              return (
+                                <div
+                                  key={horizon}
+                                  className="text-center px-2.5 py-1 border border-border-dim bg-bg-surface min-w-[70px] text-terminal-muted"
+                                  title="No measurable model edge at this horizon: showing the historical base rate"
+                                >
+                                  <span className="text-[10px] text-terminal-muted block">{horizon.toUpperCase()}</span>
+                                  <span className="text-xs font-bold block">NO EDGE</span>
+                                  {typeof baseUp === "number" && (
+                                    <span className="text-[9px] block">{(baseUp * 100).toFixed(0)}% up</span>
+                                  )}
+                                </div>
+                              );
+                            }
+
                             const isUp = pred.direction === "UP";
                             const badgeBg = isUp ? "border-terminal-green text-terminal-green" : "border-terminal-red text-terminal-red";
+                            const confidencePct = (pred.confidence * 100).toFixed(0);
 
                             return (
                               <div key={horizon} className={`text-center px-2.5 py-1 border bg-bg-surface min-w-[70px] ${badgeBg}`}>
                                 <span className="text-[10px] text-terminal-muted block">{horizon.toUpperCase()}</span>
-                                <span className="text-xs font-bold">{pred.direction} ({(pred.confidence * 100).toFixed(0)}%)</span>
+                                <span className="text-xs font-bold">
+                                  {pred.model_type === "universal"
+                                    ? `${pred.direction} ${confidencePct}%`
+                                    : `${pred.direction} (${confidencePct}%)`}
+                                </span>
                               </div>
                             );
                           })}

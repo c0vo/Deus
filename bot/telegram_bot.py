@@ -16,7 +16,7 @@ from config.settings import settings
 from bot.commands import (
     start_command, help_command, status_command, trending_command, usage_command,
     markets_command, track_command, untrack_command, briefing_command, handle_query,
-    predict_command, accuracy_command,
+    predict_command, accuracy_command, model_command,
     sectors_command, ipos_command, events_command, themes_command, forecast_command,
     macro_command,
     tip_command,
@@ -59,7 +59,8 @@ class DeusBot:
         self.application.add_handler(CommandHandler("untrack", untrack_command))
         self.application.add_handler(CommandHandler("predict", predict_command))
         self.application.add_handler(CommandHandler("accuracy", accuracy_command))
-        
+        self.application.add_handler(CommandHandler("model", model_command))
+
         # Natural language queries (catch-all text messages)
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_query))
         
@@ -95,6 +96,7 @@ class DeusBot:
                 BotCommand("markets", "View live market performance & charts"),
                 BotCommand("predict", "ML prediction (e.g. /predict AAPL)"),
                 BotCommand("accuracy", "View prediction accuracy"),
+                BotCommand("model", "Walk-forward model skill per horizon"),
                 BotCommand("track", "Add to watchlist"),
                 BotCommand("untrack", "Remove from watchlist"),
                 BotCommand("status", "View system status"),

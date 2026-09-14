@@ -14,6 +14,7 @@ import json
 import time
 import asyncio
 
+import httpx
 import numpy as np
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -30,12 +31,16 @@ from config.usage import track_llm
 # namespace would hide a replacement (a test's, or a future reset) from both.
 from config import usage as llm_usage
 from data.database import Database
+from data.prediction_rows import MODEL_ROW_TYPES, latest_by_horizon
 from pipeline.aggregator import NewsAggregator
 from pipeline.classifier import ArticleClassifier, ClassifierNotConfigured
 from pipeline.ranker import ArticleRanker
 from pipeline.embedder import Embedder
 from pipeline.market_scanner import MarketScanner
-from pipeline.predictor import HORIZON_LABELS, StockPredictor
+from pipeline.features import HORIZONS
+from pipeline.model_report import render_metrics_table_html
+from pipeline.model_training import load_panel, training_tickers
+from pipeline.predictor import HORIZON_LABELS, StockPredictor, parse_timestamp_utc
 from pipeline.price_feed import PriceFeed
 from pipeline.sector_analyzer import SectorAnalyzer
 from pipeline.ipo_detector import IPODetector
@@ -98,6 +103,98 @@ DAILY_MISFIRE_GRACE_SECONDS = 6 * 3600
 THESIS_GENERATION_HOUR = 6
 THESIS_GENERATION_MINUTE = 30
 
+# How old, in days, the newest pooled-model prediction for a (ticker, horizon)
+# may get before train_missing_models refreshes it. Longer horizons move less
+# from one day to the next, and every refresh is a web search plus a narrative.
+PREDICTION_REFRESH_DAYS: dict[int, int] = {5: 1, 21: 5, 63: 7, 252: 14}
+
+# Grading reads US closes. A prediction made before the 16:00 New York close
+# could only have seen the previous session's close, so that is its base.
+US_MARKET_TZ = ZoneInfo("America/New_York")
+US_CLOSE_HOUR = 16
+
+
+def has_price_history(db, ticker: str) -> bool:
+    """Whether price_history holds any bar at all for the ticker."""
+    return db.get_close_on_or_before(ticker, "9999-12-31") is not None
+
+
+def grade_prediction(pred: dict, db) -> Optional[dict]:
+    """Grade one prediction on stored daily closes, or None when it cannot be graded yet.
+
+    Base session: the prediction's `feature_asof` — the session its features
+    described. Rows without one are anchored on `created_at` in New York time:
+    made before the 16:00 close, the last session strictly before that date;
+    made after it, the last session on or before that date. Resolved session: exactly
+    `horizon_days` stored sessions after the base, so a 5-session call spanning
+    a holiday is graded five trading days later, not five calendar days.
+
+    Returns {actual_direction, actual_change_pct (percent), is_correct,
+    base_date, resolved_date}. None when there is no base bar or the resolving
+    session has not been stored yet — the caller retries on a later night.
+    """
+    ticker = str(pred.get("ticker") or "").strip().upper()
+    try:
+        horizon_days = int(pred.get("horizon_days") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not ticker or horizon_days < 1:
+        return None
+
+    asof = pred.get("feature_asof")
+    if asof:
+        base = db.get_close_on_or_before(ticker, str(asof)[:10])
+    else:
+        created = parse_timestamp_utc(pred.get("created_at"))
+        if created is None:
+            return None
+        local = created.astimezone(US_MARKET_TZ)
+        day = local.date()
+        if local.hour < US_CLOSE_HOUR:
+            day -= datetime.timedelta(days=1)
+        base = db.get_close_on_or_before(ticker, day.isoformat())
+    if base is None or not base.get("close") or base["close"] <= 0:
+        return None
+
+    resolved = db.get_close_n_sessions_after(ticker, base["date"], horizon_days)
+    if resolved is None:
+        return None
+
+    actual_direction = "UP" if resolved["close"] > base["close"] else "DOWN"
+    return {
+        "actual_direction": actual_direction,
+        "actual_change_pct": (resolved["close"] / base["close"] - 1.0) * 100.0,
+        "is_correct": actual_direction == pred.get("predicted_direction"),
+        "base_date": base["date"],
+        "resolved_date": resolved["date"],
+    }
+
+
+def _refresh_reason(current: Optional[dict], trained_at: str, horizon_days: int,
+                    now: datetime.datetime) -> Optional[str]:
+    """Why the row speaking for a horizon needs replacing, or None if it is current.
+
+    `current` is the row `latest_by_horizon` picked from the live predictions,
+    so it is a pooled-model (universal or prior) row whenever the horizon has
+    one. "not_pooled_model" therefore means only other types are live — a
+    debate's multi_agent row, an llm_only or retired-tier row — and "missing"
+    that nothing is.
+    """
+    if current is None:
+        return "missing"
+    if current.get("model_type") not in MODEL_ROW_TYPES:
+        return "not_pooled_model"
+    created = parse_timestamp_utc(current.get("created_at"))
+    if created is None:
+        return "unknown_age"
+    trained = parse_timestamp_utc(trained_at)
+    if trained is not None and created < trained:
+        return "predates_model"
+    window = datetime.timedelta(days=PREDICTION_REFRESH_DAYS.get(horizon_days, 1))
+    if now - created > window:
+        return "stale"
+    return None
+
 
 class ReflectionLesson(BaseModel):
     """One extracted lesson from a resolved prediction."""
@@ -112,9 +209,10 @@ class ReflectionLesson(BaseModel):
 class PipelineOrchestrator:
     """Orchestrates the periodic execution of the Deus pipeline."""
 
-    # How long to leave a (ticker, horizon) pair alone after training failed for
-    # want of price history. A day: the only thing that can change the answer is
-    # more sessions being ingested, and that happens once per trading day.
+    # How long to leave a horizon alone after its training failed, or a
+    # (ticker, horizon) pair after its prediction failed. A day: what usually
+    # changes the answer is more sessions being ingested, and that happens once
+    # per trading day.
     TRAINING_RETRY_BACKOFF_SECONDS = 24 * 3600
 
     def __init__(self, db: Database, alert_manager: Optional[AlertManager] = None):
@@ -162,11 +260,16 @@ class PipelineOrchestrator:
         # of every pipeline cycle — so it needs its own mutual exclusion.
         # APScheduler's max_instances=1 only stops a job overlapping *itself*.
         self._classify_lock = asyncio.Lock()
-        # (ticker, horizon_days) → unix time before which not to retry training.
-        # In memory on purpose: the only thing that changes the answer is more
-        # price history arriving, and a worker restart retrying once is cheaper
-        # than another user_config write path.
-        self._training_backoff: dict[tuple[str, int], float] = {}
+        # The weekly retrain and the missing-model fill both train pooled models.
+        # Two at once would double the phone's CPU load and race to write the
+        # same artifact, so whichever starts second skips its run.
+        self._training_lock = asyncio.Lock()
+        # horizon_days → unix time before which not to retry training it, and
+        # (ticker, horizon_days) → the same for a failed prediction refresh.
+        # In memory on purpose: a worker restart retrying once is cheaper than
+        # another user_config write path.
+        self._training_backoff: dict[int, float] = {}
+        self._prediction_backoff: dict[tuple[str, int], float] = {}
         # Seeded here, not only in run_pipeline_cycle. The classify job and the
         # embed pass both write into it, and the classify job can now fire from
         # its own interval before any cycle has run.
@@ -1076,7 +1179,6 @@ class PipelineOrchestrator:
             return
             
         try:
-            import httpx
             from bot.formatters import escape_html
             
             tracked = self.db.get_tracked_tickers()
@@ -1230,101 +1332,116 @@ class PipelineOrchestrator:
 
     async def train_missing_models(self) -> None:
         """
-        Fill in one missing (ticker, horizon) prediction per run.
+        One unit of model work per run: train a missing horizon, or refresh one prediction.
+
+        (a) A horizon with no loadable v4 artifact is trained — one horizon per
+            run, under the training lock, parked for a day if it fails.
+        (b) Otherwise the first tracked (ticker, horizon) whose current
+            prediction needs replacing gets a fresh predict(), web search and
+            narrative included. "Current" is the row latest_by_horizon picks,
+            the one every surface shows: the newest live universal or prior
+            row, so a newer multi_agent row from a debate, which restates that
+            baseline, never triggers a refresh by itself. A refresh happens
+            when the horizon has no live universal or prior row (reason
+            "not_pooled_model" when other types are live, a lone multi_agent
+            row included; "missing" when nothing is), when that row predates
+            the artifact's training, or when it is older than
+            PREDICTION_REFRESH_DAYS. Tickers are walked first and horizons
+            second, so one ticker's horizons refresh on consecutive runs and
+            share the web search's hourly cache.
 
         /api/markets renders a TRAINING badge for any horizon with no live
-        prediction and, as of the process split, never trains anything itself.
-        This is the other half of that contract — without it those badges would
-        stay TRAINING forever.
-
-        Deliberately one pair per run. A newly watchlisted ticker needs four
-        models, and training them back to back would monopolise this process
-        for as long as it took; spread out, the grid fills in over a few hours
-        while everything else keeps running.
-
-        A pair that cannot be trained *yet* — `train_model` raises on too little
-        price history — is parked for `TRAINING_RETRY_BACKOFF_SECONDS` instead of
-        being retried on the next tick. Without that, the first such ticker sits
-        at the head of this loop and fails every 20 minutes forever (159 times in
-        one log on the phone), and because the exception escaped to the outer
-        handler it was also the *last* pair attempted each run: every other
-        missing model behind it was never reached.
+        prediction and never trains anything itself; this is the other half of
+        that contract. One unit per run keeps a newly watchlisted ticker from
+        monopolising the worker. A pair whose prediction fails — too little
+        price history, say — is parked for TRAINING_RETRY_BACKOFF_SECONDS
+        instead of being retried on the next tick: otherwise it sits at the head
+        of the walk and every pair behind it is never reached.
         """
         try:
+            now = time.time()
+            predictor = StockPredictor(self.db)
+
+            artifacts = {}
+            for horizon_days in HORIZONS:
+                artifact, _label = await asyncio.to_thread(
+                    predictor._load_model, None, horizon_days
+                )
+                if artifact is not None:
+                    artifacts[horizon_days] = artifact
+                    continue
+                if self._training_backoff.get(horizon_days, 0.0) > now:
+                    continue
+                if self._training_lock.locked():
+                    log.info("orchestrator.training_skipped_lock_held",
+                             horizon_days=horizon_days)
+                    return
+                async with self._training_lock:
+                    log.info("orchestrator.training_missing_model", horizon_days=horizon_days)
+                    run_id = f"fill-{datetime.datetime.now(datetime.timezone.utc):%Y%m%dT%H%M%SZ}"
+                    try:
+                        path, row = await predictor.train_pooled(horizon_days, run_id=run_id)
+                        log.info("orchestrator.missing_model_trained", horizon_days=horizon_days,
+                                 status=row.get("status"), path=path)
+                    except Exception as e:
+                        self._training_backoff[horizon_days] = (
+                            now + self.TRAINING_RETRY_BACKOFF_SECONDS
+                        )
+                        log.error(
+                            "orchestrator.training_failed", horizon_days=horizon_days,
+                            error=str(e) or repr(e),
+                            retry_after_hours=round(self.TRAINING_RETRY_BACKOFF_SECONDS / 3600, 1),
+                        )
+                return  # one unit of work per run
+
+            if not artifacts:
+                return
             tracked = await asyncio.to_thread(self.db.get_tracked_tickers)
             if not tracked:
                 return
 
-            predictor = StockPredictor(self.db)
-            now = time.time()
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
             for ticker in tracked:
                 active = await asyncio.to_thread(
-                    self.db.get_recent_predictions, ticker, 20, True
+                    self.db.get_recent_predictions, ticker, 50, True
                 )
-                covered = {p.get("horizon_days") for p in active}
+                # Newest first, as latest_by_horizon requires. The newest row of
+                # any type would let the debate's multi_agent 5d row buy another
+                # predict() while the model's own row is still current.
+                current = latest_by_horizon(active)
 
-                for horizon_days in HORIZON_LABELS:
-                    if horizon_days in covered:
+                for horizon_days in HORIZONS:
+                    artifact = artifacts.get(horizon_days)
+                    if artifact is None:
+                        continue
+                    if self._prediction_backoff.get((ticker, horizon_days), 0.0) > now:
+                        continue
+                    reason = _refresh_reason(current.get(horizon_days), artifact.trained_at,
+                                             horizon_days, now_utc)
+                    if reason is None:
                         continue
 
-                    until = self._training_backoff.get((ticker, horizon_days), 0.0)
-                    if until > now:
-                        continue
-
-                    model, _scope = await asyncio.to_thread(
-                        predictor._load_model, ticker, horizon_days
-                    )
-                    if model is None:
-                        log.info("orchestrator.training_missing_model",
-                                 ticker=ticker, horizon_days=horizon_days)
-                        try:
-                            await predictor.train_model(
-                                ticker, scope="per_ticker", horizon_days=horizon_days
-                            )
-                        except ValueError as e:
-                            # Not a fault: the ticker simply has too short a
-                            # price history to model yet. info, not error, and
-                            # parked so the loop moves on to the next pair.
-                            self._training_backoff[(ticker, horizon_days)] = (
-                                now + self.TRAINING_RETRY_BACKOFF_SECONDS
-                            )
-                            log.info(
-                                "orchestrator.training_deferred",
-                                ticker=ticker, horizon_days=horizon_days,
-                                reason=str(e),
-                                retry_after_hours=round(
-                                    self.TRAINING_RETRY_BACKOFF_SECONDS / 3600, 1
-                                ),
-                            )
-                            continue
-                        model, _scope = await asyncio.to_thread(
-                            predictor._load_model, ticker, horizon_days
+                    log.info("orchestrator.prediction_refresh", ticker=ticker,
+                             horizon_days=horizon_days, reason=reason)
+                    try:
+                        result = await predictor.predict(
+                            ticker, horizon_days=horizon_days, fast_fallback=False
                         )
-
-                    if model is None:
-                        # Training did not produce a loadable model — usually
-                        # too little price history. Stop rather than fall
-                        # through to predict(), whose llm_only path would spend
-                        # a live LLM call on every cycle for a ticker that
-                        # cannot be modelled. Backed off for the same reason as
-                        # above: otherwise this pair is retried every 20 minutes
-                        # and every pair behind it is never reached.
-                        self._training_backoff[(ticker, horizon_days)] = (
+                    except Exception as e:
+                        result = {"error": str(e) or repr(e)}
+                    if result.get("error"):
+                        self._prediction_backoff[(ticker, horizon_days)] = (
                             now + self.TRAINING_RETRY_BACKOFF_SECONDS
                         )
-                        log.warning("orchestrator.missing_model_unfilled",
-                                    ticker=ticker, horizon_days=horizon_days)
-                        return
-
-                    await predictor.predict(
-                        ticker, horizon_days=horizon_days, fast_fallback=False
-                    )
-                    log.info("orchestrator.missing_model_filled",
-                             ticker=ticker, horizon_days=horizon_days)
-                    return  # one pair per run, by design
+                        log.warning("orchestrator.prediction_refresh_failed", ticker=ticker,
+                                    horizon_days=horizon_days, error=result["error"])
+                    else:
+                        log.info("orchestrator.missing_model_filled", ticker=ticker,
+                                 horizon_days=horizon_days, model_type=result.get("model_type"))
+                    return  # one unit of work per run
 
         except Exception as e:
-            log.error("orchestrator.train_missing_models_failed", error=str(e))
+            log.error("orchestrator.train_missing_models_failed", error=str(e) or repr(e))
 
     async def refresh_prices(self) -> None:
         """Refresh last-known quotes so /api/markets never calls Yahoo inline."""
@@ -2169,103 +2286,134 @@ class PipelineOrchestrator:
             return "1y"
 
     async def resolve_predictions(self):
-        """Fetches unresolved predictions, checks actual prices via Yahoo Finance, updates DB."""
+        """Grade matured predictions against stored daily closes.
+
+        The rule is grade_prediction's: the base is the session the prediction's
+        features described, the outcome the close exactly horizon_days stored
+        sessions later. The Yahoo chart window this job used to grade everything
+        with — anchored on today rather than on the prediction — survives only
+        for tickers with no stored bars at all.
+        """
         try:
-            import httpx
-            unresolved = self.db.get_unresolved_predictions()
+            unresolved = await asyncio.to_thread(self.db.get_unresolved_predictions)
             if not unresolved:
                 return
 
-            async with httpx.AsyncClient(timeout=10) as client:
+            resolved_count = pending = 0
+            client: Optional[httpx.AsyncClient] = None
+            try:
                 for p in unresolved:
+                    ticker = p.get("ticker", "?")
                     try:
-                        ticker = p["ticker"]
-                        horizon_days = p.get("horizon_days", 5)
-                        yahoo_range = self._horizon_to_yahoo_range(horizon_days)
-
-                        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-                        params = {"range": yahoo_range, "interval": "1d"}
-                        headers = {"User-Agent": "Mozilla/5.0"}
-                        resp = await client.get(url, params=params, headers=headers)
-                        data = resp.json()
-
-                        chart = data.get("chart", {}).get("result", [])
-                        if not chart:
+                        if await asyncio.to_thread(has_price_history, self.db, ticker):
+                            grade = await asyncio.to_thread(grade_prediction, p, self.db)
+                        else:
+                            if client is None:
+                                client = httpx.AsyncClient(timeout=10)
+                            grade = await self._grade_from_yahoo(client, p)
+                        if grade is None:
+                            pending += 1
                             continue
 
-                        closes = chart[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-                        closes = [c for c in closes if c is not None]
-
-                        if len(closes) >= 2:
-                            # Compare first available close to last close over the horizon window
-                            actual_direction = "UP" if closes[-1] > closes[0] else "DOWN"
-                            actual_change_pct = ((closes[-1] - closes[0]) / closes[0]) * 100
-                            is_correct = (actual_direction == p["predicted_direction"])
-                            self.db.resolve_prediction(p["id"], actual_direction, actual_change_pct, is_correct)
-                            log.info("orchestrator.prediction_resolved",
-                                     ticker=ticker, horizon_days=horizon_days,
-                                     predicted=p["predicted_direction"], actual=actual_direction,
-                                     correct=is_correct)
+                        await asyncio.to_thread(
+                            self.db.resolve_prediction, p["id"], grade["actual_direction"],
+                            grade["actual_change_pct"], grade["is_correct"],
+                        )
+                        resolved_count += 1
+                        log.info("orchestrator.prediction_resolved",
+                                 ticker=ticker, horizon_days=p.get("horizon_days"),
+                                 model_type=p.get("model_type"),
+                                 predicted=p.get("predicted_direction"),
+                                 actual=grade["actual_direction"],
+                                 change_pct=round(grade["actual_change_pct"], 2),
+                                 correct=grade["is_correct"],
+                                 base_date=grade.get("base_date"),
+                                 resolved_date=grade.get("resolved_date"))
                     except Exception as e:
-                        log.error("orchestrator.resolve_prediction_failed", ticker=p.get("ticker", "?"), error=str(e))
+                        log.error("orchestrator.resolve_prediction_failed", ticker=ticker, error=str(e))
+            finally:
+                if client is not None:
+                    await client.aclose()
 
-            log.info("orchestrator.predictions_resolved")
+            log.info("orchestrator.predictions_resolved", resolved=resolved_count, pending=pending)
         except Exception as e:
             log.error("orchestrator.resolve_predictions_error", error=str(e))
 
+    async def _grade_from_yahoo(self, client: httpx.AsyncClient, p: dict) -> Optional[dict]:
+        """The pre-price_history grading: first vs last close of a Yahoo range ending today."""
+        horizon_days = p.get("horizon_days", 5)
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{p['ticker']}"
+        params = {"range": self._horizon_to_yahoo_range(horizon_days), "interval": "1d"}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = await client.get(url, params=params, headers=headers)
+        chart = resp.json().get("chart", {}).get("result", [])
+        if not chart:
+            return None
+        closes = chart[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+        closes = [c for c in closes if c is not None]
+        if len(closes) < 2:
+            return None
+        actual_direction = "UP" if closes[-1] > closes[0] else "DOWN"
+        return {
+            "actual_direction": actual_direction,
+            "actual_change_pct": ((closes[-1] - closes[0]) / closes[0]) * 100,
+            "is_correct": actual_direction == p["predicted_direction"],
+            "base_date": None,
+            "resolved_date": None,
+        }
+
     async def retrain_models(self):
-        """Retrains models for all tracked tickers and sends a CV metrics report via Telegram."""
+        """Weekly pooled retrain of every horizon, then the skill table on Telegram.
+
+        The panel is built once and shared by the four horizons. Each horizon
+        is evaluated on purged walk-forward folds and saved as a model or, when
+        it shows no measurable edge, as the prior (pipeline.model_training). A
+        horizon that fails keeps its previous artifact and is listed under the
+        table, which shows the newest metrics row per horizon either way.
+        """
+        if self._training_lock.locked():
+            log.info("orchestrator.retrain_skipped_lock_held")
+            return
         try:
-            from bot.formatters import escape_html
-            from pipeline.predictor import StockPredictor
-            tracked = self.db.get_tracked_tickers()
-            if not tracked:
-                return
-                
-            predictor = StockPredictor(self.db)
-            training_results = []  # (label, cv_metrics) tuples
-            failed_tickers = []
+            async with self._training_lock:
+                started = time.perf_counter()
+                run_id = f"weekly-{datetime.datetime.now(datetime.timezone.utc):%Y%m%dT%H%M%SZ}"
+                predictor = StockPredictor(self.db)
+                failures: list[tuple[str, str]] = []
 
-            # Retrain every horizon the UI actually reads. This used to call
-            # train_model with its default horizon_days=1, producing *_1d models
-            # that nothing loads while the 5/21/63/252d models the dashboard
-            # needs were never refreshed here at all.
+                bundle = None
+                try:
+                    tickers = await asyncio.to_thread(
+                        training_tickers, self.db, settings.predictor_universe
+                    )
+                    bundle = await asyncio.to_thread(load_panel, self.db, tickers)
+                except Exception as e:
+                    log.error("orchestrator.retrain_panel_failed", error=str(e) or repr(e))
+                    failures.append(("panel", str(e) or repr(e)))
 
-            for t in tracked:
-                for horizon_days in HORIZON_LABELS:
-                    label = f"{t} ({horizon_days}d)"
-                    try:
-                        _path, cv_metrics = await predictor.train_model(
-                            t, scope="per_ticker", horizon_days=horizon_days)
-                        training_results.append((label, cv_metrics))
-                    except Exception as e:
-                        log.error("orchestrator.retrain_model_failed",
-                                  ticker=t, horizon_days=horizon_days, error=str(e))
-                        failed_tickers.append((label, str(e)))
-                    
-            log.info("orchestrator.models_retrained")
-            
-            # Send Telegram summary report
-            if self.alert_manager and (training_results or failed_tickers):
-                text = "<b>🧠 Weekly Model Retraining Complete</b>\n\n"
-                
-                if training_results:
-                    text += "<pre>"
-                    text += f"{'Ticker':<8}| {'CV Acc':>7} | {'Brier':>6} | {'AUC':>6}\n"
-                    text += f"{'─'*8}|{'─'*9}|{'─'*8}|{'─'*8}\n"
-                    for ticker, m in training_results:
-                        acc_str = f"{m['accuracy_mean']*100:.1f}%"
-                        brier_str = f"{m['brier_mean']:.3f}"
-                        auc_str = f"{m['auc_mean']:.3f}"
-                        text += f"{ticker:<8}| {acc_str:>7} | {brier_str:>6} | {auc_str:>6}\n"
-                    text += "</pre>\n"
-                    text += f"<i>Calibrated with Platt Scaling (5-fold TS-CV, {training_results[0][1]['n_samples']}+ samples)</i>\n"
-                
-                if failed_tickers:
-                    text += "\n⚠️ <b>Failed:</b>\n"
-                    for ticker, err in failed_tickers:
-                        text += f"• {ticker}: {escape_html(err[:80])}\n"
-                
+                if bundle is not None:
+                    for horizon_days in HORIZONS:
+                        label = HORIZON_LABELS.get(horizon_days, f"{horizon_days}d")
+                        try:
+                            path, row = await predictor.train_pooled(
+                                horizon_days, panel_bundle=bundle, run_id=run_id
+                            )
+                            log.info("orchestrator.model_retrained", horizon_days=horizon_days,
+                                     status=row.get("status"), path=path, run_id=run_id)
+                        except Exception as e:
+                            log.error("orchestrator.retrain_model_failed",
+                                      horizon_days=horizon_days, error=str(e) or repr(e))
+                            failures.append((label, str(e) or repr(e)))
+                bundle = None  # the panel is the largest object the worker holds
+
+                total_seconds = time.perf_counter() - started
+                log.info("orchestrator.models_retrained", run_id=run_id,
+                         seconds=round(total_seconds, 1), failed=[label for label, _ in failures])
+
+            if self.alert_manager:
+                rows = await asyncio.to_thread(self.db.get_latest_model_metrics)
+                text = render_metrics_table_html(rows, total_seconds=total_seconds,
+                                                 failures=failures)
                 try:
                     await self.alert_manager.bot.send_message(
                         chat_id=self.alert_manager.chat_id,
@@ -2275,7 +2423,7 @@ class PipelineOrchestrator:
                 except Exception as e:
                     log.error("orchestrator.retrain_report_send_failed", error=str(e))
         except Exception as e:
-            log.error("orchestrator.retrain_models_error", error=str(e))
+            log.error("orchestrator.retrain_models_error", error=str(e) or repr(e))
 
 
 async def run_daily_predictions(db, alert_manager=None):

@@ -346,6 +346,11 @@ start_app() {
     # $DETACH (nohup) detaches them from the controlling terminal, so closing
     # the SSH session that started the watcher does not SIGHUP the app out from
     # under it.
+    #
+    # HistGradientBoosting (the pooled direction model) uses OpenMP, which
+    # otherwise starts a thread per core; two threads keep the phone responsive
+    # while the weekly retrain runs. An OMP_NUM_THREADS already set wins.
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
     log "Starting $WORKER_SCRIPT (logging to $WORKER_LOG)..."
     $DETACH python "$WORKER_SCRIPT" >> "$WORKER_LOG" 2>&1 &
     local worker_pid=$!

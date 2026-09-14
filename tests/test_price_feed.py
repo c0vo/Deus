@@ -16,7 +16,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from data.watchlist import DEFAULT_WATCHLIST, INDEX_TICKERS
+from data.watchlist import (
+    DEFAULT_WATCHLIST,
+    INDEX_TICKERS,
+    MARKET_INPUT_TICKERS,
+    SECTOR_ETFS,
+    TRAINING_BACKBONE,
+)
 from pipeline.price_feed import FALLBACK_TICKERS, HISTORY_RANGE, PriceFeed, _at
 
 
@@ -68,12 +74,20 @@ class _StubClient:
         return resp
 
 
-def _fetch(payload=None, ticker="TSLA", raise_on_get=None):
+def _fetch_with_splits(payload=None, ticker="TSLA", raise_on_get=None,
+                       history_range=HISTORY_RANGE):
+    """(rows, splits) from _fetch_history, or None, plus the stub client."""
     feed = PriceFeed(db=MagicMock())
     client = _StubClient(payload, raise_on_get)
     return asyncio.run(
-        feed._fetch_history(client, asyncio.Semaphore(1), ticker)
+        feed._fetch_history(client, asyncio.Semaphore(1), ticker, history_range)
     ), client
+
+
+def _fetch(payload=None, ticker="TSLA", raise_on_get=None):
+    """Just the bar rows (or None), for the tests that are about rows."""
+    fetched, client = _fetch_with_splits(payload, ticker, raise_on_get)
+    return (fetched[0] if fetched is not None else None), client
 
 
 def _fetch_quote(payload=None, ticker="TSLA", raise_on_get=None):
@@ -204,6 +218,60 @@ def test_requests_a_wide_range_so_gaps_self_heal():
     assert HISTORY_RANGE.endswith("y")   # years, not days or months
 
 
+def test_requests_split_events_with_the_bars():
+    _, client = _fetch(_payload([1786109400], [420.5], [39370100]))
+    assert client.calls[0][1]["params"]["events"] == "splits"
+
+
+def test_max_range_is_requested_as_an_explicit_daily_window():
+    """range=max makes Yahoo return MONTHLY bars even at interval=1d."""
+    _, client = _fetch_with_splits(
+        _payload([1786109400], [420.5], [39370100]), history_range="max")
+    params = client.calls[0][1]["params"]
+    assert "range" not in params
+    assert params["period1"] == 0
+    assert params["period2"] > 1786109400 - 86400 * 365 * 10
+    assert params["interval"] == "1d"
+
+
+def test_refuses_a_non_daily_response():
+    """Monthly rows mixed into price_history poison every rolling window."""
+    payload = _payload([1786109400], [420.5], [39370100])
+    payload["chart"]["result"][0]["meta"]["dataGranularity"] = "1mo"
+    fetched, _ = _fetch_with_splits(payload)
+    assert fetched is None
+
+
+def test_accepts_an_explicit_daily_granularity():
+    payload = _payload([1786109400], [420.5], [39370100])
+    payload["chart"]["result"][0]["meta"]["dataGranularity"] = "1d"
+    rows, _ = _fetch(payload)
+    assert [r["date"] for r in rows] == ["2026-08-07"]
+
+
+def test_parses_split_events_as_new_shares_per_old():
+    payload = _payload([1786109400], [420.5], [39370100])
+    # Keyed by an unrelated stamp on purpose: the event's own date must win.
+    payload["chart"]["result"][0]["events"] = {"splits": {
+        "1": {"date": 1786109400, "numerator": 4.0, "denominator": 1.0,
+              "splitRatio": "4:1"},
+        "2": {"date": 1786023000, "numerator": 1, "denominator": 10,
+              "splitRatio": "1:10"},
+        "3": {"date": 1786023000, "numerator": 1, "denominator": 0},
+    }}
+    fetched, _ = _fetch_with_splits(payload)
+    rows, splits = fetched
+    assert splits == [
+        {"date": "2026-08-06", "ratio": 0.1},
+        {"date": "2026-08-07", "ratio": 4.0},
+    ]
+
+
+def test_no_split_events_is_an_empty_list():
+    fetched, _ = _fetch_with_splits(_payload([1786109400], [420.5], [39370100]))
+    assert fetched[1] == []
+
+
 # ── universe ─────────────────────────────────────────────────────────
 
 
@@ -245,6 +313,21 @@ def test_universe_handles_a_none_from_the_database():
     assert _universe(None)
 
 
+def test_history_universe_adds_the_model_inputs():
+    """Bars are kept for the training backbone and market inputs; quotes are not."""
+    db = MagicMock()
+    db.get_tracked_tickers.return_value = ["MU"]
+    feed = PriceFeed(db=db)
+    history = feed.history_universe()
+
+    assert set(feed.universe()) <= set(history)
+    assert set(TRAINING_BACKBONE) <= set(history)
+    assert set(SECTOR_ETFS) <= set(history)
+    assert set(MARKET_INPUT_TICKERS) <= set(history)
+    assert history == sorted(set(history))
+    assert "^VIX" not in feed.universe()
+
+
 def test_refresh_fetches_the_universe(monkeypatch):
     db = MagicMock()
     db.get_tracked_tickers.return_value = ["MU"]
@@ -264,7 +347,7 @@ def test_refresh_fetches_the_universe(monkeypatch):
     assert sorted(seen) == feed.universe()
 
 
-def test_refresh_history_fetches_the_universe(monkeypatch):
+def test_refresh_history_fetches_the_history_universe(monkeypatch):
     db = MagicMock()
     db.get_tracked_tickers.return_value = ["MU"]
     feed = PriceFeed(db=db)
@@ -278,7 +361,7 @@ def test_refresh_history_fetches_the_universe(monkeypatch):
     monkeypatch.setattr(feed, "_fetch_history", fake_fetch)
     asyncio.run(feed.refresh_history())
 
-    assert sorted(seen) == feed.universe()
+    assert sorted(seen) == feed.history_universe()
 
 
 # ── _fetch_quote ─────────────────────────────────────────────────────
@@ -379,17 +462,20 @@ def test_refresh_drops_failed_quotes_without_dropping_the_batch(monkeypatch):
 # ── refresh_history ──────────────────────────────────────────────────
 
 
+_ONE_BAR = [{"date": "2026-08-07", "open": 1.0, "high": 1.0,
+             "low": 1.0, "close": 1.0, "volume": 10}]
+
+
 def test_refresh_history_upserts_per_ticker_and_counts_rows(monkeypatch):
     db = MagicMock()
     db.get_tracked_tickers.return_value = ["TSLA", "MU", "BADSYM"]
     feed = PriceFeed(db=db)
-    expected = [t for t in feed.universe() if t != "BADSYM"]
+    expected = [t for t in feed.history_universe() if t != "BADSYM"]
 
     async def fake_fetch(client, semaphore, ticker):
         if ticker == "BADSYM":
             return None
-        return [{"date": "2026-08-07", "open": 1.0, "high": 1.0,
-                 "low": 1.0, "close": 1.0, "volume": 10}]
+        return _ONE_BAR, []
 
     monkeypatch.setattr(feed, "_fetch_history", fake_fetch)
 
@@ -399,6 +485,41 @@ def test_refresh_history_upserts_per_ticker_and_counts_rows(monkeypatch):
     upserted = [c.args[0] for c in db.upsert_price_history.call_args_list]
     assert upserted == expected            # the failed symbol is skipped
     assert db.upsert_price_history.call_count == len(expected)
+    db.upsert_price_splits.assert_not_called()   # nobody split
+
+
+def test_refresh_history_stores_split_events(monkeypatch):
+    db = MagicMock()
+    db.get_tracked_tickers.return_value = ["NVDA"]
+    feed = PriceFeed(db=db)
+    split = [{"date": "2024-06-10", "ratio": 10.0}]
+
+    async def fake_fetch(client, semaphore, ticker):
+        return _ONE_BAR, (split if ticker == "NVDA" else [])
+
+    monkeypatch.setattr(feed, "_fetch_history", fake_fetch)
+    asyncio.run(feed.refresh_history())
+
+    db.upsert_price_splits.assert_called_once_with("NVDA", split)
+
+
+def test_refresh_history_for_stores_split_events(monkeypatch):
+    db = MagicMock()
+    feed = PriceFeed(db=db)
+    split = [{"date": "2024-06-10", "ratio": 10.0}]
+    ranges = []
+
+    async def fake_fetch(client, semaphore, ticker, history_range):
+        ranges.append(history_range)
+        return _ONE_BAR, split
+
+    monkeypatch.setattr(feed, "_fetch_history", fake_fetch)
+    stored = asyncio.run(feed.refresh_history_for(["nvda"], history_range="max"))
+
+    assert stored == 1
+    assert ranges == ["max"]
+    db.upsert_price_history.assert_called_once_with("NVDA", _ONE_BAR)
+    db.upsert_price_splits.assert_called_once_with("NVDA", split)
 
 
 def test_refresh_history_falls_back_when_watchlist_is_empty(monkeypatch):
@@ -423,13 +544,12 @@ def test_refresh_history_survives_a_raising_fetch(monkeypatch):
     db = MagicMock()
     db.get_tracked_tickers.return_value = ["TSLA", "MU"]
     feed = PriceFeed(db=db)
-    expected = [t for t in feed.universe() if t != "TSLA"]
+    expected = [t for t in feed.history_universe() if t != "TSLA"]
 
     async def fake_fetch(client, semaphore, ticker):
         if ticker == "TSLA":
             raise RuntimeError("boom")
-        return [{"date": "2026-08-07", "open": 1.0, "high": 1.0,
-                 "low": 1.0, "close": 1.0, "volume": 10}]
+        return _ONE_BAR, []
 
     monkeypatch.setattr(feed, "_fetch_history", fake_fetch)
 

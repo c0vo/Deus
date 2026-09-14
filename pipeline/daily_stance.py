@@ -40,6 +40,7 @@ from config.llm import complete, is_llm_configured, parse_structured
 from config.logging_config import get_logger
 from config.settings import settings
 from config.usage import track_llm
+from data.prediction_rows import latest_by_horizon
 from pipeline.darkpool import DarkPoolTracker
 from pipeline.insider_tracker import InsiderTracker
 from pipeline.macro_calendar import MacroCalendar, today_et
@@ -140,6 +141,7 @@ RULES
 5. A block saying data is absent ("no analyst coverage", "no news in 48h") is information, not a gap to fill.
 6. Do NOT mention yesterday's stance, whether you changed your mind, or how long you have held a view. That is computed from the stored record.
 7. Plain text only: no markdown, HTML or bullets; no currency symbols other than $.
+8. An ML line reading "no edge" means the model has no signal at that horizon: its base rate is not evidence for either direction.
 
 FIELDS — the word limits are hard caps, not targets.
 - thesis: at most {THESIS_MAX_WORDS} words. The facts that decide the call; do not restate the action or conviction.
@@ -247,6 +249,27 @@ def _fmt(value: Optional[float], suffix: str = "", digits: int = 2) -> str:
     if value is None:
         return "n/a"
     return f"{value:+.{digits}f}{suffix}" if suffix == "%" else f"{value:.{digits}f}{suffix}"
+
+
+def _ml_part(entry: dict) -> str:
+    """One horizon of the fact block's ML line.
+
+    A `prior` row is the base rate of a horizon where the model showed no
+    measurable edge, so it is written "no edge" with that rate, never as a call
+    the note could cite. A `universal` row is the pooled model's calibrated
+    call, as the probability of the direction it calls.
+    """
+    horizon = f"{entry['horizon_days']}d"
+    model_type = entry.get("model_type")
+    if model_type == "prior":
+        p_up = entry.get("probability_up")
+        if p_up is None:
+            return f"{horizon} no edge"
+        return f"{horizon} no edge (base {float(p_up) * 100:.0f}% up)"
+    confidence = float(entry.get("confidence") or 0) * 100
+    if model_type == "universal":
+        return f"{horizon} {entry.get('direction')} {confidence:.0f}%"
+    return f"{horizon} {entry.get('direction')} {confidence:.0f}% ({model_type})"
 
 
 class DailyStanceEngine:
@@ -373,21 +396,22 @@ class DailyStanceEngine:
 
         `active_only` keeps a call while its horizon has not elapsed. Training
         and prediction belong to the worker's own jobs; the morning note reads
-        what is already there.
+        what is already there. Per horizon the pooled model's own row wins over
+        a newer debate row restating it, the same choice the dashboard makes; a
+        `prior` row there says the horizon has no model edge.
         """
         preds = self.db.get_recent_predictions(ticker, limit=20, active_only=True)
-        seen: dict[int, dict] = {}
-        for p in preds:
-            horizon = p.get("horizon_days")
-            if horizon is None or horizon in seen:
-                continue
-            seen[horizon] = {
+        rows = latest_by_horizon(preds)
+        return [
+            {
                 "horizon_days": horizon,
-                "direction": p.get("predicted_direction"),
-                "confidence": p.get("confidence"),
-                "model_type": p.get("model_type"),
+                "direction": rows[horizon].get("predicted_direction"),
+                "confidence": rows[horizon].get("confidence"),
+                "probability_up": rows[horizon].get("probability_up"),
+                "model_type": rows[horizon].get("model_type"),
             }
-        return [seen[h] for h in sorted(seen)] or None
+            for horizon in sorted(rows)
+        ] or None
 
     @staticmethod
     def _trim(text: Optional[str]) -> Optional[str]:
@@ -511,10 +535,7 @@ class DailyStanceEngine:
 
         ml = facts.get("ml")
         if ml:
-            parts = [f"{m['horizon_days']}d {m.get('direction')} "
-                     f"{(float(m.get('confidence') or 0) * 100):.0f}% "
-                     f"({m.get('model_type')})" for m in ml]
-            lines.append("- ML probability: " + "; ".join(parts))
+            lines.append("- ML probability: " + "; ".join(_ml_part(m) for m in ml))
         else:
             lines.append("- ML probability: no live model prediction")
 

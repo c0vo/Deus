@@ -208,6 +208,27 @@ CREATE TABLE IF NOT EXISTS price_history (
     fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (ticker, date)
 );
+
+-- Stock splits, one row per ticker per effective session.
+--
+-- A calendar fact, not a price: `date` is the first session trading at the new
+-- share count and `ratio` is new shares per old share (4.0 for a 4:1 split, 0.1
+-- for a 1:10 reverse split). Written by PriceFeed from the chart endpoint's
+-- split events and by backfill_price_history.py --splits.
+--
+-- Needed because price_history is NOT a consistently adjusted series. Yahoo's
+-- bars are split-adjusted as of the moment they are fetched, and every writer
+-- here is INSERT OR REPLACE over a trailing window, so after a split the table
+-- holds re-fetched rows at the new scale next to older rows still at the old
+-- one. pipeline.features uses these ratios to find that seam and repair it;
+-- nothing ever adjusts the stored rows themselves.
+CREATE TABLE IF NOT EXISTS price_splits (
+    ticker TEXT NOT NULL,
+    date TEXT NOT NULL,
+    ratio REAL NOT NULL,
+    PRIMARY KEY (ticker, date)
+);
+
 -- Ticker Info Cache
 CREATE TABLE IF NOT EXISTS ticker_info (
     ticker TEXT PRIMARY KEY,
@@ -220,6 +241,50 @@ CREATE INDEX IF NOT EXISTS idx_predictions_ticker ON predictions(ticker);
 CREATE INDEX IF NOT EXISTS idx_predictions_resolve ON predictions(resolve_after);
 CREATE INDEX IF NOT EXISTS idx_predictions_unresolved ON predictions(is_correct) WHERE is_correct IS NULL;
 CREATE INDEX IF NOT EXISTS idx_price_history_ticker ON price_history(ticker, date);
+
+-- Walk-forward skill of each trained direction model, one row per training run
+-- per horizon.
+--
+-- The retrain used to report its cross-validation only as a Telegram message,
+-- so there was no way to ask whether last week's model was any better than this
+-- week's, or whether any of them beat the base rate at all. Every metric column
+-- is measured out of sample on purged folds (pipeline.model_eval); status says
+-- whether the horizon shipped a model or fell back to the prior. The *_json
+-- columns keep the per-fold breakdown, the config and the permutation
+-- importances, so a surprising number can be traced after the fact.
+CREATE TABLE IF NOT EXISTS model_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    scope TEXT,
+    horizon_days INTEGER,
+    schema_version INTEGER,
+    config_name TEXT,
+    status TEXT,                         -- 'model' | 'prior'
+    n_rows INTEGER,
+    n_dates INTEGER,
+    n_tickers INTEGER,
+    train_end TEXT,
+    auc_mean REAL,
+    auc_std REAL,
+    auc_ci_low REAL,
+    auc_ci_high REAL,
+    logloss_mean REAL,
+    brier_mean REAL,
+    brier_skill_mean REAL,
+    acc_mean REAL,
+    acc_majority_mean REAL,
+    hi_conf_acc REAL,
+    hi_conf_n INTEGER,
+    decile_spread_mean REAL,
+    prior_up_rate REAL,
+    config_json TEXT,
+    folds_json TEXT,
+    importance_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_model_metrics_horizon
+    ON model_metrics(horizon_days, created_at DESC);
+
 -- Reflection Log
 CREATE TABLE IF NOT EXISTS reflection_log (
     id INTEGER PRIMARY KEY,
@@ -1086,6 +1151,20 @@ class Database:
             # now comes from price_history and the current figure from here.
             for col_sql in [
                 "ALTER TABLE latest_prices ADD COLUMN volume REAL",
+            ]:
+                try:
+                    conn.execute(col_sql)
+                except sqlite3.OperationalError:
+                    pass  # Column likely already exists
+
+            # Migration: what the pooled direction model actually said. The
+            # calibrated P(up) is not recoverable from `confidence`, which is
+            # max(p, 1 - p), and `feature_asof` is the session the features
+            # describe — the base date a horizon is graded from, which
+            # created_at only approximates.
+            for col_sql in [
+                "ALTER TABLE predictions ADD COLUMN probability_up REAL",
+                "ALTER TABLE predictions ADD COLUMN feature_asof TEXT",
             ]:
                 try:
                     conn.execute(col_sql)
@@ -3017,29 +3096,71 @@ class Database:
     # ── ML Predictions ───────────────────────────────────────────────────
 
     def insert_prediction(self, prediction_data: dict) -> str:
-        """Insert a new prediction row, returns ID."""
+        """Insert a new prediction row, returns ID.
+
+        `feature_snapshot` may arrive as a dict or as an already-encoded JSON
+        string. A string is stored as-is: the predictor encodes its snapshot
+        itself (it has to, to turn NaN into null), and encoding it a second
+        time here is what left every historical row double-encoded.
+
+        `probability_up` and `feature_asof` are written only when the caller
+        supplies them, so rows from paths that have neither keep NULL.
+        """
         pred_id = prediction_data.get("id") or str(uuid.uuid4())
+        snapshot = prediction_data.get("feature_snapshot", {})
+        if isinstance(snapshot, (bytes, bytearray)):
+            snapshot = snapshot.decode("utf-8")
+        if not isinstance(snapshot, str):
+            snapshot = json.dumps(snapshot)
+        columns = [
+            "id", "ticker", "predicted_direction", "confidence", "horizon_days",
+            "model_type", "feature_snapshot", "llm_narrative", "resolve_after",
+        ]
+        values: list[Any] = [
+            pred_id,
+            prediction_data["ticker"],
+            prediction_data["predicted_direction"],
+            prediction_data["confidence"],
+            prediction_data.get("horizon_days", 1),
+            prediction_data["model_type"],
+            snapshot,
+            prediction_data.get("llm_narrative", ""),
+            prediction_data["resolve_after"],
+        ]
+        for optional in ("probability_up", "feature_asof"):
+            if prediction_data.get(optional) is not None:
+                columns.append(optional)
+                values.append(self._plain(prediction_data[optional]))
         with self.connection() as conn:
             conn.execute(
-                """
-                INSERT INTO predictions (
-                    id, ticker, predicted_direction, confidence, horizon_days,
-                    model_type, feature_snapshot, llm_narrative, resolve_after
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    pred_id,
-                    prediction_data["ticker"],
-                    prediction_data["predicted_direction"],
-                    prediction_data["confidence"],
-                    prediction_data.get("horizon_days", 1),
-                    prediction_data["model_type"],
-                    json.dumps(prediction_data.get("feature_snapshot", {})),
-                    prediction_data.get("llm_narrative", ""),
-                    prediction_data["resolve_after"]
-                )
+                f"INSERT INTO predictions ({', '.join(columns)}) "
+                f"VALUES ({', '.join('?' for _ in columns)})",
+                tuple(values),
             )
         return pred_id
+
+    @staticmethod
+    def _decode_feature_snapshot(value: Any) -> Any:
+        """Stored feature_snapshot -> the dict it encodes.
+
+        Tolerates both formats on disk. Rows written before insert_prediction
+        stopped double-encoding hold a JSON string whose content is itself a
+        JSON string, so one decode yields a str; that is decoded once more.
+        Anything that will not parse is handed back unchanged rather than
+        raising, since this runs inside every prediction read.
+        """
+        if not value or not isinstance(value, (str, bytes, bytearray)):
+            return value
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return value
+        if isinstance(decoded, str):
+            try:
+                decoded = json.loads(decoded)
+            except (TypeError, ValueError):
+                pass
+        return decoded
 
     def get_existing_prediction(self, ticker: str, horizon_days: int, date: str) -> dict | None:
         """Check for cached prediction on a specific date (date string format YYYY-MM-DD)."""
@@ -3056,7 +3177,8 @@ class Database:
                 return None
             result = dict(row)
             if result.get("feature_snapshot"):
-                result["feature_snapshot"] = json.loads(result["feature_snapshot"])
+                result["feature_snapshot"] = self._decode_feature_snapshot(
+                    result["feature_snapshot"])
             return result
 
     def get_unresolved_predictions(self) -> list[dict]:
@@ -3072,7 +3194,8 @@ class Database:
             for row in rows:
                 r = dict(row)
                 if r.get("feature_snapshot"):
-                    r["feature_snapshot"] = json.loads(r["feature_snapshot"])
+                    r["feature_snapshot"] = self._decode_feature_snapshot(
+                        r["feature_snapshot"])
                 results.append(r)
             return results
 
@@ -3091,15 +3214,47 @@ class Database:
                 (actual_direction, actual_change_pct, int(is_correct), prediction_id)
             )
 
-    def get_prediction_accuracy(self, ticker: str = None) -> dict:
-        """Aggregated accuracy stats."""
+    def regrade_prediction(self, prediction_id: str, actual_direction: str,
+                           actual_change_pct: float, is_correct: bool) -> None:
+        """Overwrite an already-resolved prediction's outcome.
+
+        For correcting grades after the grading rule changed
+        (scripts/manual/regrade_predictions.py). resolved_at is left as it was:
+        the row was resolved then, only the answer is being corrected.
+        """
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE predictions SET
+                    actual_direction = ?,
+                    actual_change_pct = ?,
+                    is_correct = ?
+                WHERE id = ?
+                """,
+                (actual_direction, actual_change_pct, int(is_correct), prediction_id)
+            )
+
+    def get_prediction_accuracy(self, ticker: str = None, horizon_days: int = None,
+                                model_type: str = None) -> dict:
+        """Aggregated accuracy stats over resolved predictions.
+
+        Every filter is optional and they combine. Without the horizon and
+        model-type filters a 1-year call and a 5-day call, or an ML row and an
+        LLM-only row, were averaged into one number that described neither.
+        """
         with self.connection() as conn:
             query = "SELECT COUNT(*) as total, SUM(is_correct) as correct FROM predictions WHERE is_correct IS NOT NULL"
-            params = ()
+            params: tuple = ()
             if ticker:
                 query += " AND ticker = ?"
-                params = (ticker,)
-            
+                params += (ticker,)
+            if horizon_days is not None:
+                query += " AND horizon_days = ?"
+                params += (int(horizon_days),)
+            if model_type:
+                query += " AND model_type = ?"
+                params += (model_type,)
+
             row = conn.execute(query, params).fetchone()
             total = row["total"] or 0
             correct = row["correct"] or 0
@@ -3112,6 +3267,36 @@ class Database:
                 "incorrect": incorrect,
                 "accuracy_pct": accuracy
             }
+
+    def get_prediction_accuracy_breakdown(self) -> list[dict]:
+        """Resolved accuracy per (horizon_days, model_type), ordered by both.
+
+        One row per combination that has at least one resolved prediction:
+        `{horizon_days, model_type, total, correct, accuracy_pct}`.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT horizon_days, model_type,
+                       COUNT(*) AS total, SUM(is_correct) AS correct
+                FROM predictions
+                WHERE is_correct IS NOT NULL
+                GROUP BY horizon_days, model_type
+                ORDER BY horizon_days, model_type
+                """
+            ).fetchall()
+        out = []
+        for r in rows:
+            total = r["total"] or 0
+            correct = r["correct"] or 0
+            out.append({
+                "horizon_days": r["horizon_days"],
+                "model_type": r["model_type"],
+                "total": total,
+                "correct": correct,
+                "accuracy_pct": (correct / total * 100) if total > 0 else 0.0,
+            })
+        return out
 
     def get_recent_predictions(self, ticker: str = None, limit: int = 10,
                                active_only: bool = False) -> list[dict]:
@@ -3146,9 +3331,121 @@ class Database:
             for row in rows:
                 r = dict(row)
                 if r.get("feature_snapshot"):
-                    r["feature_snapshot"] = json.loads(r["feature_snapshot"])
+                    r["feature_snapshot"] = self._decode_feature_snapshot(
+                        r["feature_snapshot"])
                 results.append(r)
             return results
+
+    # ── Model metrics ────────────────────────────────────────────────────
+
+    _MODEL_METRICS_COLUMNS = (
+        "run_id", "created_at", "scope", "horizon_days", "schema_version",
+        "config_name", "status", "n_rows", "n_dates", "n_tickers", "train_end",
+        "auc_mean", "auc_std", "auc_ci_low", "auc_ci_high", "logloss_mean",
+        "brier_mean", "brier_skill_mean", "acc_mean", "acc_majority_mean",
+        "hi_conf_acc", "hi_conf_n", "decile_spread_mean", "prior_up_rate",
+        "config_json", "folds_json", "importance_json",
+    )
+    _MODEL_METRICS_JSON = ("config_json", "folds_json", "importance_json")
+
+    @staticmethod
+    def _plain(value: Any) -> Any:
+        """A metric value as something both sqlite3 and json accept.
+
+        numpy scalars are unwrapped (sqlite3 cannot bind np.int64), timestamps
+        become ISO strings, and NaN/inf become None — json.dumps would otherwise
+        write a bare NaN token that no browser's JSON.parse accepts.
+        """
+        if isinstance(value, dict):
+            return {str(k): Database._plain(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [Database._plain(v) for v in value]
+        if isinstance(value, np.ndarray):
+            return [Database._plain(v) for v in value.tolist()]
+        if isinstance(value, np.generic):
+            value = value.item()
+        if isinstance(value, float) and not np.isfinite(value):
+            return None
+        if hasattr(value, "isoformat") and not isinstance(value, str):
+            return value.isoformat()
+        return value
+
+    def insert_model_metrics(self, row: dict) -> int:
+        """Persist one training run's metrics for one horizon. Returns the row id.
+
+        Keys that are not columns are ignored, so a caller can hand over a whole
+        metrics summary. dict/list values for the *_json columns are encoded
+        here; a string is assumed to be JSON already and stored as-is.
+        """
+        values: dict[str, Any] = {}
+        for column in self._MODEL_METRICS_COLUMNS:
+            if column not in row:
+                continue
+            value = row[column]
+            if column in self._MODEL_METRICS_JSON:
+                if value is not None and not isinstance(value, str):
+                    value = json.dumps(self._plain(value))
+            else:
+                value = self._plain(value)
+            values[column] = value
+        if not values:
+            raise ValueError("insert_model_metrics: row has no model_metrics columns")
+
+        columns = ", ".join(values)
+        placeholders = ", ".join("?" for _ in values)
+        with self.connection() as conn:
+            cursor = conn.execute(
+                f"INSERT INTO model_metrics ({columns}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+            return int(cursor.lastrowid)
+
+    def _decode_model_metrics(self, row) -> dict:
+        """A model_metrics row as a dict, with the *_json columns decoded."""
+        out = dict(row)
+        for column in self._MODEL_METRICS_JSON:
+            raw = out.get(column)
+            if isinstance(raw, str) and raw:
+                try:
+                    out[column] = json.loads(raw)
+                except ValueError:
+                    pass  # hand back the raw text rather than lose the row
+        return out
+
+    def get_latest_model_metrics(self) -> list[dict]:
+        """The newest metrics row for each horizon, ordered by horizon.
+
+        "Newest" is by created_at, then id, so two runs stamped in the same
+        second still resolve to the later insert. JSON columns come back decoded.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.* FROM model_metrics m
+                WHERE m.id = (
+                    SELECT m2.id FROM model_metrics m2
+                    WHERE m2.horizon_days IS m.horizon_days
+                    ORDER BY m2.created_at DESC, m2.id DESC
+                    LIMIT 1
+                )
+                ORDER BY m.horizon_days
+                """
+            ).fetchall()
+        return [self._decode_model_metrics(r) for r in rows]
+
+    def get_model_metrics_history(self, horizon_days: int, limit: int = 12) -> list[dict]:
+        """The last `limit` metrics rows for one horizon, newest first."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM model_metrics
+                WHERE horizon_days = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (int(horizon_days), int(limit)),
+            ).fetchall()
+        return [self._decode_model_metrics(r) for r in rows]
 
     # ── Price History ────────────────────────────────────────────────────
 
@@ -3217,6 +3514,94 @@ class Database:
                 tuple(symbols),
             ).fetchall()
         return {r["ticker"]: r["first_date"] for r in rows if r["first_date"]}
+
+    def get_close_on_or_before(self, ticker: str, date: str) -> Optional[dict]:
+        """The last stored session on or before `date`, as `{date, close}`.
+
+        None when the ticker has no bar that early. `date` may carry a time
+        component; only its 'YYYY-MM-DD' prefix is compared.
+        """
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT date, close FROM price_history
+                WHERE ticker = ? AND date <= ? AND close IS NOT NULL
+                ORDER BY date DESC LIMIT 1
+                """,
+                (ticker.upper(), str(date)[:10]),
+            ).fetchone()
+        if not row:
+            return None
+        return {"date": str(row["date"])[:10], "close": float(row["close"])}
+
+    def get_close_n_sessions_after(self, ticker: str, date: str, n: int) -> Optional[dict]:
+        """The close exactly `n` stored sessions after the session on or before `date`.
+
+        Grading a horizon counts sessions, not calendar days, and counts them
+        on the stored bars rather than on an exchange calendar, so a 5-session
+        call made before a holiday is graded five trading days later. Returns
+        `{date, close}`, or None when there is no base session or fewer than `n`
+        sessions have been stored since it — the call is not gradable yet.
+        `n <= 0` returns the base session itself.
+        """
+        n = int(n)
+        if n <= 0:
+            return self.get_close_on_or_before(ticker, date)
+        symbol = ticker.upper()
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT date, close FROM price_history
+                WHERE ticker = ? AND close IS NOT NULL
+                  AND date > (
+                      SELECT MAX(date) FROM price_history
+                      WHERE ticker = ? AND close IS NOT NULL AND date <= ?
+                  )
+                ORDER BY date ASC
+                LIMIT 1 OFFSET ?
+                """,
+                (symbol, symbol, str(date)[:10], n - 1),
+            ).fetchone()
+        if not row:
+            return None
+        return {"date": str(row["date"])[:10], "close": float(row["close"])}
+
+    def upsert_price_splits(self, ticker: str, rows: list[dict]) -> int:
+        """Insert or replace split events for one ticker. Returns rows written.
+
+        Rows are `{date: 'YYYY-MM-DD', ratio: float}` with ratio = new shares
+        per old share. REPLACE rather than IGNORE so a corrected ratio overwrites
+        a wrong one. Rows without a date or with a non-positive ratio are
+        skipped: a zero ratio would divide every earlier bar by zero.
+        """
+        symbol = ticker.upper()
+        clean: list[tuple[str, str, float]] = []
+        for r in rows or []:
+            day = str(r.get("date") or "")[:10]
+            try:
+                ratio = float(r.get("ratio"))
+            except (TypeError, ValueError):
+                continue
+            if len(day) != 10 or not np.isfinite(ratio) or ratio <= 0:
+                continue
+            clean.append((symbol, day, ratio))
+        if not clean:
+            return 0
+        with self.connection() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO price_splits (ticker, date, ratio) VALUES (?, ?, ?)",
+                clean,
+            )
+        return len(clean)
+
+    def get_price_splits(self, ticker: str) -> list[dict]:
+        """Stored split events for one ticker, oldest first, as `{date, ratio}`."""
+        with self.connection() as conn:
+            rows = conn.execute(
+                "SELECT date, ratio FROM price_splits WHERE ticker = ? ORDER BY date ASC",
+                (ticker.upper(),),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ── Sentiment Features ───────────────────────────────────────────────
 
@@ -3306,6 +3691,88 @@ class Database:
                 "bullish_ratio": float(bullish_ratio),
                 "max_urgency_24h": float(max_urgency),
             }
+
+    def get_ticker_news_rows(self, ticker: str) -> list[dict]:
+        """Every classified mention of one ticker, oldest first, unaggregated.
+
+        Keyed on `articles.published_at`, never `ticker_mentions.mentioned_at`:
+        the latter is when the classifier got to the article, which can be days
+        after anyone could have read it. The sentiment is the mention's own
+        (written once, at classification), falling back to the article's.
+
+        Aggregation happens in pandas (pipeline.features), not here: the
+        timestamps are stored in several ISO spellings, and SQLite's date
+        functions silently return NULL on the ones they do not recognise.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT a.published_at,
+                       COALESCE(tm.sentiment_score, a.sentiment_score) AS sentiment_score,
+                       a.importance_score, a.suggested_direction, a.urgency
+                FROM articles a
+                JOIN ticker_mentions tm ON a.id = tm.article_id
+                WHERE tm.ticker = ?
+                ORDER BY a.published_at
+                """,
+                (ticker.upper(),),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def _utc_day(raw: Any) -> Optional[datetime]:
+        """A stored timestamp's UTC calendar day, or None if it will not parse."""
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        try:
+            stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                stamp = datetime.strptime(text[:10], "%Y-%m-%d")
+            except ValueError:
+                return None
+        if stamp.tzinfo is not None:
+            stamp = stamp.astimezone(timezone.utc).replace(tzinfo=None)
+        return stamp.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def get_news_coverage_start(self, window_days: int = 30,
+                                min_mentions: int = 100) -> Optional[str]:
+        """The first day from which classified news coverage is continuous.
+
+        Returns the earliest mention date (UTC, 'YYYY-MM-DD') such that the
+        `window_days` starting on it hold at least `min_mentions` ticker
+        mentions across all tickers, or None if no window ever does.
+
+        The sentiment features are NaN before this date rather than zero. Prices
+        go back decades and classified news back a few months, so without the
+        cut the model would read "no articles" on thousands of rows where the
+        truth is "no one was collecting articles" — and a stray early test
+        article must not be mistaken for the start of coverage, hence a density
+        threshold rather than the first row.
+        """
+        with self.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT a.published_at
+                FROM articles a
+                JOIN ticker_mentions tm ON a.id = tm.article_id
+                """
+            ).fetchall()
+        days = sorted(d for d in (self._utc_day(r["published_at"]) for r in rows) if d)
+        if not days:
+            return None
+
+        span = timedelta(days=int(window_days))
+        hi = 0
+        for lo, start in enumerate(days):
+            if lo and start == days[lo - 1]:
+                continue
+            while hi < len(days) and days[hi] < start + span:
+                hi += 1
+            if hi - lo >= min_mentions:
+                return start.strftime("%Y-%m-%d")
+        return None
 
     # ── Smart money: insider / institutional / KR flows ──────────────────
 

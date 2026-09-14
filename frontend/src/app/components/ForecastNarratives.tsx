@@ -8,9 +8,15 @@ import { fetchJson } from "../utils/api";
 interface HorizonNarrative {
   direction: string;
   confidence: number;
+  // Calibrated P(up), or the base rate on a no-edge row. Null on older rows.
+  probability_up?: number | null;
   horizon_days: number;
   created_at: string | null;
   model_type: string;
+  // True for a "prior" row: the horizon showed no measurable model edge, so its
+  // direction and probability are the base rate. The narrative is still a
+  // web-grounded reading of the news, and is shown like any other.
+  no_edge?: boolean;
   narrative: string;
 }
 
@@ -27,9 +33,10 @@ const HORIZONS = ["5d", "1m", "3m", "1y"];
  * NARRATIVE_MODEL_TYPES in api/server.py, the only types the endpoint serves.
  */
 const CALL_SOURCE: Record<string, string> = {
+  universal: "pooled model",
+  prior: "no edge · base rate",
   per_ticker: "per-ticker model",
   sector: "sector model",
-  universal: "universal model",
   llm_only: "LLM call, no trained model",
 };
 
@@ -119,7 +126,7 @@ export default function ForecastNarratives({
           [ML Forecast Narrative]
         </h4>
         <p className="text-[10px] text-terminal-muted uppercase tracking-wider">
-          Each horizon&apos;s call, interpreted by an LLM with recent news as context
+          Each horizon&apos;s model reading, interpreted by an LLM against web search and recent news
         </p>
       </div>
 
@@ -128,13 +135,24 @@ export default function ForecastNarratives({
       ) : (
         entries.map(([horizon, entry]) => {
           const made = madeAt(entry.created_at);
+          const baseUp = entry.probability_up;
+          const noEdge = entry.no_edge ?? entry.model_type === "prior";
           return (
             <div key={horizon} className="space-y-1">
               <p className="text-xs">
                 <span className="font-bold text-terminal-muted">{horizon.toUpperCase()}</span>{" "}
-                <span className={`font-bold ${directionTone(entry.direction)}`}>
-                  {entry.direction} ({(Number(entry.confidence ?? 0) * 100).toFixed(0)}%)
-                </span>{" "}
+                {noEdge ? (
+                  // The base rate, not a call: neutral, never green or red.
+                  typeof baseUp === "number" && (
+                    <span className="font-bold text-terminal-muted">
+                      {(baseUp * 100).toFixed(0)}% up
+                    </span>
+                  )
+                ) : (
+                  <span className={`font-bold ${directionTone(entry.direction)}`}>
+                    {entry.direction} ({(Number(entry.confidence ?? 0) * 100).toFixed(0)}%)
+                  </span>
+                )}{" "}
                 <span className="text-terminal-muted">
                   &middot; {CALL_SOURCE[entry.model_type] ?? entry.model_type}
                   {made ? ` · made ${made}` : ""}

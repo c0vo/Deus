@@ -6,9 +6,11 @@ Handlers for commands like /start, /status, /trending.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import html
 import json
+import math
 import re
 
 import httpx
@@ -18,6 +20,7 @@ from telegram.ext import ContextTypes
 from config.logging_config import get_logger
 from config.settings import settings
 from data.database import Database
+from data.prediction_rows import accuracy_breakdown, latest_by_horizon
 from bot.formatters import (
     EMPTY_BRIEFING_TEXT,
     MACRO_IMPORTANCE_MARKERS,
@@ -67,8 +70,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• /briefing - Get an immediate daily market briefing (e.g. <code>/briefing</code>)\n"
         "• /trending [HOURS] - See the most discussed tickers (e.g. <code>/trending 24</code>)\n"
         "• /markets - View live market performance and charts for tracked tickers (e.g. <code>/markets</code>)\n"
-        "• /predict &lt;TICKER&gt; [HORIZON] - ML prediction (e.g. <code>/predict NVDA 3d</code>)\n"
+        "• /predict &lt;TICKER&gt; [HORIZON] - ML prediction (e.g. <code>/predict NVDA 3m</code>)\n"
         "• /accuracy [TICKER] - View prediction accuracy (e.g. <code>/accuracy AAPL</code>)\n"
+        "• /model - Walk-forward skill of the prediction model per horizon (e.g. <code>/model</code>)\n"
         "• /track &lt;TICKER&gt; - Add to watchlist (e.g. <code>/track MSFT</code>)\n"
         "• /untrack &lt;TICKER&gt; - Remove from watchlist (e.g. <code>/untrack MSFT</code>)\n"
         "• /macro [DAYS] - Scheduled macro events: FOMC, CPI, jobs report (e.g. <code>/macro 30</code>)\n"
@@ -226,6 +230,37 @@ async def trending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Failed to fetch trending tickers.")
 
 
+def _percent(value) -> int | None:
+    """A 0-1 probability as a whole percent, or None when missing or not finite."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(number * 100) if math.isfinite(number) else None
+
+
+def _horizon_call_text(label: str, pred: dict) -> str:
+    """
+    One horizon's call as /markets and /accuracy print it.
+
+    A `prior` row is the base rate of a horizon where the model showed no
+    measurable edge, so it reads "no edge" with that rate, never as a green or
+    red call. A `universal` row is the pooled model's calibrated call, shown as
+    the probability of the direction it calls. Every other type keeps the
+    older form.
+    """
+    model_type = pred.get("model_type")
+    if model_type == "prior":
+        up = _percent(pred.get("probability_up"))
+        return f"{label}: ▫ no edge ({up}% up)" if up is not None else f"{label}: ▫ no edge"
+
+    direction = pred.get("predicted_direction", "UNK")
+    emoji = "🟢" if direction == "UP" else "🔴"
+    if model_type == "universal":
+        return f"{label}: {emoji} {direction} {_percent(pred.get('confidence')) or 0}%"
+    return f"{label}: {emoji} {int((pred.get('confidence') or 0.0) * 100)}%"
+
+
 async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /markets command."""
     if not await auth_middleware(update, context):
@@ -269,25 +304,29 @@ async def markets_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         sign = "+" if diff >= 0 else ""
                         
                         today = datetime.date.today().isoformat()
-                        
-                        from pipeline.predictor import StockPredictor
+
+                        from pipeline.predictor import HORIZON_LABELS, StockPredictor
                         predictor = StockPredictor(db)
-                        
+
+                        # Today's row per horizon, the pooled model's own call
+                        # ahead of a debate row restating it: the same choice
+                        # the dashboard grid makes.
+                        todays = latest_by_horizon(
+                            p for p in db.get_recent_predictions(t, limit=20)
+                            if str(p.get("created_at") or "")[:10] == today
+                        )
+
                         pred_strs = []
-                        for h in [5, 21, 63, 252]:
-                            pred = db.get_existing_prediction(t, horizon_days=h, date=today)
+                        for h, h_label in HORIZON_LABELS.items():
+                            pred = todays.get(h)
                             if not pred:
                                 try:
                                     pred = await predictor.predict(t, horizon_days=h)
                                 except Exception as pe:
                                     log.error("markets.auto_predict_failed", ticker=t, horizon=h, error=str(pe))
-                            
+
                             if pred:
-                                p_dir = pred.get("predicted_direction", "UNK")
-                                p_conf = int(pred.get("confidence", 0.0) * 100)
-                                dir_emoji = "🟢" if p_dir == "UP" else "🔴"
-                                h_label = {5: "5d", 21: "1m", 63: "3m", 252: "1y"}.get(h, f"{h}d")
-                                pred_strs.append(f"{h_label}: {dir_emoji} {p_conf}%")
+                                pred_strs.append(_horizon_call_text(h_label, pred))
                                 
                         pred_str = f"\n  " + " | ".join(pred_strs) if pred_strs else ""
                         
@@ -489,19 +528,22 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
         
     ticker = context.args[0].upper()
-    # Parse optional second argument: "force" to bypass cache, or a horizon label (5d, 1m, 3m, 1y)
-    force = False
-    horizon_days = None
-    HORIZON_MAP = {"5d": 5, "1m": 21, "3m": 63, "1y": 252}
-    if len(context.args) > 1:
-        arg1 = context.args[1].lower()
-        if arg1 == "force":
-            force = True
-        elif arg1 in HORIZON_MAP:
-            horizon_days = HORIZON_MAP[arg1]
-    
+
     try:
-        from pipeline.predictor import StockPredictor
+        from pipeline.predictor import HORIZON_LABELS, StockPredictor
+
+        # Optional second argument: "force" to bypass the cache, or a horizon
+        # label as the dashboard spells it (5d, 1m, 3m, 1y).
+        force = False
+        horizon_days = None
+        horizon_by_label = {label: days for days, label in HORIZON_LABELS.items()}
+        if len(context.args) > 1:
+            arg1 = context.args[1].lower()
+            if arg1 == "force":
+                force = True
+            elif arg1 in horizon_by_label:
+                horizon_days = horizon_by_label[arg1]
+
         db = get_db(context)
         
         def format_advisory_html(text: str) -> str:
@@ -573,39 +615,101 @@ async def accuracy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
         
     ticker = context.args[0].upper() if context.args else None
-    
+
     try:
+        from pipeline.predictor import HORIZON_LABELS
+
         db = get_db(context)
-        acc = db.get_prediction_accuracy(ticker)
-        
+
+        def load():
+            # One executor hop: the bot shares the worker's event loop with the
+            # pipeline, and these are three separate SQLite reads.
+            return (
+                db.get_prediction_accuracy(ticker),
+                accuracy_breakdown(db, ticker),
+                db.get_recent_predictions(ticker, limit=5),
+            )
+
+        acc, breakdown, recent = await asyncio.to_thread(load)
+
         title = f"<b>🎯 Prediction Accuracy ({ticker})</b>\n\n" if ticker else "<b>🎯 Overall Prediction Accuracy</b>\n\n"
-        
+
         if not acc or acc.get("total", 0) == 0:
             await update.message.reply_html(title + "No resolved predictions found.")
             return
-            
+
         text = title
         text += f"<b>Total Predictions:</b> {acc.get('total', 0)}\n"
         text += f"<b>Correct:</b> {acc.get('correct', 0)}\n"
         text += f"<b>Incorrect:</b> {acc.get('incorrect', 0)}\n"
         text += f"<b>Accuracy:</b> {acc.get('accuracy_pct', 0):.1f}%\n\n"
-        
-        recent = db.get_recent_predictions(ticker, limit=5)
+
+        if breakdown:
+            text += "<b>By horizon and model:</b>\n"
+            text += _accuracy_breakdown_html(breakdown, HORIZON_LABELS) + "\n"
+            text += ("<i>prior rows serve the base rate where the model has no edge: "
+                     "they are the benchmark the model rows have to beat.</i>\n\n")
+
         if recent:
             text += "<b>Recent Predictions:</b>\n"
             for p in recent:
                 icon = "✅" if p.get("is_correct") == 1 else ("❌" if p.get("is_correct") == 0 else "⏳")
-                t = p.get("ticker", "UNK")
-                dir = p.get("predicted_direction", "")
+                t = escape_html(p.get("ticker", "UNK"))
+                horizon = p.get("horizon_days")
+                call = _horizon_call_text(HORIZON_LABELS.get(horizon, f"{horizon}d"), p)
                 actual = p.get('actual_change_pct')
                 actual_str = f"{actual:.2f}%" if actual is not None else "N/A"
-                text += f"{icon} {t}: {dir} ({int(p.get('confidence',0)*100)}%) -> {actual_str}\n"
-                
+                text += f"{icon} {t} {call} -> {actual_str}\n"
+
         await update.message.reply_html(text)
-        
+
     except Exception as e:
         log.error("telegram.accuracy_failed", error=str(e))
         await update.message.reply_text("❌ Failed to fetch accuracy.")
+
+
+def _accuracy_breakdown_html(rows: list[dict], labels: dict[int, str]) -> str:
+    """Resolved accuracy per horizon and model type, as a monospaced table."""
+    lines = [f"{'Hzn':<4}{'Model':<15}{'n':>5}{'Acc':>7}"]
+    for row in rows:
+        horizon = row["horizon_days"]
+        lines.append(
+            f"{labels.get(horizon, f'{horizon}d'):<4}{str(row['model_type']):<15}"
+            f"{row['total']:>5}{row['accuracy_pct']:>6.1f}%"
+        )
+    return "<pre>" + escape_html("\n".join(lines)) + "</pre>"
+
+
+MODEL_EMPTY_TEXT = (
+    "No model has been trained yet — the worker trains the pooled models automatically."
+)
+
+
+async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle /model — walk-forward skill of the pooled direction model, per horizon.
+
+    Reads the newest model_metrics row per horizon, written by the retrain, into
+    the same table the weekly retrain report sends, heading included: the
+    renderer supplies it, so this adds none. Nothing here trains.
+    """
+    if not await auth_middleware(update, context):
+        return
+    try:
+        db = get_db(context)
+        rows = await asyncio.to_thread(db.get_latest_model_metrics)
+        if not rows:
+            await update.message.reply_text(MODEL_EMPTY_TEXT)
+            return
+
+        from pipeline.model_report import render_metrics_table_html
+
+        text = render_metrics_table_html(rows)
+        for chunk in chunk_html(text):
+            await update.message.reply_html(chunk)
+    except Exception as e:
+        log.error("telegram.model_failed", error=str(e))
+        await update.message.reply_text("❌ Failed to fetch model metrics.")
 
 
 async def sectors_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
